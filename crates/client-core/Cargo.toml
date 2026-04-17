@@ -1,0 +1,12 @@
+[package]
+name = "worklist-client-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared public types and errors for the Worklist OSS client workspace"
+publish = false
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+

@@ -1,0 +1,35 @@
+[package]
+name = "worklist-cli-oss"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Draft public CLI for Worklist agent integrations"
+publish = false
+
+[dependencies]
+base64.workspace = true
+clap.workspace = true
+reqwest.workspace = true
+rpassword.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+worklist-client-api = { path = "../crates/client-api" }
+worklist-client-auth = { path = "../crates/client-auth" }
+worklist-client-core = { path = "../crates/client-core" }
+worklist-client-crypto = { path = "../crates/client-crypto" }
+
+[dev-dependencies]
+assert_cmd = "2.0"
+axum = "0.8.6"
+base64.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+strong-box.workspace = true
+tempfile = "3.14"
+tokio.workspace = true
+uuid.workspace = true

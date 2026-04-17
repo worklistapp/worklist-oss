@@ -1,0 +1,27 @@
+name: OSS CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check workspace
+        run: cargo check --workspace
+
+      - name: Test workspace
+        run: cargo test --workspace

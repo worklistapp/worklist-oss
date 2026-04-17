@@ -1,0 +1,20 @@
+[package]
+name = "worklist-client-crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Client-side crypto scaffolding for the Worklist OSS client workspace"
+publish = false
+
+[dependencies]
+argon2.workspace = true
+base64.workspace = true
+hkdf.workspace = true
+hmac.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+strong-box.workspace = true
+uuid.workspace = true
+
+worklist-client-core = { path = "../client-core" }

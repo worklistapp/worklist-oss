@@ -1,0 +1,17 @@
+[package]
+name = "worklist-client-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "API client scaffolding for the Worklist OSS client workspace"
+publish = false
+
+[dependencies]
+chrono.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+
+worklist-client-auth = { path = "../client-auth" }
+worklist-client-core = { path = "../client-core" }

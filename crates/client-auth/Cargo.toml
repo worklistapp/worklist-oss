@@ -1,0 +1,23 @@
+[package]
+name = "worklist-client-auth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Authentication/session scaffolding for the Worklist OSS client workspace"
+publish = false
+
+[dependencies]
+argon2.workspace = true
+base64.workspace = true
+chrono.workspace = true
+dirs.workspace = true
+generic-array.workspace = true
+opaque-ke.workspace = true
+rand_core.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+uuid.workspace = true
+
+worklist-client-core = { path = "../client-core" }
