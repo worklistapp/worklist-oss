@@ -67,17 +67,8 @@ impl PublicApiClient {
     }
 
     async fn get<T: for<'de> Deserialize<'de>>(&mut self, path: &str) -> PublicResult<T> {
-        let token = self.get_access_token().await?;
         let url = format!("{}{}", self.base_url, path);
-        let response = self
-            .client
-            .get(&url)
-            .header("Authorization", format!("Bearer {}", token))
-            .send()
-            .await
-            .map_err(|err| map_reqwest_error(err, path))?;
-
-        handle_response(response, path).await
+        self.send(self.client.get(url), path).await
     }
 
     pub async fn get_me(&mut self) -> PublicResult<CurrentUserResponse> {
@@ -155,8 +146,11 @@ impl PublicApiClient {
         task_id: Uuid,
         payload: &UpdateTaskRequest,
     ) -> PublicResult<TaskResponse> {
-        self.patch(&format!("/work-lists/{work_list_id}/tasks/{task_id}"), payload)
-            .await
+        self.patch(
+            &format!("/work-lists/{work_list_id}/tasks/{task_id}"),
+            payload,
+        )
+        .await
     }
 
     pub async fn create_comment(
@@ -191,18 +185,8 @@ impl PublicApiClient {
         path: &str,
         body: &B,
     ) -> PublicResult<T> {
-        let token = self.get_access_token().await?;
         let url = format!("{}{}", self.base_url, path);
-        let response = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", token))
-            .json(body)
-            .send()
-            .await
-            .map_err(|err| map_reqwest_error(err, path))?;
-
-        handle_response(response, path).await
+        self.send(self.client.post(url).json(body), path).await
     }
 
     async fn patch<T: for<'de> Deserialize<'de>, B: Serialize>(
@@ -210,18 +194,31 @@ impl PublicApiClient {
         path: &str,
         body: &B,
     ) -> PublicResult<T> {
-        let token = self.get_access_token().await?;
         let url = format!("{}{}", self.base_url, path);
+        self.send(self.client.patch(url).json(body), path).await
+    }
+
+    async fn send<T: for<'de> Deserialize<'de>>(
+        &mut self,
+        request: reqwest::RequestBuilder,
+        path: &str,
+    ) -> PublicResult<T> {
+        let token = self.get_access_token().await?;
         let response = self
-            .client
-            .patch(&url)
-            .header("Authorization", format!("Bearer {}", token))
-            .json(body)
+            .authorized(request, &token)
             .send()
             .await
             .map_err(|err| map_reqwest_error(err, path))?;
 
         handle_response(response, path).await
+    }
+
+    fn authorized(
+        &self,
+        request: reqwest::RequestBuilder,
+        access_token: &str,
+    ) -> reqwest::RequestBuilder {
+        request.bearer_auth(access_token)
     }
 }
 
@@ -512,9 +509,7 @@ fn map_api_error(status: u16, body: &str, path: &str) -> PublicError {
             403 => PublicError::validation(format!("access denied: {message}")),
             404 => PublicError::validation(format!("not found: {message} ({path})")),
             400 | 422 => PublicError::validation(message),
-            _ => PublicError::unexpected(format!(
-                "API error ({status}) for {path}: {message}"
-            )),
+            _ => PublicError::unexpected(format!("API error ({status}) for {path}: {message}")),
         };
     }
 

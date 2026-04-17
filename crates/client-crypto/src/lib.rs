@@ -69,8 +69,7 @@ pub struct KeyDerivationService {
 
 impl KeyDerivationService {
     pub fn new() -> Self {
-        let params =
-            Params::new(64 * 1024, 3, 1, None).expect("frontend-compatible argon2 params");
+        let params = Params::new(64 * 1024, 3, 1, None).expect("frontend-compatible argon2 params");
         Self {
             argon2: Argon2::new(Algorithm::Argon2id, Version::V0x13, params),
         }
@@ -228,7 +227,10 @@ pub fn derive_child_key(
     Ok(SymmetricKey::new(okm))
 }
 
-pub fn derive_work_list_key(data_key: &SymmetricKey, work_list_id: &uuid::Uuid) -> PublicResult<SymmetricKey> {
+pub fn derive_work_list_key(
+    data_key: &SymmetricKey,
+    work_list_id: &uuid::Uuid,
+) -> PublicResult<SymmetricKey> {
     derive_child_key(data_key, format!("worklist:{work_list_id}"))
 }
 
@@ -264,14 +266,12 @@ pub fn decrypt_work_list_key(
     data_key: &SymmetricKey,
     work_list_key_ciphertext: &[u8],
 ) -> PublicResult<SymmetricKey> {
-    let sealed = SealedPayload::from_bytes(work_list_key_ciphertext)?;
-    ensure_payload_version(sealed.version)?;
-
-    let strong_box = StrongBoxKeyRing::new(data_key.clone()).strong_box();
-    let plaintext = strong_box
-        .decrypt(&sealed.ciphertext, WORK_LIST_MEMBERSHIP_CONTEXT)
-        .map_err(|err| PublicError::crypto(format!("failed to decrypt work list key: {err}")))?;
-
+    let plaintext = decrypt_sealed_bytes(
+        data_key,
+        work_list_key_ciphertext,
+        WORK_LIST_MEMBERSHIP_CONTEXT,
+        "failed to decrypt work list key",
+    )?;
     let key_bytes = decode_work_list_key_bytes(&plaintext)?;
     symmetric_key_from_bytes(&key_bytes)
 }
@@ -280,45 +280,36 @@ pub fn decrypt_work_list_payload<T: DeserializeOwned>(
     list_key: &SymmetricKey,
     payload_ciphertext: &[u8],
 ) -> PublicResult<T> {
-    let sealed = SealedPayload::from_bytes(payload_ciphertext)?;
-    ensure_payload_version(sealed.version)?;
-
-    let strong_box = StrongBoxKeyRing::new(list_key.clone()).strong_box();
-    let plaintext = strong_box
-        .decrypt(&sealed.ciphertext, WORK_LIST_PAYLOAD_CONTEXT)
-        .map_err(|err| PublicError::crypto(format!("failed to decrypt payload: {err}")))?;
-
-    deserialize_from_cbor(&plaintext)
+    decrypt_sealed_payload(
+        list_key,
+        payload_ciphertext,
+        WORK_LIST_PAYLOAD_CONTEXT,
+        "failed to decrypt payload",
+    )
 }
 
 pub fn decrypt_task_payload(
     list_key: &SymmetricKey,
     payload_ciphertext: &[u8],
 ) -> PublicResult<TaskPayloadEnvelope> {
-    let sealed = SealedPayload::from_bytes(payload_ciphertext)?;
-    ensure_payload_version(sealed.version)?;
-
-    let strong_box = StrongBoxKeyRing::new(list_key.clone()).strong_box();
-    let plaintext = strong_box
-        .decrypt(&sealed.ciphertext, TASK_PAYLOAD_CONTEXT)
-        .map_err(|err| PublicError::crypto(format!("failed to decrypt task payload: {err}")))?;
-
-    deserialize_from_cbor(&plaintext)
+    decrypt_sealed_payload(
+        list_key,
+        payload_ciphertext,
+        TASK_PAYLOAD_CONTEXT,
+        "failed to decrypt task payload",
+    )
 }
 
 pub fn decrypt_comment_payload(
     list_key: &SymmetricKey,
     payload_ciphertext: &[u8],
 ) -> PublicResult<CommentPayloadEnvelope> {
-    let sealed = SealedPayload::from_bytes(payload_ciphertext)?;
-    ensure_payload_version(sealed.version)?;
-
-    let strong_box = StrongBoxKeyRing::new(list_key.clone()).strong_box();
-    let plaintext = strong_box
-        .decrypt(&sealed.ciphertext, COMMENT_PAYLOAD_CONTEXT)
-        .map_err(|err| PublicError::crypto(format!("failed to decrypt comment payload: {err}")))?;
-
-    deserialize_from_cbor(&plaintext)
+    decrypt_sealed_payload(
+        list_key,
+        payload_ciphertext,
+        COMMENT_PAYLOAD_CONTEXT,
+        "failed to decrypt comment payload",
+    )
 }
 
 pub fn build_task_payload_envelope(body: TaskPayloadBody, version: u8) -> TaskPayloadEnvelope {
@@ -360,24 +351,24 @@ pub fn encrypt_task_payload(
     envelope: &TaskPayloadEnvelope,
     list_key: &SymmetricKey,
 ) -> PublicResult<SealedBlobPayload> {
-    let plaintext = serialize_to_cbor(envelope)?;
-    let strong_box = StrongBoxKeyRing::new(list_key.clone()).strong_box();
-    let ciphertext = strong_box
-        .encrypt(plaintext, TASK_PAYLOAD_CONTEXT)
-        .map_err(|err| PublicError::crypto(format!("failed to seal task payload: {err}")))?;
-    sealed_blob_from_payload(SealedPayload::new(ciphertext))
+    encrypt_sealed_payload(
+        envelope,
+        list_key,
+        TASK_PAYLOAD_CONTEXT,
+        "failed to seal task payload",
+    )
 }
 
 pub fn encrypt_comment_payload(
     envelope: &CommentPayloadEnvelope,
     list_key: &SymmetricKey,
 ) -> PublicResult<SealedBlobPayload> {
-    let plaintext = serialize_to_cbor(envelope)?;
-    let strong_box = StrongBoxKeyRing::new(list_key.clone()).strong_box();
-    let ciphertext = strong_box
-        .encrypt(plaintext, COMMENT_PAYLOAD_CONTEXT)
-        .map_err(|err| PublicError::crypto(format!("failed to seal comment payload: {err}")))?;
-    sealed_blob_from_payload(SealedPayload::new(ciphertext))
+    encrypt_sealed_payload(
+        envelope,
+        list_key,
+        COMMENT_PAYLOAD_CONTEXT,
+        "failed to seal comment payload",
+    )
 }
 
 pub fn seal_text_value(value: &str) -> PublicResult<SealedBlobPayload> {
@@ -385,7 +376,10 @@ pub fn seal_text_value(value: &str) -> PublicResult<SealedBlobPayload> {
     sealed_blob_from_payload(SealedPayload::new(ciphertext))
 }
 
-pub fn compute_payload_proof(ciphertext: &[u8], binding_key: &SymmetricKey) -> PublicResult<String> {
+pub fn compute_payload_proof(
+    ciphertext: &[u8],
+    binding_key: &SymmetricKey,
+) -> PublicResult<String> {
     type PayloadMac = Hmac<Sha256>;
 
     let mut mac = PayloadMac::new_from_slice(binding_key.as_bytes())
@@ -424,6 +418,45 @@ fn decode_base64(value: &str) -> PublicResult<Vec<u8>> {
         .map_err(|err| PublicError::validation(format!("ciphertext must be base64: {err}")))
 }
 
+fn decrypt_sealed_payload<T: DeserializeOwned>(
+    key: &SymmetricKey,
+    payload_ciphertext: &[u8],
+    context: &[u8],
+    error_context: &str,
+) -> PublicResult<T> {
+    let plaintext = decrypt_sealed_bytes(key, payload_ciphertext, context, error_context)?;
+    deserialize_from_cbor(&plaintext)
+}
+
+fn decrypt_sealed_bytes(
+    key: &SymmetricKey,
+    payload_ciphertext: &[u8],
+    context: &[u8],
+    error_context: &str,
+) -> PublicResult<Vec<u8>> {
+    let sealed = SealedPayload::from_bytes(payload_ciphertext)?;
+    ensure_payload_version(sealed.version)?;
+
+    StrongBoxKeyRing::new(key.clone())
+        .strong_box()
+        .decrypt(&sealed.ciphertext, context)
+        .map_err(|err| PublicError::crypto(format!("{error_context}: {err}")))
+}
+
+fn encrypt_sealed_payload<T: Serialize + ?Sized>(
+    value: &T,
+    key: &SymmetricKey,
+    context: &[u8],
+    error_context: &str,
+) -> PublicResult<SealedBlobPayload> {
+    let plaintext = serialize_to_cbor(value)?;
+    let ciphertext = StrongBoxKeyRing::new(key.clone())
+        .strong_box()
+        .encrypt(plaintext, context)
+        .map_err(|err| PublicError::crypto(format!("{error_context}: {err}")))?;
+    sealed_blob_from_payload(SealedPayload::new(ciphertext))
+}
+
 fn symmetric_key_from_bytes(bytes: &[u8]) -> PublicResult<SymmetricKey> {
     if bytes.len() != KEY_SIZE {
         return Err(PublicError::validation(format!(
@@ -455,18 +488,19 @@ fn sealed_blob_from_payload(payload: SealedPayload) -> PublicResult<SealedBlobPa
 }
 
 fn decode_work_list_key_bytes(plaintext: &[u8]) -> PublicResult<Vec<u8>> {
-    if let Some(bytes) = try_decode_envelope(plaintext)? {
-        if bytes.is_empty() {
-            return Err(PublicError::validation("work list key cannot be empty"));
-        }
-        return Ok(bytes);
-    }
+    let Some(bytes) = try_decode_envelope(plaintext)? else {
+        return if plaintext.is_empty() {
+            Err(PublicError::validation("work list key cannot be empty"))
+        } else {
+            Ok(plaintext.to_vec())
+        };
+    };
 
-    if plaintext.is_empty() {
+    if bytes.is_empty() {
         return Err(PublicError::validation("work list key cannot be empty"));
     }
 
-    Ok(plaintext.to_vec())
+    Ok(bytes)
 }
 
 fn try_decode_envelope(bytes: &[u8]) -> PublicResult<Option<Vec<u8>>> {
@@ -488,7 +522,9 @@ fn try_decode_envelope(bytes: &[u8]) -> PublicResult<Option<Vec<u8>>> {
 fn decode_membership_key_string(value: &str) -> PublicResult<Vec<u8>> {
     let normalized = value.trim().replace('-', "+").replace('_', "/");
     if normalized.is_empty() {
-        return Err(PublicError::validation("membership key string cannot be empty"));
+        return Err(PublicError::validation(
+            "membership key string cannot be empty",
+        ));
     }
 
     STANDARD_NO_PAD

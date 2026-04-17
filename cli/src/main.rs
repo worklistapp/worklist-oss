@@ -13,19 +13,19 @@ use serde_json::json;
 use uuid::Uuid;
 use worklist_client_api::{
     CommentResponse, CreateCommentRequest, CreateTaskRequest, CurrentUserResponse,
-    DashboardStatsResponse, MyTaskResponse, PublicApiClient, TaskResponse,
-    UpdateCommentRequest, UpdateTaskRequest, WorkListDetailResponse, WorkListResponse,
+    DashboardStatsResponse, MyTaskResponse, PublicApiClient, TaskResponse, UpdateCommentRequest,
+    UpdateTaskRequest, WorkListDetailResponse, WorkListResponse,
 };
 use worklist_client_auth::{
-    Credentials, auth_response_to_credentials, clear_credentials, credentials_path, load_credentials,
-    load_credentials_for_url, login, logout, normalize_api_url, save_credentials, UnlockMode,
+    Credentials, UnlockMode, auth_response_to_credentials, clear_credentials, credentials_path,
+    load_credentials, load_credentials_for_url, login, logout, normalize_api_url, save_credentials,
 };
 use worklist_client_core::{PublicResult, PublicWorkspaceStage};
 use worklist_client_crypto::{
     CommentPayloadBody, CryptoCapability, TaskPayloadBody, build_comment_payload_envelope,
     build_task_payload_envelope, compute_payload_proof, decode_sealed_blob,
-    decrypt_user_data_key, decrypt_work_list_key, decrypt_work_list_payload,
-    decrypt_comment_payload, decrypt_task_payload, derive_payload_binding_key, derive_work_list_key,
+    decrypt_comment_payload, decrypt_task_payload, decrypt_user_data_key, decrypt_work_list_key,
+    decrypt_work_list_payload, derive_payload_binding_key, derive_work_list_key,
     encrypt_comment_payload, encrypt_task_payload, plaintext_rich_text, seal_text_value,
 };
 
@@ -37,7 +37,12 @@ use worklist_client_crypto::{
 )]
 struct Cli {
     /// API base URL.
-    #[arg(long, env = "WORKLIST_API_URL", default_value = "https://worklist.app", global = true)]
+    #[arg(
+        long,
+        env = "WORKLIST_API_URL",
+        default_value = "https://worklist.app",
+        global = true
+    )]
     api_url: String,
 
     /// Output format for data commands.
@@ -317,7 +322,11 @@ async fn run(cli: Cli) -> PublicResult<()> {
     }
 }
 
-async fn cmd_login(api_url: &str, email_flag: Option<String>, password_stdin: bool) -> PublicResult<()> {
+async fn cmd_login(
+    api_url: &str,
+    email_flag: Option<String>,
+    password_stdin: bool,
+) -> PublicResult<()> {
     if let Some(credentials) = load_credentials_for_url(api_url)?
         && !credentials.is_refresh_expired()
     {
@@ -396,11 +405,15 @@ fn cmd_status(api_url: &str) -> PublicResult<()> {
             println!("User ID: {}", credentials.user_id);
             println!(
                 "Access token expires: {}",
-                credentials.access_expires_at.format("%Y-%m-%d %H:%M:%S UTC")
+                credentials
+                    .access_expires_at
+                    .format("%Y-%m-%d %H:%M:%S UTC")
             );
             println!(
                 "Refresh token expires: {}",
-                credentials.refresh_expires_at.format("%Y-%m-%d %H:%M:%S UTC")
+                credentials
+                    .refresh_expires_at
+                    .format("%Y-%m-%d %H:%M:%S UTC")
             );
 
             let status_api_url = credentials.api_url.clone();
@@ -461,20 +474,14 @@ async fn cmd_lists(api_url: &str, format: OutputFormat, verbose: bool) -> Public
     Ok(())
 }
 
-async fn cmd_tasks(
-    api_url: &str,
-    format: OutputFormat,
-    command: TasksCommand,
-) -> PublicResult<()> {
+async fn cmd_tasks(api_url: &str, format: OutputFormat, command: TasksCommand) -> PublicResult<()> {
     match command {
         TasksCommand::List {
             work_list_id,
             include_completed,
             all,
         } => cmd_tasks_list(api_url, format, work_list_id, include_completed, all).await,
-        TasksCommand::Create(args) => {
-            cmd_tasks_create(api_url, args).await
-        }
+        TasksCommand::Create(args) => cmd_tasks_create(api_url, args).await,
         TasksCommand::Update(args) => cmd_tasks_update(api_url, args).await,
     }
 }
@@ -591,8 +598,7 @@ async fn cmd_tasks_create(api_url: &str, args: TaskCreateArgs) -> PublicResult<(
 
     println!(
         "{}",
-        serde_json::to_string_pretty(&created)
-            .expect("serializing created task should succeed")
+        serde_json::to_string_pretty(&created).expect("serializing created task should succeed")
     );
     Ok(())
 }
@@ -676,8 +682,7 @@ async fn cmd_tasks_update(api_url: &str, args: TaskUpdateArgs) -> PublicResult<(
     let updated = client.update_task(work_list_id, task_id, &request).await?;
     println!(
         "{}",
-        serde_json::to_string_pretty(&updated)
-            .expect("serializing updated task should succeed")
+        serde_json::to_string_pretty(&updated).expect("serializing updated task should succeed")
     );
     Ok(())
 }
@@ -691,9 +696,7 @@ async fn cmd_stats(api_url: &str, format: OutputFormat) -> PublicResult<()> {
 
 async fn cmd_comments(api_url: &str, command: CommentsCommand) -> PublicResult<()> {
     match command {
-        CommentsCommand::Create(args) => {
-            cmd_comments_create(api_url, args).await
-        }
+        CommentsCommand::Create(args) => cmd_comments_create(api_url, args).await,
         CommentsCommand::Update(args) => cmd_comments_update(api_url, args).await,
     }
 }
@@ -728,9 +731,8 @@ async fn cmd_comments_create(api_url: &str, args: CommentCreateArgs) -> PublicRe
         "Password required to create encrypted comments.",
     )?;
     let binding_key = derive_payload_binding_key(&list_key)?;
-    let rich_text = plaintext_rich_text(normalized_body).ok_or_else(|| {
-        worklist_client_core::PublicError::validation("comment body is required")
-    })?;
+    let rich_text = plaintext_rich_text(normalized_body)
+        .ok_or_else(|| worklist_client_core::PublicError::validation("comment body is required"))?;
     let envelope = build_comment_payload_envelope(
         CommentPayloadBody {
             content: rich_text,
@@ -755,8 +757,7 @@ async fn cmd_comments_create(api_url: &str, args: CommentCreateArgs) -> PublicRe
         .await?;
     println!(
         "{}",
-        serde_json::to_string_pretty(&created)
-            .expect("serializing created comment should succeed")
+        serde_json::to_string_pretty(&created).expect("serializing created comment should succeed")
     );
     Ok(())
 }
@@ -793,9 +794,8 @@ async fn cmd_comments_update(api_url: &str, args: CommentUpdateArgs) -> PublicRe
         "Password required to update encrypted comments.",
     )?;
     let binding_key = derive_payload_binding_key(&list_key)?;
-    let rich_text = plaintext_rich_text(normalized_body).ok_or_else(|| {
-        worklist_client_core::PublicError::validation("comment body is required")
-    })?;
+    let rich_text = plaintext_rich_text(normalized_body)
+        .ok_or_else(|| worklist_client_core::PublicError::validation("comment body is required"))?;
 
     let existing_comment = task_detail
         .comments
@@ -830,8 +830,7 @@ async fn cmd_comments_update(api_url: &str, args: CommentUpdateArgs) -> PublicRe
         .await?;
     println!(
         "{}",
-        serde_json::to_string_pretty(&updated)
-            .expect("serializing updated comment should succeed")
+        serde_json::to_string_pretty(&updated).expect("serializing updated comment should succeed")
     );
     Ok(())
 }
@@ -972,11 +971,9 @@ fn resolve_comment_input(
     input_stdin: bool,
     password_stdin: bool,
 ) -> PublicResult<CommentInput> {
-    if let Some(input) = load_structured_input::<CommentInput>(
-        input_file,
-        input_stdin,
-        password_stdin,
-    )? {
+    if let Some(input) =
+        load_structured_input::<CommentInput>(input_file, input_stdin, password_stdin)?
+    {
         return Ok(input);
     }
 
@@ -1058,22 +1055,22 @@ fn daemon_session_key(
     api_url: &str,
     credentials: &Credentials,
 ) -> PublicResult<unlock_daemon::SessionKey> {
-    unlock_daemon::session_key(api_url, credentials.user_id, &credentials.data_key_ciphertext)
+    unlock_daemon::session_key(
+        api_url,
+        credentials.user_id,
+        &credentials.data_key_ciphertext,
+    )
 }
 
 fn prompt(label: &str) -> PublicResult<String> {
     print!("{label}");
     io::stdout().flush().map_err(|err| {
-        worklist_client_core::PublicError::unexpected(format!(
-            "failed to flush stdout: {err}"
-        ))
+        worklist_client_core::PublicError::unexpected(format!("failed to flush stdout: {err}"))
     })?;
 
     let mut input = String::new();
     io::stdin().read_line(&mut input).map_err(|err| {
-        worklist_client_core::PublicError::unexpected(format!(
-            "failed to read input: {err}"
-        ))
+        worklist_client_core::PublicError::unexpected(format!("failed to read input: {err}"))
     })?;
 
     Ok(input.trim().to_string())
@@ -1081,9 +1078,7 @@ fn prompt(label: &str) -> PublicResult<String> {
 
 fn read_password(label: &str) -> PublicResult<String> {
     prompt_password(label).map_err(|err| {
-        worklist_client_core::PublicError::unexpected(format!(
-            "failed to read password: {err}"
-        ))
+        worklist_client_core::PublicError::unexpected(format!("failed to read password: {err}"))
     })
 }
 
@@ -1222,7 +1217,10 @@ fn print_tasks(tasks: &[TaskResponse], format: OutputFormat) {
             println!("{}", "-".repeat(80));
 
             for task in tasks {
-                let priority = task.priority.map(|value| value.to_string()).unwrap_or_default();
+                let priority = task
+                    .priority
+                    .map(|value| value.to_string())
+                    .unwrap_or_default();
                 let due = task
                     .due_at
                     .map(|value| value.format("%Y-%m-%d").to_string())
@@ -1251,8 +1249,7 @@ fn print_my_tasks(tasks: &[MyTaskResponse], format: OutputFormat) {
         OutputFormat::Json => {
             println!(
                 "{}",
-                serde_json::to_string_pretty(tasks)
-                    .expect("serializing my tasks should succeed")
+                serde_json::to_string_pretty(tasks).expect("serializing my tasks should succeed")
             );
         }
         OutputFormat::Table => {
@@ -1263,7 +1260,10 @@ fn print_my_tasks(tasks: &[MyTaskResponse], format: OutputFormat) {
             println!("{}", "-".repeat(100));
 
             for task in tasks {
-                let priority = task.priority.map(|value| value.to_string()).unwrap_or_default();
+                let priority = task
+                    .priority
+                    .map(|value| value.to_string())
+                    .unwrap_or_default();
                 let due = task
                     .due_at
                     .map(|value| value.format("%Y-%m-%d").to_string())

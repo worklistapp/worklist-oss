@@ -2,7 +2,7 @@
 
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use base64::Engine as _;
@@ -232,9 +232,7 @@ pub fn save_credentials(credentials: &Credentials) -> PublicResult<()> {
 
         let permissions = fs::Permissions::from_mode(0o600);
         fs::set_permissions(&path, permissions).map_err(|err| {
-            PublicError::unexpected(format!(
-                "failed to set credentials file permissions: {err}"
-            ))
+            PublicError::unexpected(format!("failed to set credentials file permissions: {err}"))
         })?;
     }
 
@@ -256,7 +254,7 @@ pub fn clear_credentials() -> PublicResult<()> {
 }
 
 #[cfg(unix)]
-fn set_config_dir_permissions(dir: &PathBuf) -> PublicResult<()> {
+fn set_config_dir_permissions(dir: &Path) -> PublicResult<()> {
     use std::os::unix::fs::PermissionsExt;
 
     fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(|err| {
@@ -268,11 +266,13 @@ fn set_config_dir_permissions(dir: &PathBuf) -> PublicResult<()> {
 }
 
 #[cfg(not(unix))]
-fn set_config_dir_permissions(_dir: &PathBuf) -> PublicResult<()> {
+fn set_config_dir_permissions(_dir: &Path) -> PublicResult<()> {
     Ok(())
 }
 
-pub fn opaque_login_start(password: &str) -> PublicResult<(ClientLogin<ClientCipherSuite>, String)> {
+pub fn opaque_login_start(
+    password: &str,
+) -> PublicResult<(ClientLogin<ClientCipherSuite>, String)> {
     let mut rng = OsRng;
     let ClientLoginStartResult { message, state } =
         ClientLogin::<ClientCipherSuite>::start(&mut rng, password.as_bytes())
@@ -290,10 +290,8 @@ pub fn opaque_login_finish(
     let server_bytes = decode_bytes(server_response_b64)?;
     let credential_response = CredentialResponse::<ClientCipherSuite>::deserialize(&server_bytes)
         .map_err(|err| {
-            PublicError::crypto(format!(
-                "failed to deserialize server response: {err}"
-            ))
-        })?;
+        PublicError::crypto(format!("failed to deserialize server response: {err}"))
+    })?;
 
     let normalized_email = email.trim().to_lowercase();
     let identifiers = Identifiers {
@@ -318,7 +316,10 @@ pub async fn login(
     let (opaque_state, client_login_state) = opaque_login_start(password)?;
 
     let start_response = client
-        .post(format!("{}/auth/opaque/login/start", base_url.trim_end_matches('/')))
+        .post(format!(
+            "{}/auth/opaque/login/start",
+            base_url.trim_end_matches('/')
+        ))
         .json(&LoginStartRequest {
             email: email.to_string(),
             client_login_state,
@@ -326,23 +327,15 @@ pub async fn login(
         .send()
         .await
         .map_err(|err| map_reqwest_error(err, "login start"))?;
+    let start_result: LoginStartResponse =
+        parse_json_response(start_response, "login start response").await?;
 
-    let status = start_response.status();
-    if !status.is_success() {
-        let error_text = start_response
-            .text()
-            .await
-            .unwrap_or_else(|_| "unknown error".to_string());
-        return Err(map_api_error(status.as_u16(), &error_text));
-    }
-
-    let start_result: LoginStartResponse = start_response.json().await.map_err(|err| {
-        PublicError::unexpected(format!("failed to parse login start response: {err}"))
-    })?;
-    let _ = start_result.expires_in;
-
-    let client_finish_message =
-        opaque_login_finish(opaque_state, email, password, &start_result.server_login_state)?;
+    let client_finish_message = opaque_login_finish(
+        opaque_state,
+        email,
+        password,
+        &start_result.server_login_state,
+    )?;
 
     let finish_response = client
         .post(format!(
@@ -357,18 +350,7 @@ pub async fn login(
         .await
         .map_err(|err| map_reqwest_error(err, "login finish"))?;
 
-    let status = finish_response.status();
-    if !status.is_success() {
-        let error_text = finish_response
-            .text()
-            .await
-            .unwrap_or_else(|_| "unknown error".to_string());
-        return Err(map_api_error(status.as_u16(), &error_text));
-    }
-
-    finish_response.json().await.map_err(|err| {
-        PublicError::unexpected(format!("failed to parse auth response: {err}"))
-    })
+    parse_json_response(finish_response, "auth response").await
 }
 
 pub async fn refresh_access_token(
@@ -385,18 +367,7 @@ pub async fn refresh_access_token(
         .await
         .map_err(|err| map_reqwest_error(err, "token refresh"))?;
 
-    let status = response.status();
-    if !status.is_success() {
-        let error_text = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "unknown error".to_string());
-        return Err(map_api_error(status.as_u16(), &error_text));
-    }
-
-    response.json().await.map_err(|err| {
-        PublicError::unexpected(format!("failed to parse refresh response: {err}"))
-    })
+    parse_json_response(response, "refresh response").await
 }
 
 pub async fn logout(
@@ -414,7 +385,10 @@ pub async fn logout(
         .map_err(|err| map_reqwest_error(err, "logout"))?;
 
     if !response.status().is_success() {
-        eprintln!("warning: server logout returned status {}", response.status());
+        eprintln!(
+            "warning: server logout returned status {}",
+            response.status()
+        );
     }
 
     Ok(())
@@ -422,14 +396,6 @@ pub async fn logout(
 
 pub fn auth_response_to_credentials(api_url: &str, response: AuthResponse) -> Credentials {
     let now = Utc::now();
-    let _ = (
-        &response.token_type,
-        &response.user.name,
-        &response.user.timezone,
-        &response.user.avatar_color,
-        &response.user.theme_preference,
-        response.user.email_verified,
-    );
     Credentials {
         api_url: normalize_api_url(api_url),
         access_token: response.access_token,
@@ -447,9 +413,9 @@ pub fn update_credentials_with_refresh(
     refresh_response: RefreshResponse,
 ) {
     let now = Utc::now();
-    let _ = &refresh_response.token_type;
     credentials.access_token = refresh_response.access_token;
-    credentials.access_expires_at = now + chrono::Duration::seconds(refresh_response.expires_in as i64);
+    credentials.access_expires_at =
+        now + chrono::Duration::seconds(refresh_response.expires_in as i64);
 }
 
 fn encode_bytes(bytes: &[u8]) -> String {
@@ -468,14 +434,31 @@ fn decode_bytes(value: &str) -> PublicResult<Vec<u8>> {
 
 fn map_reqwest_error(err: reqwest::Error, context: &str) -> PublicError {
     if err.is_connect() {
-        PublicError::unexpected(format!(
-            "failed to connect to API during {context}: {err}"
-        ))
+        PublicError::unexpected(format!("failed to connect to API during {context}: {err}"))
     } else if err.is_timeout() {
         PublicError::unexpected(format!("API request timed out during {context}"))
     } else {
         PublicError::unexpected(format!("API request failed during {context}: {err}"))
     }
+}
+
+async fn parse_json_response<T: for<'de> Deserialize<'de>>(
+    response: reqwest::Response,
+    context: &str,
+) -> PublicResult<T> {
+    let status = response.status();
+    if !status.is_success() {
+        let error_text = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "unknown error".to_string());
+        return Err(map_api_error(status.as_u16(), &error_text));
+    }
+
+    response
+        .json()
+        .await
+        .map_err(|err| PublicError::unexpected(format!("failed to parse {context}: {err}")))
 }
 
 fn map_api_error(status: u16, body: &str) -> PublicError {

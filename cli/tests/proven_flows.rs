@@ -22,9 +22,9 @@ use worklist_client_crypto::{
     CommentPayloadBody, SealedPayload, StrongBoxKeyRing, SymmetricKey, TaskPayloadBody,
     USER_DATA_KEY_CONTEXT, WORK_LIST_MEMBERSHIP_CONTEXT, WORK_LIST_PAYLOAD_CONTEXT,
     build_comment_payload_envelope, build_task_payload_envelope, compute_payload_proof,
-    decrypt_comment_payload, decrypt_task_payload,
-    derive_payload_binding_key, encrypt_comment_payload, encrypt_task_payload, plaintext_rich_text,
-    seal_text_value, serialize_to_cbor,
+    decrypt_comment_payload, decrypt_task_payload, derive_payload_binding_key,
+    encrypt_comment_payload, encrypt_task_payload, plaintext_rich_text, seal_text_value,
+    serialize_to_cbor,
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -45,8 +45,16 @@ async fn cli_proven_flows_round_trip_through_mock_api() {
         ],
         Some(&fixture.password),
     );
-    assert!(inspect_output.status.success(), "inspect failed: {}", inspect_output.stderr);
-    assert!(inspect_output.stdout.contains("\"title\": \"Fixture Work List\""));
+    assert!(
+        inspect_output.status.success(),
+        "inspect failed: {}",
+        inspect_output.stderr
+    );
+    assert!(
+        inspect_output
+            .stdout
+            .contains("\"title\": \"Fixture Work List\"")
+    );
 
     let create_task_output = run_cli(
         home.path(),
@@ -176,10 +184,7 @@ async fn cli_proven_flows_round_trip_through_mock_api() {
         1
     );
     assert_eq!(
-        updated_task
-            .mentions
-            .as_ref()
-            .expect("mentions preserved")[0],
+        updated_task.mentions.as_ref().expect("mentions preserved")[0],
         fixture.mentioned_user_id.to_string()
     );
 
@@ -237,12 +242,21 @@ async fn cli_task_reads_parse_current_api_shapes() {
         "my tasks failed: {}",
         my_tasks_output.stderr
     );
-    assert!(my_tasks_output.stdout.contains(&fixture.task_id.to_string()));
+    assert!(
+        my_tasks_output
+            .stdout
+            .contains(&fixture.task_id.to_string())
+    );
 
     let list_tasks_output = run_cli(
         home.path(),
         &server.base_url,
-        &["tasks", "list", "--work-list-id", &fixture.work_list_id.to_string()],
+        &[
+            "tasks",
+            "list",
+            "--work-list-id",
+            &fixture.work_list_id.to_string(),
+        ],
         None,
     );
     assert!(
@@ -250,7 +264,11 @@ async fn cli_task_reads_parse_current_api_shapes() {
         "list tasks failed: {}",
         list_tasks_output.stderr
     );
-    assert!(list_tasks_output.stdout.contains(&fixture.task_id.to_string()));
+    assert!(
+        list_tasks_output
+            .stdout
+            .contains(&fixture.task_id.to_string())
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -262,7 +280,11 @@ async fn cli_tasks_help_uses_explicit_verbs() {
         None,
     );
 
-    assert!(output.status.success(), "tasks help failed: {}", output.stderr);
+    assert!(
+        output.status.success(),
+        "tasks help failed: {}",
+        output.stderr
+    );
     assert!(output.stdout.contains("list"));
     assert!(output.stdout.contains("create"));
     assert!(output.stdout.contains("update"));
@@ -293,7 +315,11 @@ async fn cli_rejects_input_stdin_with_password_stdin() {
     );
 
     assert!(!output.status.success(), "command unexpectedly succeeded");
-    assert!(output.stderr.contains("--input-stdin cannot be combined with --password-stdin"));
+    assert!(
+        output
+            .stderr
+            .contains("--input-stdin cannot be combined with --password-stdin")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -327,7 +353,11 @@ async fn cli_unlock_daemon_enables_later_decrypt_without_password_flag() {
         "inspect without password flag failed: {}",
         inspect_output.stderr
     );
-    assert!(inspect_output.stdout.contains("\"title\": \"Fixture Work List\""));
+    assert!(
+        inspect_output
+            .stdout
+            .contains("\"title\": \"Fixture Work List\"")
+    );
 
     let lock_output = run_cli(home.path(), &server.base_url, &["auth", "lock"], None);
     assert!(
@@ -439,7 +469,11 @@ async fn cli_status_reports_stored_session_daemon_state_when_api_url_differs() {
         status_output.stderr
     );
     assert!(status_output.stdout.contains("Stored:"));
-    assert!(status_output.stdout.contains("Current: https://worklist.app"));
+    assert!(
+        status_output
+            .stdout
+            .contains("Current: https://worklist.app")
+    );
     assert!(status_output.stdout.contains("Unlock daemon: active"));
 
     let _ = run_cli(home.path(), &server.base_url, &["auth", "lock"], None);
@@ -536,9 +570,7 @@ impl TestFixture {
         )
         .expect("task payload")
         .base64;
-        let task_title_ciphertext = seal_text_value("Existing task")
-            .expect("task title")
-            .base64;
+        let task_title_ciphertext = seal_text_value("Existing task").expect("task title").base64;
 
         let existing_comment_body = CommentPayloadBody {
             content: plaintext_rich_text("Existing comment").expect("comment rich text"),
@@ -617,7 +649,10 @@ async fn spawn_server(state: Arc<Mutex<TestState>>) -> TestServer {
     let app = Router::new()
         .route("/work-lists/{id}", get(get_work_list))
         .route("/work-lists/{id}/tasks", get(list_tasks).post(create_task))
-        .route("/work-lists/{id}/tasks/{task_id}", get(get_task).patch(update_task))
+        .route(
+            "/work-lists/{id}/tasks/{task_id}",
+            get(get_task).patch(update_task),
+        )
         .route(
             "/work-lists/{id}/tasks/{task_id}/comments",
             post(create_comment),
@@ -831,13 +866,13 @@ async fn create_task(
     assert_eq!(work_list_id, state.fixture.work_list_id);
 
     let title_bytes = decode_b64(&payload.title_ciphertext);
-    let title_proof = compute_payload_proof(&title_bytes, &state.fixture.binding_key)
-        .expect("title proof");
+    let title_proof =
+        compute_payload_proof(&title_bytes, &state.fixture.binding_key).expect("title proof");
     assert_eq!(title_proof, payload.title_ciphertext_proof);
 
     let payload_bytes = decode_b64(&payload.payload_ciphertext);
-    let payload_proof = compute_payload_proof(&payload_bytes, &state.fixture.binding_key)
-        .expect("payload proof");
+    let payload_proof =
+        compute_payload_proof(&payload_bytes, &state.fixture.binding_key).expect("payload proof");
     assert_eq!(payload_proof, payload.payload_ciphertext_proof);
 
     let decrypted = decrypt_task_payload(&state.fixture.list_key, &payload_bytes)
@@ -887,8 +922,8 @@ async fn update_task(
         .as_ref()
         .expect("payload ciphertext present");
     let payload_bytes = decode_b64(payload_ciphertext);
-    let payload_proof = compute_payload_proof(&payload_bytes, &state.fixture.binding_key)
-        .expect("payload proof");
+    let payload_proof =
+        compute_payload_proof(&payload_bytes, &state.fixture.binding_key).expect("payload proof");
     assert_eq!(
         payload.payload_ciphertext_proof.as_deref(),
         Some(payload_proof.as_str())
@@ -896,8 +931,8 @@ async fn update_task(
 
     if let Some(title_ciphertext) = payload.title_ciphertext.as_ref() {
         let title_bytes = decode_b64(title_ciphertext);
-        let title_proof = compute_payload_proof(&title_bytes, &state.fixture.binding_key)
-            .expect("title proof");
+        let title_proof =
+            compute_payload_proof(&title_bytes, &state.fixture.binding_key).expect("title proof");
         assert_eq!(
             payload.title_ciphertext_proof.as_deref(),
             Some(title_proof.as_str())
@@ -947,8 +982,8 @@ async fn create_comment(
     assert_eq!(task_id, state.fixture.task_id);
 
     let body_bytes = decode_b64(&payload.body_ciphertext);
-    let body_proof = compute_payload_proof(&body_bytes, &state.fixture.binding_key)
-        .expect("comment proof");
+    let body_proof =
+        compute_payload_proof(&body_bytes, &state.fixture.binding_key).expect("comment proof");
     assert_eq!(body_proof, payload.body_ciphertext_proof);
 
     let decrypted = decrypt_comment_payload(&state.fixture.list_key, &body_bytes)
@@ -984,8 +1019,8 @@ async fn update_comment(
         .as_ref()
         .expect("body ciphertext present");
     let body_bytes = decode_b64(body_ciphertext);
-    let body_proof = compute_payload_proof(&body_bytes, &state.fixture.binding_key)
-        .expect("comment proof");
+    let body_proof =
+        compute_payload_proof(&body_bytes, &state.fixture.binding_key).expect("comment proof");
     assert_eq!(
         payload.body_ciphertext_proof.as_deref(),
         Some(body_proof.as_str())
@@ -1039,8 +1074,11 @@ fn seed_credentials(home: &std::path::Path, fixture: &TestFixture, api_url: &str
     let config_dir = home.join(".worklist");
     std::fs::create_dir_all(&config_dir).expect("create config dir");
     let path = config_dir.join("credentials.json");
-    std::fs::write(path, serde_json::to_vec_pretty(&credentials).expect("serialize creds"))
-        .expect("write creds");
+    std::fs::write(
+        path,
+        serde_json::to_vec_pretty(&credentials).expect("serialize creds"),
+    )
+    .expect("write creds");
 }
 
 fn authorize(state: &Arc<Mutex<TestState>>, headers: &HeaderMap) {
@@ -1159,7 +1197,10 @@ struct CliOutput {
 
 fn write_json_file(dir: &FsPath, name: &str, value: &serde_json::Value) -> std::path::PathBuf {
     let path = dir.join(name);
-    std::fs::write(&path, serde_json::to_vec_pretty(value).expect("serialize json"))
-        .expect("write json file");
+    std::fs::write(
+        &path,
+        serde_json::to_vec_pretty(value).expect("serialize json"),
+    )
+    .expect("write json file");
     path
 }

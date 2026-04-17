@@ -53,14 +53,10 @@ enum DaemonRequest {
 enum DaemonResponse {
     Stored,
     Deleted,
-    DataKey {
-        data_key_b64: Option<String>,
-    },
+    DataKey { data_key_b64: Option<String> },
     Status(UnlockStatus),
     Shutdown,
-    Error {
-        message: String,
-    },
+    Error { message: String },
 }
 
 #[derive(Debug, Default)]
@@ -95,33 +91,20 @@ impl UnlockStore {
         self.prune_expired();
 
         match session_key {
-            Some(session_key) => self
-                .sessions
-                .get(session_key)
-                .map(|session| UnlockStatus {
-                    unlocked: true,
-                    session_key: Some(session_key.clone()),
-                    expires_at_unix: Some(session.expires_at_unix),
-                })
-                .unwrap_or(UnlockStatus {
-                    unlocked: false,
-                    session_key: Some(session_key.clone()),
-                    expires_at_unix: None,
-                }),
+            Some(session_key) => build_status(
+                Some(session_key.clone()),
+                self.sessions
+                    .get(session_key)
+                    .map(|session| session.expires_at_unix),
+            ),
             None => self
                 .sessions
                 .iter()
                 .next()
-                .map(|(session_key, session)| UnlockStatus {
-                    unlocked: true,
-                    session_key: Some(session_key.clone()),
-                    expires_at_unix: Some(session.expires_at_unix),
+                .map(|(session_key, session)| {
+                    build_status(Some(session_key.clone()), Some(session.expires_at_unix))
                 })
-                .unwrap_or(UnlockStatus {
-                    unlocked: false,
-                    session_key: None,
-                    expires_at_unix: None,
-                }),
+                .unwrap_or_else(|| build_status(None, None)),
         }
     }
 
@@ -141,16 +124,10 @@ pub fn session_key(
     user_id: Uuid,
     data_key_ciphertext: &str,
 ) -> PublicResult<SessionKey> {
-    let ciphertext_bytes = STANDARD_NO_PAD
-        .decode(data_key_ciphertext.trim().as_bytes())
-        .or_else(|_| {
-            base64::engine::general_purpose::STANDARD.decode(data_key_ciphertext.trim().as_bytes())
-        })
-        .map_err(|err| {
-            PublicError::unexpected(format!(
-                "invalid data key ciphertext for daemon session key: {err}"
-            ))
-        })?;
+    let ciphertext_bytes = decode_base64(
+        data_key_ciphertext.trim(),
+        "invalid data key ciphertext for daemon session key",
+    )?;
 
     let mut hasher = Sha256::new();
     hasher.update(ciphertext_bytes);
@@ -169,27 +146,29 @@ pub fn unlock_status(session_key: Option<&SessionKey>) -> PublicResult<UnlockSta
     }) {
         Ok(response) => response,
         Err(err) if is_daemon_unavailable(&err) => {
-            return Ok(UnlockStatus {
-                unlocked: false,
-                session_key: session_key.cloned(),
-                expires_at_unix: None,
-            });
+            return Ok(build_status(session_key.cloned(), None));
         }
         Err(err) => {
             return Err(PublicError::unexpected(format!(
                 "failed to query unlock daemon status: {err}"
-            )))
+            )));
         }
     };
 
     match response {
         DaemonResponse::Status(status) => Ok(status),
         DaemonResponse::Error { message } => Err(PublicError::unexpected(message)),
-        _ => Err(PublicError::unexpected("unexpected daemon response to status")),
+        _ => Err(PublicError::unexpected(
+            "unexpected daemon response to status",
+        )),
     }
 }
 
-pub fn unlock(session_key: &SessionKey, data_key: &SymmetricKey, ttl_seconds: u64) -> PublicResult<()> {
+pub fn unlock(
+    session_key: &SessionKey,
+    data_key: &SymmetricKey,
+    ttl_seconds: u64,
+) -> PublicResult<()> {
     ensure_running()?;
 
     let expires_at_unix = unix_now() + ttl_seconds;
@@ -202,7 +181,9 @@ pub fn unlock(session_key: &SessionKey, data_key: &SymmetricKey, ttl_seconds: u6
     match response {
         DaemonResponse::Stored => Ok(()),
         DaemonResponse::Error { message } => Err(PublicError::unexpected(message)),
-        _ => Err(PublicError::unexpected("unexpected daemon response to unlock")),
+        _ => Err(PublicError::unexpected(
+            "unexpected daemon response to unlock",
+        )),
     }
 }
 
@@ -215,7 +196,7 @@ pub fn fetch_data_key(session_key: &SessionKey) -> PublicResult<Option<Symmetric
         Err(err) => {
             return Err(PublicError::unexpected(format!(
                 "failed to fetch data key from unlock daemon: {err}"
-            )))
+            )));
         }
     };
 
@@ -223,10 +204,7 @@ pub fn fetch_data_key(session_key: &SessionKey) -> PublicResult<Option<Symmetric
         DaemonResponse::DataKey {
             data_key_b64: Some(data_key_b64),
         } => {
-            let bytes = STANDARD_NO_PAD
-                .decode(data_key_b64.as_bytes())
-                .or_else(|_| base64::engine::general_purpose::STANDARD.decode(data_key_b64.as_bytes()))
-                .map_err(|err| PublicError::unexpected(format!("invalid daemon data key: {err}")))?;
+            let bytes = decode_base64(&data_key_b64, "invalid daemon data key")?;
             SymmetricKey::from_slice(&bytes).map(Some)
         }
         DaemonResponse::DataKey { data_key_b64: None } => Ok(None),
@@ -242,14 +220,16 @@ pub fn lock() -> PublicResult<()> {
         Err(err) => {
             return Err(PublicError::unexpected(format!(
                 "failed to shut down unlock daemon: {err}"
-            )))
+            )));
         }
     };
 
     match response {
         DaemonResponse::Shutdown => Ok(()),
         DaemonResponse::Error { message } => Err(PublicError::unexpected(message)),
-        _ => Err(PublicError::unexpected("unexpected daemon response to shutdown")),
+        _ => Err(PublicError::unexpected(
+            "unexpected daemon response to shutdown",
+        )),
     }
 }
 
@@ -262,7 +242,7 @@ pub fn clear_session(session_key: &SessionKey) -> PublicResult<()> {
         Err(err) => {
             return Err(PublicError::unexpected(format!(
                 "failed to clear unlock daemon session: {err}"
-            )))
+            )));
         }
     };
 
@@ -317,14 +297,15 @@ pub async fn serve(socket_path: &Path) -> PublicResult<()> {
             })?;
 
             let mut request_bytes = Vec::new();
-            stream.read_to_end(&mut request_bytes).await.map_err(|err| {
-                PublicError::unexpected(format!("failed to read unlock request: {err}"))
-            })?;
-
-            let request: DaemonRequest =
-                serde_json::from_slice(&request_bytes).map_err(|err| {
-                    PublicError::unexpected(format!("invalid unlock request: {err}"))
+            stream
+                .read_to_end(&mut request_bytes)
+                .await
+                .map_err(|err| {
+                    PublicError::unexpected(format!("failed to read unlock request: {err}"))
                 })?;
+
+            let request: DaemonRequest = serde_json::from_slice(&request_bytes)
+                .map_err(|err| PublicError::unexpected(format!("invalid unlock request: {err}")))?;
 
             let (response, should_exit) = handle_request(&mut store, request);
             let response_bytes = serde_json::to_vec(&response).map_err(|err| {
@@ -372,9 +353,8 @@ fn ensure_running() -> PublicResult<()> {
 }
 
 fn send_request(request: DaemonRequest) -> PublicResult<DaemonResponse> {
-    try_send_request(request).map_err(|err| {
-        PublicError::unexpected(format!("failed to contact unlock daemon: {err}"))
-    })
+    try_send_request(request)
+        .map_err(|err| PublicError::unexpected(format!("failed to contact unlock daemon: {err}")))
 }
 
 fn try_send_request(request: DaemonRequest) -> std::io::Result<DaemonResponse> {
@@ -392,11 +372,9 @@ fn try_send_request(request: DaemonRequest) -> std::io::Result<DaemonResponse> {
         use std::io::{Read, Write};
         use std::os::unix::net::UnixStream;
 
-        let socket_path =
-            socket_path().map_err(std::io::Error::other)?;
+        let socket_path = socket_path().map_err(std::io::Error::other)?;
         let mut stream = UnixStream::connect(&socket_path)?;
-        let request_bytes = serde_json::to_vec(&request)
-            .map_err(std::io::Error::other)?;
+        let request_bytes = serde_json::to_vec(&request).map_err(std::io::Error::other)?;
         stream.write_all(&request_bytes)?;
         stream.shutdown(std::net::Shutdown::Write)?;
 
@@ -428,15 +406,31 @@ fn handle_request(store: &mut UnlockStore, request: DaemonRequest) -> (DaemonRes
             },
             false,
         ),
-        DaemonRequest::Status { session_key } => {
-            (DaemonResponse::Status(store.status(session_key.as_ref())), false)
-        }
+        DaemonRequest::Status { session_key } => (
+            DaemonResponse::Status(store.status(session_key.as_ref())),
+            false,
+        ),
         DaemonRequest::Delete { session_key } => {
             store.delete(&session_key);
             (DaemonResponse::Deleted, false)
         }
         DaemonRequest::Shutdown => (DaemonResponse::Shutdown, true),
     }
+}
+
+fn build_status(session_key: Option<SessionKey>, expires_at_unix: Option<u64>) -> UnlockStatus {
+    UnlockStatus {
+        unlocked: expires_at_unix.is_some(),
+        session_key,
+        expires_at_unix,
+    }
+}
+
+fn decode_base64(value: &str, error_context: &str) -> PublicResult<Vec<u8>> {
+    STANDARD_NO_PAD
+        .decode(value.as_bytes())
+        .or_else(|_| base64::engine::general_purpose::STANDARD.decode(value.as_bytes()))
+        .map_err(|err| PublicError::unexpected(format!("{error_context}: {err}")))
 }
 
 fn is_daemon_unavailable(err: &std::io::Error) -> bool {
@@ -469,14 +463,12 @@ fn set_daemon_dir_permissions(dir: &Path) -> PublicResult<()> {
 fn set_socket_permissions(socket_path: &Path) -> PublicResult<()> {
     use std::os::unix::fs::PermissionsExt;
 
-    std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600)).map_err(
-        |err| {
-            PublicError::unexpected(format!(
-                "failed to set unlock socket permissions on {}: {err}",
-                socket_path.display()
-            ))
-        },
-    )
+    std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600)).map_err(|err| {
+        PublicError::unexpected(format!(
+            "failed to set unlock socket permissions on {}: {err}",
+            socket_path.display()
+        ))
+    })
 }
 
 #[cfg(test)]
