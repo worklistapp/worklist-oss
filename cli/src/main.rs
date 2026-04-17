@@ -20,7 +20,7 @@ use worklist_client_auth::{
     Credentials, UnlockMode, auth_response_to_credentials, clear_credentials, credentials_path,
     load_credentials, load_credentials_for_url, login, logout, normalize_api_url, save_credentials,
 };
-use worklist_client_core::{PublicResult, PublicWorkspaceStage};
+use worklist_client_core::PublicResult;
 use worklist_client_crypto::{
     CommentPayloadBody, CryptoCapability, TaskPayloadBody, build_comment_payload_envelope,
     build_task_payload_envelope, compute_payload_proof, decode_sealed_blob,
@@ -31,9 +31,9 @@ use worklist_client_crypto::{
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "worklist-cli-oss",
+    name = "worklist",
     version,
-    about = "Draft public CLI workspace for Worklist"
+    about = "CLI for working with Worklist tasks, comments, and encrypted workspace data"
 )]
 struct Cli {
     /// API base URL.
@@ -65,7 +65,7 @@ enum OutputFormat {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Show scaffold metadata for the public workspace.
+    /// Show CLI metadata and capability summary.
     Info,
     /// Authenticate and manage local session state.
     Auth {
@@ -276,8 +276,9 @@ async fn run(cli: Cli) -> PublicResult<()> {
         Command::Info => {
             let client = PublicApiClient::new(&cli.api_url);
             let payload = json!({
-                "workspaceStage": PublicWorkspaceStage::Draft.as_str(),
                 "apiBaseUrl": client.base_url(),
+                "commandName": "worklist",
+                "automationProfile": "agent_task_management",
                 "authUnlockModes": [
                     UnlockMode::SingleCommand.as_str(),
                     UnlockMode::Daemon.as_str(),
@@ -288,12 +289,12 @@ async fn run(cli: Cli) -> PublicResult<()> {
                     CryptoCapability::PayloadSeal.as_str(),
                     CryptoCapability::PayloadProof.as_str(),
                 ],
-                "note": "This CLI crate is a scaffold for the future public extraction.",
+                "note": "This CLI is intended for agent-friendly task and comment workflows against Worklist.",
             });
             println!(
                 "{}",
                 serde_json::to_string_pretty(&payload)
-                    .expect("serializing scaffold metadata should succeed")
+                    .expect("serializing CLI metadata should succeed")
             );
             Ok(())
         }
@@ -866,7 +867,7 @@ fn get_authenticated_client(api_url: &str) -> PublicResult<PublicApiClient> {
 
     if credentials.is_refresh_expired() {
         return Err(worklist_client_core::PublicError::validation(
-            "session expired - run 'worklist-cli-oss auth login' to authenticate",
+            "session expired - run 'worklist auth login' to authenticate",
         ));
     }
 
@@ -876,7 +877,7 @@ fn get_authenticated_client(api_url: &str) -> PublicResult<PublicApiClient> {
 fn require_logged_in_credentials(api_url: &str) -> PublicResult<Credentials> {
     load_credentials_for_url(api_url)?.ok_or_else(|| {
         worklist_client_core::PublicError::validation(
-            "not logged in - run 'worklist-cli-oss auth login' first",
+            "not logged in - run 'worklist auth login' first",
         )
     })
 }

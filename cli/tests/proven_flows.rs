@@ -1043,7 +1043,7 @@ async fn update_comment(
 }
 
 fn run_cli(home: &std::path::Path, api_url: &str, args: &[&str], stdin: Option<&str>) -> CliOutput {
-    let mut command = Command::cargo_bin("worklist-cli-oss").expect("binary");
+    let mut command = Command::cargo_bin("worklist").expect("binary");
     command.env("HOME", home);
     command.arg("--api-url").arg(api_url);
     command.args(args);

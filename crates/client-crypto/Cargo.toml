@@ -3,8 +3,13 @@ name = "worklist-client-crypto"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Client-side crypto scaffolding for the Worklist OSS client workspace"
-publish = false
+description = "Client-side crypto helpers for Worklist sealed payloads and key derivation"
+repository = "https://github.com/worklistapp/worklist-oss"
+homepage = "https://worklist.app"
+readme = "../../README.md"
+keywords = ["worklist", "crypto", "client", "encryption"]
+categories = ["cryptography", "api-bindings"]
+publish = ["crates-io"]
 
 [dependencies]
 argon2.workspace = true
@@ -17,4 +22,4 @@ sha2.workspace = true
 strong-box.workspace = true
 uuid.workspace = true
 
-worklist-client-core = { path = "../client-core" }
+worklist-client-core = { version = "0.1.0", path = "../client-core" }

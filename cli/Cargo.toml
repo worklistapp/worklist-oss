@@ -1,10 +1,15 @@
 [package]
-name = "worklist-cli-oss"
+name = "worklist"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Draft public CLI for Worklist agent integrations"
-publish = false
+description = "CLI for working with Worklist tasks, comments, and encrypted workspace data"
+repository = "https://github.com/worklistapp/worklist-oss"
+homepage = "https://worklist.app"
+readme = "../README.md"
+keywords = ["worklist", "cli", "tasks", "productivity", "agents"]
+categories = ["command-line-utilities", "api-bindings"]
+publish = ["crates-io"]
 
 [dependencies]
 base64.workspace = true
@@ -17,10 +22,10 @@ sha2.workspace = true
 tokio.workspace = true
 uuid.workspace = true
 
-worklist-client-api = { path = "../crates/client-api" }
-worklist-client-auth = { path = "../crates/client-auth" }
-worklist-client-core = { path = "../crates/client-core" }
-worklist-client-crypto = { path = "../crates/client-crypto" }
+worklist-client-api = { version = "0.1.0", path = "../crates/client-api" }
+worklist-client-auth = { version = "0.1.0", path = "../crates/client-auth" }
+worklist-client-core = { version = "0.1.0", path = "../crates/client-core" }
+worklist-client-crypto = { version = "0.1.0", path = "../crates/client-crypto" }
 
 [dev-dependencies]
 assert_cmd = "2.0"

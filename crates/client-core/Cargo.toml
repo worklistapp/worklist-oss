@@ -3,10 +3,13 @@ name = "worklist-client-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Shared public types and errors for the Worklist OSS client workspace"
-publish = false
+description = "Shared public types and error handling for Worklist client tooling"
+repository = "https://github.com/worklistapp/worklist-oss"
+homepage = "https://worklist.app"
+readme = "../../README.md"
+keywords = ["worklist", "client", "types"]
+categories = ["api-bindings"]
+publish = ["crates-io"]
 
 [dependencies]
-serde.workspace = true
 thiserror.workspace = true
-

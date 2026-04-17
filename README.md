@@ -1,70 +1,71 @@
-# OSS Workspace
+# Worklist OSS
 
-This repository contains the draft public workspace for the future Worklist agent CLI and shared client crates.
+Open-source Rust workspace for the `worklist` CLI and shared client crates.
 
-It is designed to work in two contexts:
+This repository contains the early public client surface for Worklist:
 
-1. as the root of the public `worklistapp/worklist-oss` repository,
-2. as the `oss/` subtree inside the private Worklist monorepo,
-3. as the release surface for public crates and binaries once the API and license surface are settled.
+- `worklist`: command-line client for authenticating, listing work lists, inspecting encrypted payloads, and creating or updating tasks and comments
+- `worklist-client-core`: shared public types and error handling
+- `worklist-client-auth`: local credential storage and authentication helpers
+- `worklist-client-api`: typed HTTP client for the Worklist API
+- `worklist-client-crypto`: client-side crypto helpers for sealed payloads and key derivation
 
-## Goals
+## Status
 
-- isolate the future public client from private backend code,
-- keep crate boundaries explicit,
-- make `git subtree split --prefix oss` viable,
-- avoid coupling the public CLI to the root workspace.
+This workspace is still in active development and is not yet positioned as a stable public SDK.
+
+- crate boundaries are intentional, but APIs may still change
+- several APIs may still evolve as the agent workflow surface expands
+- the current release target is the CLI first, with supporting crates published alongside it
 
 ## Layout
 
-In the private monorepo, this workspace lives under `oss/`. In the public mirror, these entries live at the repository root.
-
 ```text
 cli/                    # public CLI binary
-crates/client-core/     # shared errors, config, public types
-crates/client-auth/     # OPAQUE/session/unlock flows
+crates/client-core/     # shared public types and errors
+crates/client-auth/     # auth, credentials, and session helpers
 crates/client-api/      # typed API client
-crates/client-crypto/   # client-side crypto and payload builders
+crates/client-crypto/   # client-side crypto and payload helpers
 .github/workflows/ci.yml
 ```
 
-## Current Status
+## Getting Started
 
-This is a scaffold, not the extracted implementation yet.
+Requirements:
 
-- crate names and boundaries are intentional,
-- source files are placeholders,
-- all crates are marked `publish = false`,
-- the workspace is standalone and is not included in the private monorepo root workspace.
+- Rust stable toolchain
 
-## Mirroring
-
-This workspace is intended to be mirrored automatically from the private Worklist monorepo into `worklistapp/worklist-oss`.
-
-- The private monorepo is the source of truth.
-- Maintainers run the subtree split and push automation from that upstream repository.
-- The public mirror receives the resulting `oss/` history on its `main` branch.
-
-If you are reading this file inside the private monorepo, the mirroring automation lives outside this subtree, at the repository root.
-
-## Commands
-
-Public mirror:
+Common commands:
 
 ```bash
 cargo check
 cargo test
-cargo run -p worklist-cli-oss -- --help
+cargo run -p worklist -- --help
 ```
 
-Private monorepo root:
+Once the crate is published, install the CLI with:
 
 ```bash
-cargo check --manifest-path oss/Cargo.toml
-cargo test --manifest-path oss/Cargo.toml
-cargo run --manifest-path oss/Cargo.toml -p worklist-cli-oss -- --help
+cargo install worklist
 ```
 
-## Licensing
+Set a custom API URL with `WORKLIST_API_URL` if you are not targeting the default hosted endpoint:
 
-The workspace currently inherits `GPL-3.0-only` because the existing crypto stack in this repository already uses that license. Revisit this before publication if the crypto dependency story changes.
+```bash
+WORKLIST_API_URL=https://your-worklist.example cargo run -p worklist -- me
+```
+
+## Development Notes
+
+- The CLI defaults to JSON output for data-oriented commands.
+- The current workspace targets encrypted Worklist flows, so some commands expect credentials, sealed payloads, and workspace keys from a live Worklist deployment.
+- CI for this repository runs from `.github/workflows/ci.yml`.
+- Crates.io release steps are documented in [`RELEASE.md`](./RELEASE.md), with a helper script at [`scripts/publish-crates.sh`](./scripts/publish-crates.sh).
+
+## Repository Flow
+
+This public repository is mirrored automatically from Worklist's upstream development repository. The code here is intended to be consumable as a normal standalone Rust workspace, but some changes may land here after first being developed upstream.
+
+## License
+
+This workspace is licensed under `GPL-3.0-only`. See [LICENSE](./LICENSE).

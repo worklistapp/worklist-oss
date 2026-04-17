@@ -3,8 +3,13 @@ name = "worklist-client-auth"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Authentication/session scaffolding for the Worklist OSS client workspace"
-publish = false
+description = "Authentication, credential storage, and session helpers for Worklist clients"
+repository = "https://github.com/worklistapp/worklist-oss"
+homepage = "https://worklist.app"
+readme = "../../README.md"
+keywords = ["worklist", "auth", "client"]
+categories = ["api-bindings"]
+publish = ["crates-io"]
 
 [dependencies]
 argon2.workspace = true
@@ -20,4 +25,4 @@ serde_json.workspace = true
 sha2.workspace = true
 uuid.workspace = true
 
-worklist-client-core = { path = "../client-core" }
+worklist-client-core = { version = "0.1.0", path = "../client-core" }

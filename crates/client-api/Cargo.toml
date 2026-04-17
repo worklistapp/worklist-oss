@@ -3,8 +3,13 @@ name = "worklist-client-api"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "API client scaffolding for the Worklist OSS client workspace"
-publish = false
+description = "Typed HTTP client for the Worklist API"
+repository = "https://github.com/worklistapp/worklist-oss"
+homepage = "https://worklist.app"
+readme = "../../README.md"
+keywords = ["worklist", "api", "client"]
+categories = ["api-bindings"]
+publish = ["crates-io"]
 
 [dependencies]
 chrono.workspace = true
@@ -13,5 +18,5 @@ serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
 
-worklist-client-auth = { path = "../client-auth" }
-worklist-client-core = { path = "../client-core" }
+worklist-client-auth = { version = "0.1.0", path = "../client-auth" }
+worklist-client-core = { version = "0.1.0", path = "../client-core" }
