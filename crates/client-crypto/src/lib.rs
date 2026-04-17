@@ -18,6 +18,10 @@ pub const WORK_LIST_PAYLOAD_CONTEXT: &[u8] = b"worklist.work_list.v1";
 pub const WORK_LIST_MEMBERSHIP_CONTEXT: &[u8] = b"worklist.membership";
 pub const TASK_PAYLOAD_CONTEXT: &[u8] = b"worklist.task.v1";
 pub const COMMENT_PAYLOAD_CONTEXT: &[u8] = b"worklist.comment.v1";
+pub const ATTACHMENT_BLOB_CONTEXT: &[u8] = b"worklist.attachment.blob.v1";
+pub const ATTACHMENT_REF_CONTEXT: &[u8] = b"worklist.attachment.ref.v1";
+pub const ATTACHMENT_BLOB_CONTEXT_LABEL: &str = "worklist.attachment.blob.v1";
+pub const ATTACHMENT_BLOB_REF_VERSION: u8 = 1;
 pub const DATA_KEY_SALT_BYTES: usize = 32;
 pub const KEY_SIZE: usize = 32;
 
@@ -148,6 +152,18 @@ pub struct SealedBlobPayload {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttachmentBlobRef {
+    pub version: u8,
+    pub object_key: String,
+    pub ciphertext_bytes: u64,
+    pub file_key: Vec<u8>,
+    #[serde(default = "default_attachment_blob_context_label")]
+    pub enc_context: String,
+}
+
+pub type FlexibleValue = strong_box::ciborium::Value;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskPayloadEnvelope {
     pub kind: String,
     pub version: u8,
@@ -162,15 +178,15 @@ pub struct TaskPayloadBody {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checklist: Option<Vec<ChecklistItemPayload>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub attachments: Option<Vec<serde_json::Value>>,
+    pub attachments: Option<Vec<FlexibleValue>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub references: Option<Vec<serde_json::Value>>,
+    pub references: Option<Vec<FlexibleValue>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mentions: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub client_meta: Option<serde_json::Value>,
+    pub client_meta: Option<FlexibleValue>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub recurrence_state: Option<serde_json::Value>,
+    pub recurrence_state: Option<FlexibleValue>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -200,9 +216,9 @@ pub struct CommentPayloadBody {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mentions: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub attachments: Option<Vec<serde_json::Value>>,
+    pub attachments: Option<Vec<FlexibleValue>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub client_meta: Option<serde_json::Value>,
+    pub client_meta: Option<FlexibleValue>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -312,12 +328,344 @@ pub fn decrypt_comment_payload(
     )
 }
 
+pub fn decode_attachment_blob_key(
+    list_key: &SymmetricKey,
+    blob_key: &[u8],
+) -> PublicResult<AttachmentBlobRef> {
+    let plaintext = decrypt_sealed_bytes(
+        list_key,
+        blob_key,
+        ATTACHMENT_REF_CONTEXT,
+        "failed to decrypt attachment reference",
+    )?;
+    let blob_ref_value: FlexibleValue = deserialize_from_cbor(&plaintext).map_err(|err| {
+        PublicError::validation(format!(
+            "failed to deserialize attachment reference payload: {err}"
+        ))
+    })?;
+    validate_attachment_blob_ref(parse_attachment_blob_ref(blob_ref_value)?)
+}
+
+pub fn decrypt_attachment_bytes(
+    ciphertext: &[u8],
+    file_key: &[u8],
+    enc_context: Option<&str>,
+) -> PublicResult<Vec<u8>> {
+    let file_key = symmetric_key_from_bytes(file_key)?;
+    let context = enc_context.unwrap_or(ATTACHMENT_BLOB_CONTEXT_LABEL);
+    decrypt_raw_attachment_bytes(&file_key, ciphertext, context.as_bytes()).or_else(|raw_err| {
+        decrypt_sealed_bytes(
+            &file_key,
+            ciphertext,
+            context.as_bytes(),
+            "failed to decrypt attachment bytes",
+        )
+        .map_err(|sealed_err| {
+            PublicError::crypto(format!(
+                "failed to decrypt attachment bytes as raw StrongBox ciphertext ({raw_err}); also failed wrapped payload fallback ({sealed_err})"
+            ))
+        })
+    })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TextValuePayload {
+    value: String,
+}
+
+pub fn decrypt_text_value(payload_ciphertext: &[u8]) -> PublicResult<String> {
+    let sealed = SealedPayload::from_bytes(payload_ciphertext)?;
+    ensure_payload_version(sealed.version)?;
+    let payload: TextValuePayload = deserialize_from_cbor(&sealed.ciphertext)?;
+    Ok(payload.value)
+}
+
+pub fn flexible_value_to_json(value: FlexibleValue) -> serde_json::Value {
+    match value {
+        FlexibleValue::Integer(value) => integer_to_json_value(value),
+        FlexibleValue::Bytes(bytes) => {
+            serde_json::Value::Array(bytes.into_iter().map(serde_json::Value::from).collect())
+        }
+        FlexibleValue::Float(value) => serde_json::Number::from_f64(value)
+            .map(serde_json::Value::Number)
+            .unwrap_or_else(|| serde_json::Value::String(value.to_string())),
+        FlexibleValue::Text(value) => serde_json::Value::String(value),
+        FlexibleValue::Bool(value) => serde_json::Value::Bool(value),
+        FlexibleValue::Null => serde_json::Value::Null,
+        FlexibleValue::Tag(tag, value) => serde_json::json!({
+            "tag": tag,
+            "value": flexible_value_to_json(*value),
+        }),
+        FlexibleValue::Array(values) => {
+            serde_json::Value::Array(values.into_iter().map(flexible_value_to_json).collect())
+        }
+        FlexibleValue::Map(entries) => serde_json::Value::Object(
+            entries
+                .into_iter()
+                .map(|(key, value)| {
+                    (
+                        flexible_map_key_to_string(key),
+                        flexible_value_to_json(value),
+                    )
+                })
+                .collect(),
+        ),
+        other => serde_json::Value::String(format!("{other:?}")),
+    }
+}
+
+pub fn json_value_to_flexible(value: serde_json::Value) -> FlexibleValue {
+    match value {
+        serde_json::Value::Null => FlexibleValue::Null,
+        serde_json::Value::Bool(value) => FlexibleValue::Bool(value),
+        serde_json::Value::Number(value) => {
+            if let Some(value) = value.as_i64() {
+                FlexibleValue::Integer(value.into())
+            } else if let Some(value) = value.as_u64() {
+                FlexibleValue::Integer(value.into())
+            } else {
+                FlexibleValue::Float(
+                    value
+                        .as_f64()
+                        .expect("serde_json number should deserialize as f64"),
+                )
+            }
+        }
+        serde_json::Value::String(value) => FlexibleValue::Text(value),
+        serde_json::Value::Array(values) => {
+            FlexibleValue::Array(values.into_iter().map(json_value_to_flexible).collect())
+        }
+        serde_json::Value::Object(values) => FlexibleValue::Map(
+            values
+                .into_iter()
+                .map(|(key, value)| (FlexibleValue::Text(key), json_value_to_flexible(value)))
+                .collect(),
+        ),
+    }
+}
+
 pub fn build_task_payload_envelope(body: TaskPayloadBody, version: u8) -> TaskPayloadEnvelope {
     TaskPayloadEnvelope {
         kind: "task".to_string(),
         version,
         body,
     }
+}
+
+fn integer_to_json_value(value: strong_box::ciborium::value::Integer) -> serde_json::Value {
+    let value = i128::from(value);
+    if let Ok(value) = i64::try_from(value) {
+        return serde_json::Value::from(value);
+    }
+    if let Ok(value) = u64::try_from(value) {
+        return serde_json::Value::from(value);
+    }
+
+    serde_json::Value::String(value.to_string())
+}
+
+fn flexible_map_key_to_string(value: FlexibleValue) -> String {
+    match value {
+        FlexibleValue::Text(value) => value,
+        other => flexible_value_to_json(other).to_string(),
+    }
+}
+
+fn default_attachment_blob_context_label() -> String {
+    ATTACHMENT_BLOB_CONTEXT_LABEL.to_string()
+}
+
+fn parse_attachment_blob_ref(value: FlexibleValue) -> PublicResult<AttachmentBlobRef> {
+    let json = flexible_value_to_json(value);
+    let version = parse_attachment_blob_ref_version(&json)?;
+    let object_key = parse_attachment_blob_ref_object_key(&json)?;
+    let ciphertext_bytes =
+        parse_required_attachment_blob_ref_u64(&json, &["ciphertext_bytes", "ciphertextBytes"])?;
+    let file_key = parse_attachment_blob_ref_file_key(&json)?;
+    let enc_context =
+        parse_optional_attachment_blob_ref_text(&json, &["enc_context", "encContext"])
+            .unwrap_or_else(default_attachment_blob_context_label);
+
+    Ok(AttachmentBlobRef {
+        version,
+        object_key,
+        ciphertext_bytes,
+        file_key,
+        enc_context,
+    })
+}
+
+fn parse_attachment_blob_ref_version(value: &serde_json::Value) -> PublicResult<u8> {
+    let version = parse_required_attachment_blob_ref_u64(value, &["version"])?;
+    u8::try_from(version).map_err(|_| {
+        PublicError::validation(format!(
+            "attachment reference version {version} does not fit in u8"
+        ))
+    })
+}
+
+fn parse_attachment_blob_ref_object_key(value: &serde_json::Value) -> PublicResult<String> {
+    parse_required_attachment_blob_ref_text(value, &["object_key", "objectKey"]).or_else(|_| {
+        extract_attachment_blob_ref_nested_object_key(value)
+            .ok_or_else(|| PublicError::validation("attachment reference object key is required"))
+    })
+}
+
+fn parse_attachment_blob_ref_file_key(value: &serde_json::Value) -> PublicResult<Vec<u8>> {
+    parse_required_attachment_blob_ref_bytes(value, &["file_key", "fileKey"]).or_else(|_| {
+        find_attachment_blob_ref_value(value, &["file_key", "fileKey"])
+            .and_then(extract_attachment_blob_ref_nested_file_key)
+            .ok_or_else(|| PublicError::validation("attachment reference file key is required"))
+    })
+}
+
+fn parse_required_attachment_blob_ref_text(
+    value: &serde_json::Value,
+    field_names: &[&str],
+) -> PublicResult<String> {
+    find_attachment_blob_ref_value(value, field_names)
+        .and_then(extract_attachment_blob_ref_text)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            PublicError::validation(format!(
+                "attachment reference {} is required",
+                field_names[0]
+            ))
+        })
+}
+
+fn parse_optional_attachment_blob_ref_text(
+    value: &serde_json::Value,
+    field_names: &[&str],
+) -> Option<String> {
+    find_attachment_blob_ref_value(value, field_names)
+        .and_then(extract_attachment_blob_ref_text)
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn parse_required_attachment_blob_ref_u64(
+    value: &serde_json::Value,
+    field_names: &[&str],
+) -> PublicResult<u64> {
+    find_attachment_blob_ref_value(value, field_names)
+        .and_then(extract_attachment_blob_ref_u64)
+        .ok_or_else(|| {
+            PublicError::validation(format!(
+                "attachment reference {} is required",
+                field_names[0]
+            ))
+        })
+}
+
+fn parse_required_attachment_blob_ref_bytes(
+    value: &serde_json::Value,
+    field_names: &[&str],
+) -> PublicResult<Vec<u8>> {
+    find_attachment_blob_ref_value(value, field_names)
+        .and_then(extract_attachment_blob_ref_bytes)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            PublicError::validation(format!(
+                "attachment reference {} is required",
+                field_names[0]
+            ))
+        })
+}
+
+fn find_attachment_blob_ref_value<'a>(
+    value: &'a serde_json::Value,
+    field_names: &[&str],
+) -> Option<&'a serde_json::Value> {
+    match value {
+        serde_json::Value::Object(entries) => {
+            for field_name in field_names {
+                if let Some(value) = entries.get(*field_name) {
+                    return Some(value);
+                }
+            }
+            entries
+                .values()
+                .find_map(|value| find_attachment_blob_ref_value(value, field_names))
+        }
+        serde_json::Value::Array(values) => values
+            .iter()
+            .find_map(|value| find_attachment_blob_ref_value(value, field_names)),
+        _ => None,
+    }
+}
+
+fn extract_attachment_blob_ref_text(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(value) => Some(value.clone()),
+        serde_json::Value::Array(values) => {
+            let bytes = json_array_to_bytes(values)?;
+            String::from_utf8(bytes).ok()
+        }
+        serde_json::Value::Object(_) => extract_attachment_blob_ref_nested_object_key(value),
+        _ => None,
+    }
+}
+
+fn extract_attachment_blob_ref_u64(value: &serde_json::Value) -> Option<u64> {
+    match value {
+        serde_json::Value::Number(value) => value
+            .as_u64()
+            .or_else(|| value.as_i64().and_then(|value| u64::try_from(value).ok())),
+        serde_json::Value::String(value) => value.parse().ok(),
+        _ => None,
+    }
+}
+
+fn extract_attachment_blob_ref_bytes(value: &serde_json::Value) -> Option<Vec<u8>> {
+    match value {
+        serde_json::Value::Array(values) => json_array_to_bytes(values),
+        serde_json::Value::String(value) => decode_base64(value).ok(),
+        serde_json::Value::Object(_) => extract_attachment_blob_ref_nested_file_key(value),
+        _ => None,
+    }
+}
+
+fn extract_attachment_blob_ref_nested_object_key(value: &serde_json::Value) -> Option<String> {
+    find_attachment_blob_ref_value(value, &["object_key", "objectKey", "key", "path", "value"])
+        .and_then(extract_attachment_blob_ref_text)
+}
+
+fn extract_attachment_blob_ref_nested_file_key(value: &serde_json::Value) -> Option<Vec<u8>> {
+    find_attachment_blob_ref_value(value, &["file_key", "fileKey", "bytes", "data", "value"])
+        .and_then(extract_attachment_blob_ref_bytes)
+}
+
+fn json_array_to_bytes(values: &[serde_json::Value]) -> Option<Vec<u8>> {
+    values
+        .iter()
+        .map(|value| value.as_u64().and_then(|byte| u8::try_from(byte).ok()))
+        .collect()
+}
+
+fn validate_attachment_blob_ref(blob_ref: AttachmentBlobRef) -> PublicResult<AttachmentBlobRef> {
+    if blob_ref.version != ATTACHMENT_BLOB_REF_VERSION {
+        return Err(PublicError::validation(format!(
+            "unsupported attachment reference version {}",
+            blob_ref.version
+        )));
+    }
+    if blob_ref.object_key.trim().is_empty() {
+        return Err(PublicError::validation(
+            "attachment reference object key cannot be empty",
+        ));
+    }
+    if blob_ref.ciphertext_bytes == 0 {
+        return Err(PublicError::validation(
+            "attachment reference ciphertext bytes must be positive",
+        ));
+    }
+    symmetric_key_from_bytes(&blob_ref.file_key)?;
+    if blob_ref.enc_context.trim().is_empty() {
+        return Err(PublicError::validation(
+            "attachment reference encryption context cannot be empty",
+        ));
+    }
+    Ok(blob_ref)
 }
 
 pub fn build_comment_payload_envelope(
@@ -441,6 +789,17 @@ fn decrypt_sealed_bytes(
         .strong_box()
         .decrypt(&sealed.ciphertext, context)
         .map_err(|err| PublicError::crypto(format!("{error_context}: {err}")))
+}
+
+fn decrypt_raw_attachment_bytes(
+    key: &SymmetricKey,
+    ciphertext: &[u8],
+    context: &[u8],
+) -> PublicResult<Vec<u8>> {
+    StrongBoxKeyRing::new(key.clone())
+        .strong_box()
+        .decrypt(ciphertext, context)
+        .map_err(|err| PublicError::crypto(format!("failed to decrypt attachment bytes: {err}")))
 }
 
 fn encrypt_sealed_payload<T: Serialize + ?Sized>(
@@ -572,5 +931,83 @@ mod tests {
         let child_a = derive_child_key(&master, "worklist:test").expect("child");
         let child_b = derive_child_key(&master, "worklist:test").expect("child");
         assert_eq!(child_a, child_b);
+    }
+
+    #[test]
+    fn decode_attachment_blob_key_accepts_nested_legacy_blob_ref_shapes() {
+        let list_key = SymmetricKey::new([7; KEY_SIZE]);
+        let legacy_blob_ref = serde_json::json!({
+            "version": 1,
+            "locator": {
+                "bucket": "ignored",
+                "key": "workspaces/test/attachments/attachment-1",
+            },
+            "ciphertextBytes": 123,
+            "fileKey": {
+                "bytes": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+                    17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]
+            },
+            "encContext": "worklist.attachment.blob.v1"
+        });
+        let blob_key = encrypt_sealed_payload(
+            &json_value_to_flexible(legacy_blob_ref),
+            &list_key,
+            ATTACHMENT_REF_CONTEXT,
+            "failed to seal attachment reference",
+        )
+        .expect("seal blob ref")
+        .bytes;
+
+        let decoded = decode_attachment_blob_key(&list_key, &blob_key).expect("decode blob ref");
+
+        assert_eq!(decoded.version, 1);
+        assert_eq!(
+            decoded.object_key,
+            "workspaces/test/attachments/attachment-1"
+        );
+        assert_eq!(decoded.ciphertext_bytes, 123);
+        assert_eq!(decoded.file_key, (1u8..=32).collect::<Vec<_>>());
+        assert_eq!(decoded.enc_context, ATTACHMENT_BLOB_CONTEXT_LABEL);
+    }
+
+    #[test]
+    fn decrypt_attachment_bytes_supports_raw_strongbox_ciphertext() {
+        let file_key = SymmetricKey::new([9; KEY_SIZE]);
+        let plaintext = b"attachment body";
+        let ciphertext = StrongBoxKeyRing::new(file_key.clone())
+            .strong_box()
+            .encrypt(plaintext.as_slice(), ATTACHMENT_BLOB_CONTEXT)
+            .expect("encrypt attachment");
+
+        let decrypted = decrypt_attachment_bytes(
+            &ciphertext,
+            file_key.as_bytes(),
+            Some(ATTACHMENT_BLOB_CONTEXT_LABEL),
+        )
+        .expect("decrypt attachment");
+
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn decrypt_attachment_bytes_keeps_wrapped_payload_fallback() {
+        let file_key = SymmetricKey::new([11; KEY_SIZE]);
+        let plaintext = b"wrapped attachment body";
+        let raw_ciphertext = StrongBoxKeyRing::new(file_key.clone())
+            .strong_box()
+            .encrypt(plaintext.as_slice(), ATTACHMENT_BLOB_CONTEXT)
+            .expect("encrypt attachment");
+        let wrapped_ciphertext = SealedPayload::new(raw_ciphertext)
+            .to_bytes()
+            .expect("wrap attachment");
+
+        let decrypted = decrypt_attachment_bytes(
+            &wrapped_ciphertext,
+            file_key.as_bytes(),
+            Some(ATTACHMENT_BLOB_CONTEXT_LABEL),
+        )
+        .expect("decrypt attachment");
+
+        assert_eq!(decrypted, plaintext);
     }
 }

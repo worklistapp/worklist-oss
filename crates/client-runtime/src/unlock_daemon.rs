@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
@@ -219,7 +219,7 @@ pub fn lock() -> PublicResult<()> {
         Err(err) if is_daemon_unavailable(&err) => return Ok(()),
         Err(err) => {
             return Err(PublicError::unexpected(format!(
-                "failed to shut down unlock daemon: {err}"
+                "failed to lock unlock daemon: {err}"
             )));
         }
     };
@@ -250,172 +250,232 @@ pub fn clear_session(session_key: &SessionKey) -> PublicResult<()> {
         DaemonResponse::Deleted => Ok(()),
         DaemonResponse::Error { message } => Err(PublicError::unexpected(message)),
         _ => Err(PublicError::unexpected(
-            "unexpected daemon response to session delete",
+            "unexpected daemon response to delete",
         )),
     }
 }
 
 pub async fn serve(socket_path: &Path) -> PublicResult<()> {
-    #[cfg(not(unix))]
-    {
-        let _ = socket_path;
-        return Err(PublicError::unexpected(
-            "unlock daemon is only supported on unix platforms",
-        ));
+    let socket_dir = socket_path.parent().ok_or_else(|| {
+        PublicError::unexpected(format!(
+            "unlock daemon socket path has no parent: {}",
+            socket_path.display()
+        ))
+    })?;
+    if !socket_dir.exists() {
+        std::fs::create_dir_all(socket_dir).map_err(|err| {
+            PublicError::unexpected(format!(
+                "failed to create unlock daemon directory {}: {err}",
+                socket_dir.display()
+            ))
+        })?;
     }
 
     #[cfg(unix)]
     {
-        use tokio::net::UnixListener;
+        use std::os::unix::fs::PermissionsExt;
 
-        if let Some(parent) = socket_path.parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(|err| {
+        std::fs::set_permissions(socket_dir, std::fs::Permissions::from_mode(0o700)).map_err(
+            |err| {
                 PublicError::unexpected(format!(
-                    "failed to create daemon directory {}: {err}",
-                    parent.display()
+                    "failed to secure unlock daemon directory {}: {err}",
+                    socket_dir.display()
                 ))
-            })?;
-            set_daemon_dir_permissions(parent)?;
-        }
+            },
+        )?;
+    }
 
-        if socket_path.exists() {
-            let _ = tokio::fs::remove_file(socket_path).await;
-        }
-
-        let listener = UnixListener::bind(socket_path).map_err(|err| {
+    if socket_path.exists() {
+        std::fs::remove_file(socket_path).map_err(|err| {
             PublicError::unexpected(format!(
-                "failed to bind unlock socket {}: {err}",
+                "failed to remove stale unlock daemon socket {}: {err}",
                 socket_path.display()
             ))
         })?;
-        set_socket_permissions(socket_path)?;
-        let mut store = UnlockStore::default();
+    }
 
-        loop {
-            let (mut stream, _) = listener.accept().await.map_err(|err| {
-                PublicError::unexpected(format!("failed to accept unlock connection: {err}"))
-            })?;
+    let listener = tokio::net::UnixListener::bind(socket_path).map_err(|err| {
+        PublicError::unexpected(format!(
+            "failed to bind unlock daemon socket {}: {err}",
+            socket_path.display()
+        ))
+    })?;
 
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600)).map_err(
+            |err| {
+                PublicError::unexpected(format!(
+                    "failed to secure unlock daemon socket {}: {err}",
+                    socket_path.display()
+                ))
+            },
+        )?;
+    }
+
+    let store = std::sync::Arc::new(tokio::sync::Mutex::new(UnlockStore::default()));
+
+    loop {
+        let (mut stream, _) = listener.accept().await.map_err(|err| {
+            PublicError::unexpected(format!("unlock daemon accept failed: {err}"))
+        })?;
+        let store = store.clone();
+
+        let should_shutdown = {
             let mut request_bytes = Vec::new();
             stream
                 .read_to_end(&mut request_bytes)
                 .await
                 .map_err(|err| {
-                    PublicError::unexpected(format!("failed to read unlock request: {err}"))
+                    PublicError::unexpected(format!("unlock daemon read failed: {err}"))
                 })?;
 
-            let request: DaemonRequest = serde_json::from_slice(&request_bytes)
-                .map_err(|err| PublicError::unexpected(format!("invalid unlock request: {err}")))?;
+            let request: DaemonRequest = serde_json::from_slice(&request_bytes).map_err(|err| {
+                PublicError::unexpected(format!("failed to decode unlock daemon request: {err}"))
+            })?;
 
-            let (response, should_exit) = handle_request(&mut store, request);
+            let response = handle_request(request, &store).await;
+            let shutdown = matches!(response, DaemonResponse::Shutdown);
             let response_bytes = serde_json::to_vec(&response).map_err(|err| {
-                PublicError::unexpected(format!("failed to encode unlock response: {err}"))
+                PublicError::unexpected(format!("failed to encode unlock daemon response: {err}"))
             })?;
             stream.write_all(&response_bytes).await.map_err(|err| {
-                PublicError::unexpected(format!("failed to write unlock response: {err}"))
+                PublicError::unexpected(format!("unlock daemon write failed: {err}"))
             })?;
+            shutdown
+        };
 
-            if should_exit {
-                let _ = tokio::fs::remove_file(socket_path).await;
-                return Ok(());
-            }
-        }
-    }
-}
-
-fn ensure_running() -> PublicResult<()> {
-    if try_send_request(DaemonRequest::Status { session_key: None }).is_ok() {
-        return Ok(());
-    }
-
-    let socket_path = socket_path()?;
-    let current_exe = std::env::current_exe().map_err(|err| {
-        PublicError::unexpected(format!("failed to resolve current executable: {err}"))
-    })?;
-
-    std::process::Command::new(current_exe)
-        .arg("--serve-unlock-daemon")
-        .arg(socket_path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|err| PublicError::unexpected(format!("failed to spawn unlock daemon: {err}")))?;
-
-    for _ in 0..10 {
-        std::thread::sleep(Duration::from_millis(50));
-        if try_send_request(DaemonRequest::Status { session_key: None }).is_ok() {
-            return Ok(());
+        if should_shutdown {
+            break;
         }
     }
 
-    Err(PublicError::unexpected("unlock daemon did not start"))
-}
-
-fn send_request(request: DaemonRequest) -> PublicResult<DaemonResponse> {
-    try_send_request(request)
-        .map_err(|err| PublicError::unexpected(format!("failed to contact unlock daemon: {err}")))
-}
-
-fn try_send_request(request: DaemonRequest) -> std::io::Result<DaemonResponse> {
-    #[cfg(not(unix))]
-    {
-        let _ = request;
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "unlock daemon is only supported on unix platforms",
-        ));
+    if socket_path.exists() {
+        let _ = std::fs::remove_file(socket_path);
     }
 
-    #[cfg(unix)]
-    {
-        use std::io::{Read, Write};
-        use std::os::unix::net::UnixStream;
-
-        let socket_path = socket_path().map_err(std::io::Error::other)?;
-        let mut stream = UnixStream::connect(&socket_path)?;
-        let request_bytes = serde_json::to_vec(&request).map_err(std::io::Error::other)?;
-        stream.write_all(&request_bytes)?;
-        stream.shutdown(std::net::Shutdown::Write)?;
-
-        let mut response_bytes = Vec::new();
-        stream.read_to_end(&mut response_bytes)?;
-        serde_json::from_slice(&response_bytes).map_err(std::io::Error::other)
-    }
+    Ok(())
 }
 
-fn handle_request(store: &mut UnlockStore, request: DaemonRequest) -> (DaemonResponse, bool) {
+async fn handle_request(
+    request: DaemonRequest,
+    store: &std::sync::Arc<tokio::sync::Mutex<UnlockStore>>,
+) -> DaemonResponse {
     match request {
         DaemonRequest::Put {
             session_key,
             data_key_b64,
             expires_at_unix,
         } => {
-            store.put(
+            store.lock().await.put(
                 session_key,
                 StoredSession {
                     data_key_b64,
                     expires_at_unix,
                 },
             );
-            (DaemonResponse::Stored, false)
+            DaemonResponse::Stored
         }
-        DaemonRequest::Get { session_key } => (
-            DaemonResponse::DataKey {
-                data_key_b64: store.get(&session_key),
-            },
-            false,
-        ),
-        DaemonRequest::Status { session_key } => (
-            DaemonResponse::Status(store.status(session_key.as_ref())),
-            false,
-        ),
+        DaemonRequest::Get { session_key } => DaemonResponse::DataKey {
+            data_key_b64: store.lock().await.get(&session_key),
+        },
+        DaemonRequest::Status { session_key } => {
+            DaemonResponse::Status(store.lock().await.status(session_key.as_ref()))
+        }
         DaemonRequest::Delete { session_key } => {
-            store.delete(&session_key);
-            (DaemonResponse::Deleted, false)
+            store.lock().await.delete(&session_key);
+            DaemonResponse::Deleted
         }
-        DaemonRequest::Shutdown => (DaemonResponse::Shutdown, true),
+        DaemonRequest::Shutdown => DaemonResponse::Shutdown,
     }
+}
+
+fn send_request(request: DaemonRequest) -> PublicResult<DaemonResponse> {
+    try_send_request(request).map_err(|err| {
+        PublicError::unexpected(format!("failed to communicate with unlock daemon: {err}"))
+    })
+}
+
+fn try_send_request(request: DaemonRequest) -> PublicResult<DaemonResponse> {
+    let socket_path = socket_path()?;
+    let stream = std::os::unix::net::UnixStream::connect(&socket_path).map_err(|err| {
+        PublicError::unexpected(format!(
+            "failed to connect to unlock daemon at {}: {err}",
+            socket_path.display()
+        ))
+    })?;
+    let response = send_request_over_stream(stream, request)?;
+    Ok(response)
+}
+
+fn send_request_over_stream(
+    mut stream: std::os::unix::net::UnixStream,
+    request: DaemonRequest,
+) -> PublicResult<DaemonResponse> {
+    let payload = serde_json::to_vec(&request).map_err(|err| {
+        PublicError::unexpected(format!("failed to encode unlock daemon request: {err}"))
+    })?;
+    use std::io::{Read, Write};
+    stream.write_all(&payload).map_err(|err| {
+        PublicError::unexpected(format!("failed to write unlock daemon request: {err}"))
+    })?;
+    stream.shutdown(std::net::Shutdown::Write).map_err(|err| {
+        PublicError::unexpected(format!("failed to finish unlock daemon request: {err}"))
+    })?;
+
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).map_err(|err| {
+        PublicError::unexpected(format!("failed to read unlock daemon response: {err}"))
+    })?;
+
+    serde_json::from_slice(&response).map_err(|err| {
+        PublicError::unexpected(format!("failed to decode unlock daemon response: {err}"))
+    })
+}
+
+fn ensure_running() -> PublicResult<()> {
+    match try_send_request(DaemonRequest::Status { session_key: None }) {
+        Ok(_) => Ok(()),
+        Err(err) if is_daemon_unavailable(&err) => spawn_daemon(),
+        Err(err) => Err(PublicError::unexpected(format!(
+            "failed to check unlock daemon: {err}"
+        ))),
+    }
+}
+
+fn spawn_daemon() -> PublicResult<()> {
+    let socket_path = socket_path()?;
+    let executable = std::env::current_exe().map_err(|err| {
+        PublicError::unexpected(format!("failed to locate current executable: {err}"))
+    })?;
+    let mut command = std::process::Command::new(executable);
+    command
+        .arg("--serve-unlock-daemon")
+        .arg(&socket_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    command
+        .spawn()
+        .map_err(|err| PublicError::unexpected(format!("failed to start unlock daemon: {err}")))?;
+
+    for _ in 0..50 {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        if try_send_request(DaemonRequest::Status { session_key: None }).is_ok() {
+            return Ok(());
+        }
+    }
+
+    Err(PublicError::unexpected(
+        "unlock daemon did not become ready in time",
+    ))
+}
+
+fn is_daemon_unavailable(err: &PublicError) -> bool {
+    matches!(err, PublicError::Unexpected(message) if message.contains("failed to connect to unlock daemon"))
 }
 
 fn build_status(session_key: Option<SessionKey>, expires_at_unix: Option<u64>) -> UnlockStatus {
@@ -426,89 +486,16 @@ fn build_status(session_key: Option<SessionKey>, expires_at_unix: Option<u64>) -
     }
 }
 
-fn decode_base64(value: &str, error_context: &str) -> PublicResult<Vec<u8>> {
+fn decode_base64(value: &str, message: &str) -> PublicResult<Vec<u8>> {
     STANDARD_NO_PAD
-        .decode(value.as_bytes())
-        .or_else(|_| base64::engine::general_purpose::STANDARD.decode(value.as_bytes()))
-        .map_err(|err| PublicError::unexpected(format!("{error_context}: {err}")))
-}
-
-fn is_daemon_unavailable(err: &std::io::Error) -> bool {
-    matches!(
-        err.kind(),
-        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-    )
+        .decode(value)
+        .or_else(|_| base64::engine::general_purpose::STANDARD.decode(value))
+        .map_err(|err| PublicError::validation(format!("{message}: {err}")))
 }
 
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("system time after unix epoch")
+        .expect("time should be after unix epoch")
         .as_secs()
-}
-
-#[cfg(unix)]
-fn set_daemon_dir_permissions(dir: &Path) -> PublicResult<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(|err| {
-        PublicError::unexpected(format!(
-            "failed to set daemon directory permissions on {}: {err}",
-            dir.display()
-        ))
-    })
-}
-
-#[cfg(unix)]
-fn set_socket_permissions(socket_path: &Path) -> PublicResult<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600)).map_err(|err| {
-        PublicError::unexpected(format!(
-            "failed to set unlock socket permissions on {}: {err}",
-            socket_path.display()
-        ))
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn session_key_normalizes_api_url() {
-        let user_id = Uuid::now_v7();
-        let ciphertext = STANDARD_NO_PAD.encode(b"ciphertext");
-        let left = session_key("https://worklist.app", user_id, &ciphertext).expect("left");
-        let right = session_key("https://worklist.app/", user_id, &ciphertext).expect("right");
-        assert_eq!(left, right);
-    }
-
-    #[test]
-    fn session_key_changes_when_ciphertext_changes() {
-        let user_id = Uuid::now_v7();
-        let left = session_key(
-            "https://worklist.app",
-            user_id,
-            &STANDARD_NO_PAD.encode(b"ciphertext-a"),
-        )
-        .expect("left");
-        let right = session_key(
-            "https://worklist.app",
-            user_id,
-            &STANDARD_NO_PAD.encode(b"ciphertext-b"),
-        )
-        .expect("right");
-        assert_ne!(left, right);
-    }
-
-    #[test]
-    fn session_key_normalizes_equivalent_base64() {
-        let user_id = Uuid::now_v7();
-        let padded = base64::engine::general_purpose::STANDARD.encode(b"ciphertext");
-        let unpadded = STANDARD_NO_PAD.encode(b"ciphertext");
-        let left = session_key("https://worklist.app", user_id, &padded).expect("left");
-        let right = session_key("https://worklist.app", user_id, &unpadded).expect("right");
-        assert_eq!(left, right);
-    }
 }

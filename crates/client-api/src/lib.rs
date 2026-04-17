@@ -131,6 +131,17 @@ impl PublicApiClient {
             .await
     }
 
+    pub async fn get_attachment_download(
+        &mut self,
+        work_list_id: Uuid,
+        attachment_id: Uuid,
+    ) -> PublicResult<DownloadAttachmentResponse> {
+        self.get(&format!(
+            "/work-lists/{work_list_id}/attachments/{attachment_id}/download"
+        ))
+        .await
+    }
+
     pub async fn create_task(
         &mut self,
         work_list_id: Uuid,
@@ -150,6 +161,69 @@ impl PublicApiClient {
             &format!("/work-lists/{work_list_id}/tasks/{task_id}"),
             payload,
         )
+        .await
+    }
+
+    pub async fn move_task(
+        &mut self,
+        work_list_id: Uuid,
+        task_id: Uuid,
+        payload: &MoveTaskRequest,
+    ) -> PublicResult<TaskResponse> {
+        self.post(
+            &format!("/work-lists/{work_list_id}/tasks/{task_id}/move"),
+            payload,
+        )
+        .await
+    }
+
+    pub async fn archive_task(
+        &mut self,
+        work_list_id: Uuid,
+        task_id: Uuid,
+        payload: &ArchiveTaskRequest,
+    ) -> PublicResult<TaskResponse> {
+        self.post(
+            &format!("/work-lists/{work_list_id}/tasks/{task_id}/archive"),
+            payload,
+        )
+        .await
+    }
+
+    pub async fn unarchive_task(
+        &mut self,
+        work_list_id: Uuid,
+        task_id: Uuid,
+        payload: &UnarchiveTaskRequest,
+    ) -> PublicResult<TaskResponse> {
+        self.post(
+            &format!("/work-lists/{work_list_id}/tasks/{task_id}/unarchive"),
+            payload,
+        )
+        .await
+    }
+
+    pub async fn delete_task(
+        &mut self,
+        work_list_id: Uuid,
+        task_id: Uuid,
+        payload: &DeleteTaskRequest,
+    ) -> PublicResult<()> {
+        self.delete_no_content_with_body(
+            &format!("/work-lists/{work_list_id}/tasks/{task_id}"),
+            payload,
+        )
+        .await
+    }
+
+    pub async fn list_comments(
+        &mut self,
+        work_list_id: Uuid,
+        task_id: Uuid,
+    ) -> PublicResult<Vec<CommentResponse>> {
+        self.get(&format!(
+            "/work-lists/{work_list_id}/tasks/{task_id}/comments"
+        ))
         .await
     }
 
@@ -180,6 +254,20 @@ impl PublicApiClient {
         .await
     }
 
+    pub async fn delete_comment(
+        &mut self,
+        work_list_id: Uuid,
+        task_id: Uuid,
+        comment_id: Uuid,
+        payload: &DeleteCommentRequest,
+    ) -> PublicResult<()> {
+        self.delete_no_content_with_body(
+            &format!("/work-lists/{work_list_id}/tasks/{task_id}/comments/{comment_id}"),
+            payload,
+        )
+        .await
+    }
+
     async fn post<T: for<'de> Deserialize<'de>, B: Serialize>(
         &mut self,
         path: &str,
@@ -198,6 +286,16 @@ impl PublicApiClient {
         self.send(self.client.patch(url).json(body), path).await
     }
 
+    async fn delete_no_content_with_body<B: Serialize>(
+        &mut self,
+        path: &str,
+        body: &B,
+    ) -> PublicResult<()> {
+        let url = format!("{}{}", self.base_url, path);
+        self.send_no_content(self.client.delete(url).json(body), path)
+            .await
+    }
+
     async fn send<T: for<'de> Deserialize<'de>>(
         &mut self,
         request: reqwest::RequestBuilder,
@@ -211,6 +309,21 @@ impl PublicApiClient {
             .map_err(|err| map_reqwest_error(err, path))?;
 
         handle_response(response, path).await
+    }
+
+    async fn send_no_content(
+        &mut self,
+        request: reqwest::RequestBuilder,
+        path: &str,
+    ) -> PublicResult<()> {
+        let token = self.get_access_token().await?;
+        let response = self
+            .authorized(request, &token)
+            .send()
+            .await
+            .map_err(|err| map_reqwest_error(err, path))?;
+
+        handle_empty_response(response, path).await
     }
 
     fn authorized(
@@ -267,7 +380,7 @@ pub struct WorkListDetailResponse {
     pub members: Vec<MembershipResponse>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SectionSnapshotPayload {
     pub id: Uuid,
@@ -409,6 +522,14 @@ pub struct DashboardStatsResponse {
     pub completed: i64,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadAttachmentResponse {
+    pub download_url: String,
+    pub download_headers: std::collections::HashMap<String, String>,
+    pub expires_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateTaskRequest {
@@ -447,6 +568,55 @@ pub struct UpdateTaskRequest {
     pub section_id: Option<Option<Uuid>>,
 }
 
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MoveTaskRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub section_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub insert_before_task_id: Option<Uuid>,
+}
+
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveTaskRequest {}
+
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnarchiveTaskRequest {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditPatchFieldRequest {
+    pub field: String,
+    pub change_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub before_scalar: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after_scalar: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub before_ciphertext_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after_ciphertext_digest: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditPatchRequest {
+    #[serde(default)]
+    pub fields: Vec<AuditPatchFieldRequest>,
+    pub payload_ciphertext: String,
+    pub payload_ciphertext_proof: String,
+    pub payload_version: i64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteTaskRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audit_patch: Option<AuditPatchRequest>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateCommentRequest {
@@ -461,6 +631,13 @@ pub struct UpdateCommentRequest {
     pub body_ciphertext: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body_ciphertext_proof: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteCommentRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audit_patch: Option<AuditPatchRequest>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -478,6 +655,19 @@ async fn handle_response<T: for<'de> Deserialize<'de>>(
         response.json().await.map_err(|err| {
             PublicError::unexpected(format!("failed to parse response from {path}: {err}"))
         })
+    } else {
+        let error_text = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "unknown error".to_string());
+        Err(map_api_error(status.as_u16(), &error_text, path))
+    }
+}
+
+async fn handle_empty_response(response: reqwest::Response, path: &str) -> PublicResult<()> {
+    let status = response.status();
+    if status.is_success() {
+        Ok(())
     } else {
         let error_text = response
             .text()

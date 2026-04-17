@@ -1,32 +1,30 @@
 [package]
-name = "worklist-client-auth"
+name = "worklist-client-runtime"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Authentication, credential storage, and session helpers for Worklist clients"
+description = "Agent-facing runtime and decrypted read models for Worklist clients"
 repository = "https://github.com/worklistapp/worklist-oss"
 homepage = "https://worklist.app"
 readme = "../../README.md"
-keywords = ["worklist", "auth", "client"]
+keywords = ["worklist", "runtime", "agents", "client"]
 categories = ["api-bindings"]
 publish = ["crates-io"]
 
 [dependencies]
-argon2.workspace = true
 base64.workspace = true
 chrono.workspace = true
-dirs.workspace = true
-generic-array.workspace = true
-keyring.workspace = true
-opaque-ke.workspace = true
-rand_core.workspace = true
+html2md.workspace = true
+rpassword.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+tokio.workspace = true
+undocx.workspace = true
 uuid.workspace = true
 
+worklist-client-api = { version = "0.1.0", path = "../client-api" }
+worklist-client-auth = { version = "0.1.0", path = "../client-auth" }
 worklist-client-core = { version = "0.1.0", path = "../client-core" }
-
-[dev-dependencies]
-tempfile = "3.14"
+worklist-client-crypto = { version = "0.1.0", path = "../client-crypto" }

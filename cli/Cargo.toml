@@ -26,6 +26,7 @@ worklist-client-api = { version = "0.1.0", path = "../crates/client-api" }
 worklist-client-auth = { version = "0.1.0", path = "../crates/client-auth" }
 worklist-client-core = { version = "0.1.0", path = "../crates/client-core" }
 worklist-client-crypto = { version = "0.1.0", path = "../crates/client-crypto" }
+worklist-client-runtime = { version = "0.1.0", path = "../crates/client-runtime" }
 
 [dev-dependencies]
 assert_cmd = "2.0"

@@ -16,12 +16,14 @@ use opaque_ke::{
 };
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
-use sha2::Sha512;
+use sha2::{Digest, Sha256, Sha512};
 use uuid::Uuid;
 
 use worklist_client_core::{PublicError, PublicResult};
 
 const OPAQUE_SERVER_ID: &[u8] = b"worklist.api";
+const DATA_KEY_KEYCHAIN_SERVICE: &str = "worklist.data-key";
+const TEST_KEYCHAIN_DIR_ENV: &str = "WORKLIST_TEST_KEYCHAIN_DIR";
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -73,6 +75,20 @@ impl Credentials {
     }
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum PersistedDataKeyStatus {
+    Available,
+    Missing,
+    Unavailable(String),
+}
+
+impl PersistedDataKeyStatus {
+    #[must_use]
+    pub fn is_available(&self) -> bool {
+        matches!(self, Self::Available)
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoginStartResponse {
@@ -109,7 +125,9 @@ pub struct UserResponse {
 #[serde(rename_all = "camelCase")]
 pub struct RefreshResponse {
     pub access_token: String,
+    pub refresh_token: String,
     pub expires_in: u64,
+    pub refresh_expires_in: u64,
     pub token_type: String,
 }
 
@@ -251,6 +269,27 @@ pub fn clear_credentials() -> PublicResult<()> {
         })?;
     }
     Ok(())
+}
+
+pub fn load_persisted_data_key(credentials: &Credentials) -> PublicResult<Option<Vec<u8>>> {
+    persisted_data_key_backend().load(credentials)
+}
+
+pub fn save_persisted_data_key(credentials: &Credentials, data_key: &[u8]) -> PublicResult<()> {
+    persisted_data_key_backend().save(credentials, data_key)
+}
+
+pub fn clear_persisted_data_key(credentials: &Credentials) -> PublicResult<()> {
+    persisted_data_key_backend().clear(credentials)
+}
+
+#[must_use]
+pub fn persisted_data_key_status(credentials: &Credentials) -> PersistedDataKeyStatus {
+    match load_persisted_data_key(credentials) {
+        Ok(Some(_)) => PersistedDataKeyStatus::Available,
+        Ok(None) => PersistedDataKeyStatus::Missing,
+        Err(err) => PersistedDataKeyStatus::Unavailable(err.to_string()),
+    }
 }
 
 #[cfg(unix)]
@@ -400,8 +439,8 @@ pub fn auth_response_to_credentials(api_url: &str, response: AuthResponse) -> Cr
         api_url: normalize_api_url(api_url),
         access_token: response.access_token,
         refresh_token: response.refresh_token,
-        access_expires_at: now + chrono::Duration::seconds(response.expires_in as i64),
-        refresh_expires_at: now + chrono::Duration::seconds(response.refresh_expires_in as i64),
+        access_expires_at: expires_at_from(now, response.expires_in),
+        refresh_expires_at: expires_at_from(now, response.refresh_expires_in),
         user_id: response.user.id,
         email: response.user.email,
         data_key_ciphertext: response.data_key_ciphertext,
@@ -414,8 +453,156 @@ pub fn update_credentials_with_refresh(
 ) {
     let now = Utc::now();
     credentials.access_token = refresh_response.access_token;
-    credentials.access_expires_at =
-        now + chrono::Duration::seconds(refresh_response.expires_in as i64);
+    credentials.refresh_token = refresh_response.refresh_token;
+    credentials.access_expires_at = expires_at_from(now, refresh_response.expires_in);
+    credentials.refresh_expires_at = expires_at_from(now, refresh_response.refresh_expires_in);
+}
+
+fn expires_at_from(now: DateTime<Utc>, expires_in_seconds: u64) -> DateTime<Utc> {
+    now + chrono::Duration::seconds(expires_in_seconds as i64)
+}
+
+enum PersistedDataKeyBackend {
+    PlatformKeyring,
+    TestDirectory(PathBuf),
+}
+
+impl PersistedDataKeyBackend {
+    fn load(&self, credentials: &Credentials) -> PublicResult<Option<Vec<u8>>> {
+        match self {
+            Self::PlatformKeyring => {
+                let entry = platform_keyring_entry(credentials)?;
+                match entry.get_secret() {
+                    Ok(secret) => Ok(Some(secret)),
+                    Err(keyring::Error::NoEntry) => Ok(None),
+                    Err(err) => Err(map_keyring_error("read from the platform keychain", err)),
+                }
+            }
+            Self::TestDirectory(dir) => load_test_persisted_data_key(dir, credentials),
+        }
+    }
+
+    fn save(&self, credentials: &Credentials, data_key: &[u8]) -> PublicResult<()> {
+        match self {
+            Self::PlatformKeyring => {
+                let entry = platform_keyring_entry(credentials)?;
+                entry
+                    .set_secret(data_key)
+                    .map_err(|err| map_keyring_error("write to the platform keychain", err))
+            }
+            Self::TestDirectory(dir) => save_test_persisted_data_key(dir, credentials, data_key),
+        }
+    }
+
+    fn clear(&self, credentials: &Credentials) -> PublicResult<()> {
+        match self {
+            Self::PlatformKeyring => {
+                let entry = platform_keyring_entry(credentials)?;
+                match entry.delete_credential() {
+                    Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+                    Err(err) => Err(map_keyring_error("clear the platform keychain entry", err)),
+                }
+            }
+            Self::TestDirectory(dir) => clear_test_persisted_data_key(dir, credentials),
+        }
+    }
+}
+
+fn persisted_data_key_backend() -> PersistedDataKeyBackend {
+    match std::env::var(TEST_KEYCHAIN_DIR_ENV) {
+        Ok(dir) if !dir.trim().is_empty() => PersistedDataKeyBackend::TestDirectory(dir.into()),
+        _ => PersistedDataKeyBackend::PlatformKeyring,
+    }
+}
+
+fn platform_keyring_entry(credentials: &Credentials) -> PublicResult<keyring::Entry> {
+    let entry_name = persisted_data_key_entry_name(credentials)?;
+    keyring::Entry::new(DATA_KEY_KEYCHAIN_SERVICE, &entry_name)
+        .map_err(|err| map_keyring_error("create the platform keychain entry", err))
+}
+
+fn persisted_data_key_entry_name(credentials: &Credentials) -> PublicResult<String> {
+    let fingerprint = data_key_fingerprint(&credentials.data_key_ciphertext)?;
+    Ok(format!(
+        "{}::{}::{}",
+        normalize_api_url(&credentials.api_url),
+        credentials.user_id,
+        fingerprint
+    ))
+}
+
+fn data_key_fingerprint(data_key_ciphertext: &str) -> PublicResult<String> {
+    let mut hasher = Sha256::new();
+    hasher.update(decode_bytes(data_key_ciphertext)?);
+    Ok(URL_SAFE_NO_PAD.encode(hasher.finalize()))
+}
+
+fn map_keyring_error(action: &str, err: keyring::Error) -> PublicError {
+    PublicError::validation(format!("failed to {action}: {err}"))
+}
+
+fn load_test_persisted_data_key(
+    dir: &Path,
+    credentials: &Credentials,
+) -> PublicResult<Option<Vec<u8>>> {
+    let path = test_persisted_data_key_path(dir, credentials)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    fs::read(&path).map(Some).map_err(|err| {
+        PublicError::unexpected(format!(
+            "failed to read the persisted test keychain secret {}: {err}",
+            path.display()
+        ))
+    })
+}
+
+fn save_test_persisted_data_key(
+    dir: &Path,
+    credentials: &Credentials,
+    data_key: &[u8],
+) -> PublicResult<()> {
+    fs::create_dir_all(dir).map_err(|err| {
+        PublicError::unexpected(format!(
+            "failed to create the persisted test keychain directory {}: {err}",
+            dir.display()
+        ))
+    })?;
+    set_config_dir_permissions(dir)?;
+
+    let path = test_persisted_data_key_path(dir, credentials)?;
+    fs::write(&path, data_key).map_err(|err| {
+        PublicError::unexpected(format!(
+            "failed to write the persisted test keychain secret {}: {err}",
+            path.display()
+        ))
+    })?;
+    set_secret_file_permissions(&path)?;
+    Ok(())
+}
+
+fn clear_test_persisted_data_key(dir: &Path, credentials: &Credentials) -> PublicResult<()> {
+    let path = test_persisted_data_key_path(dir, credentials)?;
+    if !path.exists() {
+        return Ok(());
+    }
+
+    fs::remove_file(&path).map_err(|err| {
+        PublicError::unexpected(format!(
+            "failed to remove the persisted test keychain secret {}: {err}",
+            path.display()
+        ))
+    })
+}
+
+fn test_persisted_data_key_path(dir: &Path, credentials: &Credentials) -> PublicResult<PathBuf> {
+    let entry_name = persisted_data_key_entry_name(credentials)?;
+    let file_name = format!(
+        "persisted-data-key-{}.bin",
+        URL_SAFE_NO_PAD.encode(Sha256::digest(entry_name.as_bytes()))
+    );
+    Ok(dir.join(file_name))
 }
 
 fn encode_bytes(bytes: &[u8]) -> String {
@@ -478,5 +665,74 @@ fn map_api_error(status: u16, body: &str) -> PublicError {
         403 => PublicError::validation("access denied"),
         404 => PublicError::validation("resource not found"),
         _ => PublicError::unexpected(format!("API error ({status}): {body}")),
+    }
+}
+
+#[cfg(unix)]
+fn set_secret_file_permissions(path: &Path) -> PublicResult<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|err| {
+        PublicError::unexpected(format!(
+            "failed to set secret file permissions on {}: {err}",
+            path.display()
+        ))
+    })
+}
+
+#[cfg(not(unix))]
+fn set_secret_file_permissions(_path: &Path) -> PublicResult<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration;
+    use tempfile::TempDir;
+
+    fn test_credentials() -> Credentials {
+        Credentials {
+            api_url: "https://worklist.example.test".to_string(),
+            access_token: "access".to_string(),
+            refresh_token: "refresh".to_string(),
+            access_expires_at: Utc::now() + Duration::hours(1),
+            refresh_expires_at: Utc::now() + Duration::days(1),
+            user_id: Uuid::now_v7(),
+            email: "test@example.com".to_string(),
+            data_key_ciphertext: STANDARD_NO_PAD.encode(b"ciphertext"),
+        }
+    }
+
+    #[test]
+    fn test_persisted_data_key_round_trips_through_test_backend() {
+        let temp = TempDir::new().expect("temp dir");
+        let credentials = test_credentials();
+        unsafe {
+            std::env::set_var(TEST_KEYCHAIN_DIR_ENV, temp.path());
+        }
+
+        save_persisted_data_key(&credentials, b"secret").expect("store key");
+        let loaded = load_persisted_data_key(&credentials).expect("load key");
+
+        assert_eq!(loaded.as_deref(), Some(b"secret".as_slice()));
+        assert_eq!(
+            persisted_data_key_status(&credentials),
+            PersistedDataKeyStatus::Available
+        );
+
+        clear_persisted_data_key(&credentials).expect("clear key");
+        assert_eq!(
+            load_persisted_data_key(&credentials).expect("reload key"),
+            None
+        );
+        assert_eq!(
+            persisted_data_key_status(&credentials),
+            PersistedDataKeyStatus::Missing
+        );
+
+        unsafe {
+            std::env::remove_var(TEST_KEYCHAIN_DIR_ENV);
+        }
     }
 }

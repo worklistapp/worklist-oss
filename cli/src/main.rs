@@ -1,42 +1,160 @@
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
-mod unlock_daemon;
-
+use std::fmt;
 use std::fs;
+use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use rpassword::prompt_password;
-use serde::{Deserialize, de::DeserializeOwned};
+use serde::{Serialize, de::DeserializeOwned};
 use serde_json::json;
 use uuid::Uuid;
 use worklist_client_api::{
-    CommentResponse, CreateCommentRequest, CreateTaskRequest, CurrentUserResponse,
-    DashboardStatsResponse, MyTaskResponse, PublicApiClient, TaskResponse, UpdateCommentRequest,
-    UpdateTaskRequest, WorkListDetailResponse, WorkListResponse,
+    CurrentUserResponse, DashboardStatsResponse, DeleteCommentRequest, DeleteTaskRequest,
+    TaskDetailResponse, TaskResponse, WorkListDetailResponse, WorkListResponse,
 };
 use worklist_client_auth::{
-    Credentials, UnlockMode, auth_response_to_credentials, clear_credentials, credentials_path,
-    load_credentials, load_credentials_for_url, login, logout, normalize_api_url, save_credentials,
+    PersistedDataKeyStatus, UnlockMode, auth_response_to_credentials, clear_credentials,
+    credentials_path, load_credentials, load_credentials_for_url, login, logout, normalize_api_url,
+    persisted_data_key_status, save_credentials,
 };
-use worklist_client_core::PublicResult;
-use worklist_client_crypto::{
-    CommentPayloadBody, CryptoCapability, TaskPayloadBody, build_comment_payload_envelope,
-    build_task_payload_envelope, compute_payload_proof, decode_sealed_blob,
-    decrypt_comment_payload, decrypt_task_payload, decrypt_user_data_key, decrypt_work_list_key,
-    decrypt_work_list_payload, derive_payload_binding_key, derive_work_list_key,
-    encrypt_comment_payload, encrypt_task_payload, plaintext_rich_text, seal_text_value,
+use worklist_client_core::{PublicError, PublicResult};
+use worklist_client_crypto::CryptoCapability;
+use worklist_client_runtime::{
+    AgentComment, AgentTaskDetail, AgentTaskSummary, AgentWorkListDetail, AgentWorkListSummary,
+    ArchiveTaskArgs, CommentInput, CreateCommentArgs, CreateTaskArgs, DeleteCommentArgs,
+    DeleteTaskArgs, MoveTaskArgs, MoveTaskInput, ReadableAttachment, RuntimeClient,
+    TaskCreateInput, TaskUpdateInput, UnarchiveTaskArgs, UpdateCommentArgs, UpdateTaskArgs,
+    clear_session, lock, serve, session_key, unlock_status,
 };
+
+type CliResult<T> = Result<T, CliError>;
+
+#[derive(Debug)]
+enum CliError {
+    BrokenPipe,
+    Public(PublicError),
+}
+
+impl std::error::Error for CliError {}
+
+impl fmt::Display for CliError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BrokenPipe => write!(f, "broken pipe"),
+            Self::Public(err) => err.fmt(f),
+        }
+    }
+}
+
+impl From<PublicError> for CliError {
+    fn from(value: PublicError) -> Self {
+        Self::Public(value)
+    }
+}
+
+macro_rules! print {
+    () => {
+        write_stdout(format_args!(""))?
+    };
+    ($($arg:tt)*) => {
+        write_stdout(format_args!($($arg)*))?
+    };
+}
+
+macro_rules! println {
+    () => {
+        write_stdout_line(format_args!(""))?
+    };
+    ($($arg:tt)*) => {
+        write_stdout_line(format_args!($($arg)*))?
+    };
+}
+
+macro_rules! eprintln {
+    () => {
+        let _ = write_stderr_line(format_args!(""));
+    };
+    ($($arg:tt)*) => {
+        let _ = write_stderr_line(format_args!($($arg)*));
+    };
+}
+
+fn write_stdout(args: fmt::Arguments<'_>) -> CliResult<()> {
+    write_to_stream(io::stdout().lock(), args, "print to", "stdout", true)
+}
+
+fn write_stdout_line(args: fmt::Arguments<'_>) -> CliResult<()> {
+    write_line_to_stream(io::stdout().lock(), args, "print to", "stdout", true)
+}
+
+fn write_stderr_line(args: fmt::Arguments<'_>) -> CliResult<()> {
+    write_line_to_stream(io::stderr().lock(), args, "print to", "stderr", false)
+}
+
+fn flush_stdout() -> CliResult<()> {
+    io::stdout()
+        .lock()
+        .flush()
+        .map_err(|err| map_stream_error(err, "flush", "stdout", true))
+}
+
+fn write_to_stream<W: Write>(
+    mut stream: W,
+    args: fmt::Arguments<'_>,
+    action: &str,
+    stream_name: &str,
+    broken_pipe_is_success: bool,
+) -> CliResult<()> {
+    stream
+        .write_fmt(args)
+        .map_err(|err| map_stream_error(err, action, stream_name, broken_pipe_is_success))
+}
+
+fn write_line_to_stream<W: Write>(
+    mut stream: W,
+    args: fmt::Arguments<'_>,
+    action: &str,
+    stream_name: &str,
+    broken_pipe_is_success: bool,
+) -> CliResult<()> {
+    stream
+        .write_fmt(args)
+        .map_err(|err| map_stream_error(err, action, stream_name, broken_pipe_is_success))?;
+    stream
+        .write_all(b"\n")
+        .map_err(|err| map_stream_error(err, action, stream_name, broken_pipe_is_success))
+}
+
+fn map_stream_error(
+    err: io::Error,
+    action: &str,
+    stream_name: &str,
+    broken_pipe_is_success: bool,
+) -> CliError {
+    if broken_pipe_is_success && err.kind() == io::ErrorKind::BrokenPipe {
+        CliError::BrokenPipe
+    } else {
+        CliError::Public(PublicError::unexpected(format!(
+            "failed to {action} {stream_name}: {err}"
+        )))
+    }
+}
+
+fn print_pretty_json<T: Serialize + ?Sized>(value: &T, context: &str) -> CliResult<()> {
+    let output = serde_json::to_string_pretty(value).expect(context);
+    println!("{output}");
+    Ok(())
+}
 
 #[derive(Parser, Debug)]
 #[command(
     name = "worklist",
     version,
-    about = "CLI for working with Worklist tasks, comments, and encrypted workspace data"
+    about = "CLI for working with Worklist tasks, comments, and decrypted workspace data"
 )]
 struct Cli {
-    /// API base URL.
     #[arg(
         long,
         env = "WORKLIST_API_URL",
@@ -45,8 +163,7 @@ struct Cli {
     )]
     api_url: String,
 
-    /// Output format for data commands.
-    #[arg(long, value_enum, default_value_t = OutputFormat::Json, global = true)]
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table, global = true)]
     format: OutputFormat,
 
     #[arg(long, hide = true)]
@@ -58,41 +175,40 @@ struct Cli {
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum, Default)]
 enum OutputFormat {
-    Table,
     #[default]
+    Table,
     Json,
 }
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Show CLI metadata and capability summary.
     Info,
-    /// Authenticate and manage local session state.
     Auth {
         #[command(subcommand)]
         command: AuthCommand,
     },
-    /// Fetch the current user profile.
     Me,
-    /// List work lists for the current user.
     Lists {
         #[arg(long)]
         verbose: bool,
+        #[arg(long)]
+        password_stdin: bool,
+        #[arg(long, hide = true)]
+        raw: bool,
+        #[command(subcommand)]
+        command: Option<ListsCommand>,
     },
-    /// Manage tasks.
     Tasks {
         #[command(subcommand)]
         command: TasksCommand,
     },
-    /// Show dashboard statistics.
     Stats,
-    /// Inspect and decrypt work list payload data.
+    #[command(hide = true)]
     Inspect {
         work_list_id: Uuid,
         #[arg(long)]
         password_stdin: bool,
     },
-    /// Create and update encrypted comments.
     Comments {
         #[command(subcommand)]
         command: CommentsCommand,
@@ -100,8 +216,18 @@ enum Command {
 }
 
 #[derive(Subcommand, Debug)]
+enum ListsCommand {
+    Get {
+        work_list_id: Uuid,
+        #[arg(long)]
+        password_stdin: bool,
+        #[arg(long, hide = true)]
+        raw: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum TasksCommand {
-    /// List tasks.
     List {
         #[arg(long)]
         work_list_id: Option<Uuid>,
@@ -109,23 +235,56 @@ enum TasksCommand {
         include_completed: bool,
         #[arg(long)]
         all: bool,
+        #[arg(long)]
+        password_stdin: bool,
+        #[arg(long, hide = true)]
+        raw: bool,
     },
-    /// Create a new task in a work list.
-    Create(TaskCreateArgs),
-    /// Update an existing task's encrypted title/body.
-    Update(TaskUpdateArgs),
+    Get {
+        #[arg(long)]
+        work_list_id: Uuid,
+        #[arg(long)]
+        task_id: Uuid,
+        #[arg(long)]
+        password_stdin: bool,
+        #[arg(long, hide = true)]
+        raw: bool,
+    },
+    Create(TaskCreateArgsCli),
+    Update(TaskUpdateArgsCli),
+    Move(TaskMoveArgsCli),
+    Archive(TaskArchiveArgsCli),
+    Unarchive(TaskUnarchiveArgsCli),
+    Delete(TaskDeleteArgsCli),
+    Attachments {
+        #[command(subcommand)]
+        command: TaskAttachmentsCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum TaskAttachmentsCommand {
+    Read(TaskAttachmentReadArgsCli),
+    Download(TaskAttachmentDownloadArgsCli),
 }
 
 #[derive(Subcommand, Debug)]
 enum CommentsCommand {
-    /// Create a new comment on a task.
-    Create(CommentCreateArgs),
-    /// Update an existing comment.
-    Update(CommentUpdateArgs),
+    List {
+        #[arg(long)]
+        work_list_id: Uuid,
+        #[arg(long)]
+        task_id: Uuid,
+        #[arg(long)]
+        password_stdin: bool,
+    },
+    Create(CommentCreateArgsCli),
+    Update(CommentUpdateArgsCli),
+    Delete(CommentDeleteArgsCli),
 }
 
 #[derive(Args, Debug)]
-struct TaskCreateArgs {
+struct TaskCreateArgsCli {
     #[arg(long)]
     work_list_id: Uuid,
     #[arg(long)]
@@ -141,7 +300,7 @@ struct TaskCreateArgs {
 }
 
 #[derive(Args, Debug)]
-struct TaskUpdateArgs {
+struct TaskUpdateArgsCli {
     #[arg(long)]
     work_list_id: Uuid,
     #[arg(long)]
@@ -159,7 +318,53 @@ struct TaskUpdateArgs {
 }
 
 #[derive(Args, Debug)]
-struct CommentCreateArgs {
+struct TaskMoveArgsCli {
+    #[arg(long)]
+    work_list_id: Uuid,
+    #[arg(long)]
+    task_id: Uuid,
+    #[arg(long)]
+    section_id: Option<Uuid>,
+    #[arg(long)]
+    insert_before_task_id: Option<Uuid>,
+    #[arg(long)]
+    password_stdin: bool,
+}
+
+#[derive(Args, Debug)]
+struct TaskArchiveArgsCli {
+    #[arg(long)]
+    work_list_id: Uuid,
+    #[arg(long)]
+    task_id: Uuid,
+    #[arg(long)]
+    password_stdin: bool,
+}
+
+#[derive(Args, Debug)]
+struct TaskUnarchiveArgsCli {
+    #[arg(long)]
+    work_list_id: Uuid,
+    #[arg(long)]
+    task_id: Uuid,
+    #[arg(long)]
+    password_stdin: bool,
+}
+
+#[derive(Args, Debug)]
+struct TaskDeleteArgsCli {
+    #[arg(long)]
+    work_list_id: Uuid,
+    #[arg(long)]
+    task_id: Uuid,
+    #[arg(long)]
+    input_file: Option<PathBuf>,
+    #[arg(long)]
+    input_stdin: bool,
+}
+
+#[derive(Args, Debug)]
+struct CommentCreateArgsCli {
     #[arg(long)]
     work_list_id: Uuid,
     #[arg(long)]
@@ -175,7 +380,7 @@ struct CommentCreateArgs {
 }
 
 #[derive(Args, Debug)]
-struct CommentUpdateArgs {
+struct CommentUpdateArgsCli {
     #[arg(long)]
     work_list_id: Uuid,
     #[arg(long)]
@@ -192,24 +397,46 @@ struct CommentUpdateArgs {
     password_stdin: bool,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct TaskCreateInput {
-    title: String,
-    body: Option<String>,
+#[derive(Args, Debug)]
+struct CommentDeleteArgsCli {
+    #[arg(long)]
+    work_list_id: Uuid,
+    #[arg(long)]
+    task_id: Uuid,
+    #[arg(long)]
+    comment_id: Uuid,
+    #[arg(long)]
+    input_file: Option<PathBuf>,
+    #[arg(long)]
+    input_stdin: bool,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct TaskUpdateInput {
-    title: Option<String>,
-    body: Option<String>,
+#[derive(Args, Debug)]
+struct TaskAttachmentReadArgsCli {
+    #[arg(long)]
+    work_list_id: Uuid,
+    #[arg(long)]
+    task_id: Uuid,
+    #[arg(long)]
+    attachment_id: Uuid,
+    #[arg(long)]
+    password_stdin: bool,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CommentInput {
-    body: String,
+#[derive(Args, Debug)]
+struct TaskAttachmentDownloadArgsCli {
+    #[arg(long)]
+    work_list_id: Uuid,
+    #[arg(long)]
+    task_id: Uuid,
+    #[arg(long)]
+    attachment_id: Uuid,
+    #[arg(long)]
+    output: Option<PathBuf>,
+    #[arg(long)]
+    force: bool,
+    #[arg(long)]
+    password_stdin: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -229,105 +456,125 @@ impl<'a> JsonInputSource<'a> {
 
 #[derive(Subcommand, Debug)]
 enum AuthCommand {
-    /// Login and persist credentials.
     Login {
         #[arg(long)]
         email: Option<String>,
         #[arg(long)]
         password_stdin: bool,
     },
-    /// Unlock the decrypted data key in a local in-memory daemon.
     Unlock {
         #[arg(long, default_value_t = 8 * 60 * 60)]
         ttl_seconds: u64,
         #[arg(long)]
         password_stdin: bool,
     },
-    /// Shut down the local unlock daemon.
     Lock,
-    /// Logout and clear stored credentials.
+    Keychain {
+        #[command(subcommand)]
+        command: KeychainCommand,
+    },
     Logout,
-    /// Show local credential status.
     Status,
+}
+
+#[derive(Subcommand, Debug)]
+enum KeychainCommand {
+    Store {
+        #[arg(long)]
+        password_stdin: bool,
+    },
+    Clear,
 }
 
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
-
-    if let Err(err) = run(cli).await {
-        eprintln!("error: {err}");
-        std::process::exit(1);
+    match run(cli).await {
+        Ok(()) => {}
+        Err(CliError::BrokenPipe) => std::process::exit(0),
+        Err(err) => {
+            let _ = write_stderr_line(format_args!("error: {err}"));
+            std::process::exit(1);
+        }
     }
 }
 
-async fn run(cli: Cli) -> PublicResult<()> {
+async fn run(cli: Cli) -> CliResult<()> {
     if let Some(socket_path) = cli.serve_unlock_daemon.as_deref() {
-        return unlock_daemon::serve(socket_path).await;
+        return serve(socket_path).await.map_err(Into::into);
     }
 
+    let runtime = RuntimeClient::new(&cli.api_url);
     let Some(command) = cli.command else {
-        return Err(worklist_client_core::PublicError::validation(
-            "a command is required",
-        ));
+        return Err(PublicError::validation("a command is required").into());
     };
 
     match command {
-        Command::Info => {
-            let client = PublicApiClient::new(&cli.api_url);
-            let payload = json!({
-                "apiBaseUrl": client.base_url(),
-                "commandName": "worklist",
-                "automationProfile": "agent_task_management",
-                "authUnlockModes": [
-                    UnlockMode::SingleCommand.as_str(),
-                    UnlockMode::Daemon.as_str(),
-                ],
-                "cryptoCapabilities": [
-                    CryptoCapability::DataKeyUnwrap.as_str(),
-                    CryptoCapability::WorkListKeyDecrypt.as_str(),
-                    CryptoCapability::PayloadSeal.as_str(),
-                    CryptoCapability::PayloadProof.as_str(),
-                ],
-                "note": "This CLI is intended for agent-friendly task and comment workflows against Worklist.",
-            });
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&payload)
-                    .expect("serializing CLI metadata should succeed")
-            );
-            Ok(())
-        }
+        Command::Info => cmd_info(&runtime),
         Command::Auth { command } => match command {
             AuthCommand::Login {
                 email,
                 password_stdin,
-            } => cmd_login(&cli.api_url, email, password_stdin).await,
+            } => cmd_login(runtime.api_url(), email, password_stdin).await,
             AuthCommand::Unlock {
                 ttl_seconds,
                 password_stdin,
-            } => cmd_unlock(&cli.api_url, ttl_seconds, password_stdin).await,
+            } => cmd_unlock(&runtime, ttl_seconds, password_stdin),
             AuthCommand::Lock => cmd_lock(),
-            AuthCommand::Logout => cmd_logout(&cli.api_url).await,
-            AuthCommand::Status => cmd_status(&cli.api_url),
+            AuthCommand::Keychain { command } => cmd_keychain(&runtime, command),
+            AuthCommand::Logout => cmd_logout(&runtime).await,
+            AuthCommand::Status => cmd_status(runtime.api_url()),
         },
-        Command::Me => cmd_me(&cli.api_url, cli.format).await,
-        Command::Lists { verbose } => cmd_lists(&cli.api_url, cli.format, verbose).await,
-        Command::Tasks { command } => cmd_tasks(&cli.api_url, cli.format, command).await,
-        Command::Stats => cmd_stats(&cli.api_url, cli.format).await,
+        Command::Me => cmd_me(&runtime, cli.format).await,
+        Command::Lists {
+            verbose,
+            password_stdin,
+            raw,
+            command,
+        } => match command {
+            Some(ListsCommand::Get {
+                work_list_id,
+                password_stdin,
+                raw,
+            }) => cmd_lists_get(&runtime, cli.format, work_list_id, password_stdin, raw).await,
+            None => cmd_lists(&runtime, cli.format, verbose, password_stdin, raw).await,
+        },
+        Command::Tasks { command } => cmd_tasks(&runtime, cli.format, command).await,
+        Command::Stats => cmd_stats(&runtime, cli.format).await,
         Command::Inspect {
             work_list_id,
             password_stdin,
-        } => cmd_inspect(&cli.api_url, cli.format, work_list_id, password_stdin).await,
-        Command::Comments { command } => cmd_comments(&cli.api_url, command).await,
+        } => cmd_lists_get(&runtime, cli.format, work_list_id, password_stdin, false).await,
+        Command::Comments { command } => cmd_comments(&runtime, cli.format, command).await,
     }
+}
+
+fn cmd_info(runtime: &RuntimeClient) -> CliResult<()> {
+    let payload = json!({
+        "apiBaseUrl": runtime.api_url(),
+        "commandName": "worklist",
+        "automationProfile": "agent_task_management",
+        "authUnlockModes": [
+            UnlockMode::SingleCommand.as_str(),
+            UnlockMode::Daemon.as_str(),
+        ],
+        "cryptoCapabilities": [
+            CryptoCapability::DataKeyUnwrap.as_str(),
+            CryptoCapability::WorkListKeyDecrypt.as_str(),
+            CryptoCapability::PayloadSeal.as_str(),
+            CryptoCapability::PayloadProof.as_str(),
+        ],
+        "decryptedReadModel": true,
+        "note": "This CLI is intended for agent-friendly task and comment workflows against Worklist.",
+    });
+    print_pretty_json(&payload, "serializing CLI metadata should succeed")
 }
 
 async fn cmd_login(
     api_url: &str,
     email_flag: Option<String>,
     password_stdin: bool,
-) -> PublicResult<()> {
+) -> CliResult<()> {
     if let Some(credentials) = load_credentials_for_url(api_url)?
         && !credentials.is_refresh_expired()
     {
@@ -340,13 +587,10 @@ async fn cmd_login(
         None => prompt("Email: ")?,
     };
     if email.is_empty() {
-        return Err(worklist_client_core::PublicError::validation(
-            "email is required",
-        ));
+        return Err(PublicError::validation("email is required").into());
     }
 
     let password = read_required_password(password_stdin, None)?;
-
     println!("Authenticating...");
     let client = reqwest::Client::new();
     let auth_response = login(&client, api_url, &email, &password).await?;
@@ -358,27 +602,34 @@ async fn cmd_login(
     Ok(())
 }
 
-async fn cmd_unlock(api_url: &str, ttl_seconds: u64, password_stdin: bool) -> PublicResult<()> {
-    let credentials = require_logged_in_credentials(api_url)?;
-    let password = read_required_password(
-        password_stdin,
-        Some("Password required to unlock the local daemon."),
-    )?;
-    let data_key = decrypt_user_data_key(&password, &credentials.data_key_ciphertext)?;
-    let session_key = daemon_session_key(api_url, &credentials)?;
-    unlock_daemon::unlock(&session_key, &data_key, ttl_seconds)?;
+fn cmd_unlock(runtime: &RuntimeClient, ttl_seconds: u64, password_stdin: bool) -> CliResult<()> {
+    runtime.unlock_daemon(ttl_seconds, password_stdin)?;
     println!("Unlocked local daemon for {} seconds.", ttl_seconds);
     Ok(())
 }
 
-fn cmd_lock() -> PublicResult<()> {
-    unlock_daemon::lock()?;
+fn cmd_lock() -> CliResult<()> {
+    lock()?;
     println!("Locked local daemon.");
     Ok(())
 }
 
-async fn cmd_logout(api_url: &str) -> PublicResult<()> {
-    let credentials = match load_credentials_for_url(api_url)? {
+fn cmd_keychain(runtime: &RuntimeClient, command: KeychainCommand) -> CliResult<()> {
+    match command {
+        KeychainCommand::Store { password_stdin } => {
+            runtime.store_persisted_data_key(password_stdin)?;
+            println!("Stored a local bootstrap secret in the platform keychain.");
+        }
+        KeychainCommand::Clear => {
+            runtime.clear_persisted_data_key()?;
+            println!("Cleared the local bootstrap secret from the platform keychain.");
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_logout(runtime: &RuntimeClient) -> CliResult<()> {
+    let credentials = match load_credentials_for_url(runtime.api_url())? {
         Some(credentials) => credentials,
         None => {
             println!("Not logged in.");
@@ -387,18 +638,21 @@ async fn cmd_logout(api_url: &str) -> PublicResult<()> {
     };
 
     let client = reqwest::Client::new();
-    if let Err(err) = logout(&client, api_url, &credentials.refresh_token).await {
+    if let Err(err) = logout(&client, runtime.api_url(), &credentials.refresh_token).await {
         eprintln!("warning: failed to revoke token on server: {err}");
     }
 
+    if let Err(err) = runtime.clear_persisted_data_key() {
+        eprintln!("warning: failed to clear platform keychain entry: {err}");
+    }
     clear_credentials()?;
-    let session_key = daemon_session_key(api_url, &credentials)?;
-    unlock_daemon::clear_session(&session_key)?;
+    let session_key = runtime.current_session_key(&credentials)?;
+    clear_session(&session_key)?;
     println!("Logged out successfully.");
     Ok(())
 }
 
-fn cmd_status(api_url: &str) -> PublicResult<()> {
+fn cmd_status(api_url: &str) -> CliResult<()> {
     match load_credentials()? {
         Some(credentials) => {
             println!("Logged in as: {}", credentials.email);
@@ -430,18 +684,32 @@ fn cmd_status(api_url: &str) -> PublicResult<()> {
                 println!("\nNote: Access token has expired but will be refreshed automatically.");
             }
 
-            let unlock_status = unlock_daemon::unlock_status(Some(&daemon_session_key(
+            let session_key = session_key(
                 &status_api_url,
-                &credentials,
-            )?))?;
-            if unlock_status.unlocked {
-                if let Some(expires_at_unix) = unlock_status.expires_at_unix {
+                credentials.user_id,
+                &credentials.data_key_ciphertext,
+            )?;
+            let status = unlock_status(Some(&session_key))?;
+            if status.unlocked {
+                if let Some(expires_at_unix) = status.expires_at_unix {
                     println!("\nUnlock daemon: active until unix {}", expires_at_unix);
                 } else {
                     println!("\nUnlock daemon: active");
                 }
             } else {
                 println!("\nUnlock daemon: inactive");
+            }
+
+            match persisted_data_key_status(&credentials) {
+                PersistedDataKeyStatus::Available => {
+                    println!("Persisted bootstrap: available");
+                }
+                PersistedDataKeyStatus::Missing => {
+                    println!("Persisted bootstrap: missing");
+                }
+                PersistedDataKeyStatus::Unavailable(message) => {
+                    println!("Persisted bootstrap: unavailable ({message})");
+                }
             }
         }
         None => {
@@ -451,486 +719,401 @@ fn cmd_status(api_url: &str) -> PublicResult<()> {
                 credentials_path()?.display()
             );
             println!("Unlock daemon: inactive for current target");
+            println!("Persisted bootstrap: unavailable for current target");
         }
     }
-
     Ok(())
 }
 
-async fn cmd_me(api_url: &str, format: OutputFormat) -> PublicResult<()> {
-    let mut client = get_authenticated_client(api_url)?;
-    let user = client.get_me().await?;
-    print_user(&user, format);
+async fn cmd_me(runtime: &RuntimeClient, format: OutputFormat) -> CliResult<()> {
+    let user = runtime.get_me().await?;
+    print_user(&user, format)?;
     Ok(())
 }
 
-async fn cmd_lists(api_url: &str, format: OutputFormat, verbose: bool) -> PublicResult<()> {
-    let mut client = get_authenticated_client(api_url)?;
-    let lists = client.list_work_lists().await?;
+async fn cmd_lists(
+    runtime: &RuntimeClient,
+    format: OutputFormat,
+    verbose: bool,
+    password_stdin: bool,
+    raw: bool,
+) -> CliResult<()> {
+    if raw {
+        let mut client = runtime.authenticated_api_client()?;
+        let lists = client.list_work_lists().await?;
+        if lists.is_empty() {
+            println!("No work lists found.");
+            return Ok(());
+        }
+        print_raw_work_lists(&lists, format, verbose)?;
+        return Ok(());
+    }
+
+    let lists = runtime.list_work_lists(password_stdin).await?;
     if lists.is_empty() {
         println!("No work lists found.");
         return Ok(());
     }
-    print_work_lists(&lists, format, verbose);
+    print_work_lists(&lists, format, verbose)?;
     Ok(())
 }
 
-async fn cmd_tasks(api_url: &str, format: OutputFormat, command: TasksCommand) -> PublicResult<()> {
+async fn cmd_lists_get(
+    runtime: &RuntimeClient,
+    format: OutputFormat,
+    work_list_id: Uuid,
+    password_stdin: bool,
+    raw: bool,
+) -> CliResult<()> {
+    if raw {
+        let mut client = runtime.authenticated_api_client()?;
+        let detail = client.get_work_list(work_list_id).await?;
+        print_raw_work_list_detail(&detail, format)?;
+        return Ok(());
+    }
+
+    let detail = runtime.get_work_list(work_list_id, password_stdin).await?;
+    print_work_list_detail(&detail, format)?;
+    Ok(())
+}
+
+async fn cmd_tasks(
+    runtime: &RuntimeClient,
+    format: OutputFormat,
+    command: TasksCommand,
+) -> CliResult<()> {
     match command {
         TasksCommand::List {
             work_list_id,
             include_completed,
             all,
-        } => cmd_tasks_list(api_url, format, work_list_id, include_completed, all).await,
-        TasksCommand::Create(args) => cmd_tasks_create(api_url, args).await,
-        TasksCommand::Update(args) => cmd_tasks_update(api_url, args).await,
-    }
-}
+            password_stdin,
+            raw,
+        } => {
+            if raw {
+                let mut client = runtime.authenticated_api_client()?;
+                if all || work_list_id.is_none() {
+                    let response = client.get_my_tasks(Some(100), None).await?;
+                    let tasks: Vec<_> = if include_completed {
+                        response.tasks
+                    } else {
+                        response
+                            .tasks
+                            .into_iter()
+                            .filter(|task| !task.is_completed)
+                            .collect()
+                    };
+                    if tasks.is_empty() {
+                        println!("No tasks found.");
+                        return Ok(());
+                    }
+                    print_raw_my_tasks(&tasks, format)?;
+                    return Ok(());
+                }
 
-async fn cmd_tasks_list(
-    api_url: &str,
-    format: OutputFormat,
-    work_list_id: Option<Uuid>,
-    include_completed: bool,
-    all: bool,
-) -> PublicResult<()> {
-    let mut client = get_authenticated_client(api_url)?;
+                let work_list_id = work_list_id.expect("validated work list id");
+                let response = client.get_tasks(work_list_id, false).await?;
+                let tasks: Vec<_> = if include_completed {
+                    response.tasks
+                } else {
+                    response
+                        .tasks
+                        .into_iter()
+                        .filter(|task| !task.is_completed)
+                        .collect()
+                };
+                if tasks.is_empty() {
+                    println!("No tasks found in this work list.");
+                    return Ok(());
+                }
+                print_raw_tasks(&tasks, format)?;
+                return Ok(());
+            }
 
-    if all || work_list_id.is_none() {
-        let response = client.get_my_tasks(Some(100), None).await?;
-        let tasks: Vec<_> = if include_completed {
-            response.tasks
-        } else {
-            response
-                .tasks
-                .into_iter()
-                .filter(|task| !task.is_completed)
-                .collect()
-        };
-
-        if tasks.is_empty() {
-            println!("No tasks found.");
-            return Ok(());
+            let tasks = runtime
+                .list_tasks(work_list_id, include_completed, all, password_stdin)
+                .await?;
+            if tasks.is_empty() {
+                if all || work_list_id.is_none() {
+                    println!("No tasks found.");
+                } else {
+                    println!("No tasks found in this work list.");
+                }
+                return Ok(());
+            }
+            print_tasks(&tasks, format)?;
+            Ok(())
         }
-
-        print_my_tasks(&tasks, format);
-        return Ok(());
-    }
-
-    if let Some(work_list_id) = work_list_id {
-        let response = client.get_tasks(work_list_id, false).await?;
-        let tasks: Vec<_> = if include_completed {
-            response.tasks
-        } else {
-            response
-                .tasks
-                .into_iter()
-                .filter(|task| !task.is_completed)
-                .collect()
-        };
-
-        if tasks.is_empty() {
-            println!("No tasks found in this work list.");
-            return Ok(());
-        }
-
-        print_tasks(&tasks, format);
-    }
-
-    Ok(())
-}
-
-async fn cmd_tasks_create(api_url: &str, args: TaskCreateArgs) -> PublicResult<()> {
-    let work_list_id = args.work_list_id;
-    let input = resolve_task_create_input(&args)?;
-    let normalized_title = input.title.trim();
-    if normalized_title.is_empty() {
-        return Err(worklist_client_core::PublicError::validation(
-            "title is required",
-        ));
-    }
-
-    let credentials = require_logged_in_credentials(api_url)?;
-
-    let mut client = PublicApiClient::with_credentials(api_url, credentials.clone());
-    let work_list = client.get_work_list(work_list_id).await?;
-
-    let list_key = load_list_key(
-        api_url,
-        &credentials,
-        work_list_id,
-        &work_list.work_list.membership.work_list_key_ciphertext,
-        args.password_stdin,
-        "Password required to create encrypted task payloads.",
-    )?;
-    let binding_key = derive_payload_binding_key(&list_key)?;
-
-    let task_body = TaskPayloadBody {
-        title: normalized_title.to_string(),
-        rich_text: input.body.as_deref().and_then(plaintext_rich_text),
-        checklist: None,
-        attachments: None,
-        references: None,
-        mentions: None,
-        client_meta: None,
-        recurrence_state: None,
-    };
-    let envelope = build_task_payload_envelope(task_body, 1);
-    let payload_ciphertext = encrypt_task_payload(&envelope, &list_key)?;
-    let title_ciphertext = seal_text_value(normalized_title)?;
-    let payload_proof = compute_payload_proof(&payload_ciphertext.bytes, &binding_key)?;
-    let title_proof = compute_payload_proof(&title_ciphertext.bytes, &binding_key)?;
-
-    let created = client
-        .create_task(
+        TasksCommand::Get {
             work_list_id,
-            &CreateTaskRequest {
-                title_ciphertext: title_ciphertext.base64,
-                title_ciphertext_proof: title_proof,
-                payload_ciphertext: payload_ciphertext.base64,
-                payload_ciphertext_proof: payload_proof,
-                attachment_ids: Vec::new(),
-                priority: None,
-                due_at: None,
-                section_id: None,
-            },
-        )
-        .await?;
+            task_id,
+            password_stdin,
+            raw,
+        } => {
+            if raw {
+                let mut client = runtime.authenticated_api_client()?;
+                let detail = client.get_task(work_list_id, task_id).await?;
+                print_raw_task_detail(&detail, format)?;
+                return Ok(());
+            }
 
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&created).expect("serializing created task should succeed")
-    );
-    Ok(())
-}
-
-async fn cmd_tasks_update(api_url: &str, args: TaskUpdateArgs) -> PublicResult<()> {
-    let work_list_id = args.work_list_id;
-    let task_id = args.task_id;
-    let input = resolve_task_update_input(&args)?;
-    if input.title.is_none() && input.body.is_none() {
-        return Err(worklist_client_core::PublicError::validation(
-            "provide at least one of --title or --body",
-        ));
-    }
-
-    let credentials = require_logged_in_credentials(api_url)?;
-
-    let mut client = PublicApiClient::with_credentials(api_url, credentials.clone());
-    let work_list = client.get_work_list(work_list_id).await?;
-    let task_detail = client.get_task(work_list_id, task_id).await?;
-
-    let list_key = load_list_key(
-        api_url,
-        &credentials,
-        work_list_id,
-        &work_list.work_list.membership.work_list_key_ciphertext,
-        args.password_stdin,
-        "Password required to update encrypted task payloads.",
-    )?;
-    let binding_key = derive_payload_binding_key(&list_key)?;
-
-    let payload_bytes = decode_sealed_blob(&task_detail.task.payload_ciphertext)?;
-    let existing_payload = decrypt_task_payload(&list_key, &payload_bytes)?;
-
-    let existing_body = existing_payload.body;
-    let next_title = input
-        .title
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| existing_body.title.clone());
-    let next_rich_text = match input.body.as_deref() {
-        Some(value) if value.trim().is_empty() => None,
-        Some(value) => plaintext_rich_text(value),
-        None => existing_body.rich_text.clone(),
-    };
-
-    let next_body = TaskPayloadBody {
-        title: next_title.clone(),
-        rich_text: next_rich_text,
-        checklist: existing_body.checklist,
-        attachments: existing_body.attachments,
-        references: existing_body.references,
-        mentions: existing_body.mentions,
-        client_meta: existing_body.client_meta,
-        recurrence_state: existing_body.recurrence_state,
-    };
-    let envelope = build_task_payload_envelope(next_body, 1);
-    let payload_ciphertext = encrypt_task_payload(&envelope, &list_key)?;
-    let payload_proof = compute_payload_proof(&payload_ciphertext.bytes, &binding_key)?;
-
-    let mut request = UpdateTaskRequest {
-        payload_ciphertext: Some(payload_ciphertext.base64),
-        payload_ciphertext_proof: Some(payload_proof),
-        ..UpdateTaskRequest::default()
-    };
-
-    if let Some(new_title) = input.title.as_deref() {
-        let normalized_title = new_title.trim();
-        if normalized_title.is_empty() {
-            return Err(worklist_client_core::PublicError::validation(
-                "title cannot be empty",
-            ));
+            let detail = runtime
+                .get_task(work_list_id, task_id, password_stdin)
+                .await?;
+            print_task_detail(&detail, format)?;
+            Ok(())
         }
-        let title_ciphertext = seal_text_value(normalized_title)?;
-        let title_proof = compute_payload_proof(&title_ciphertext.bytes, &binding_key)?;
-        request.title_ciphertext = Some(title_ciphertext.base64);
-        request.title_ciphertext_proof = Some(title_proof);
+        TasksCommand::Create(args) => cmd_tasks_create(runtime, args).await,
+        TasksCommand::Update(args) => cmd_tasks_update(runtime, args).await,
+        TasksCommand::Move(args) => cmd_tasks_move(runtime, args).await,
+        TasksCommand::Archive(args) => cmd_tasks_archive(runtime, args).await,
+        TasksCommand::Unarchive(args) => cmd_tasks_unarchive(runtime, args).await,
+        TasksCommand::Delete(args) => cmd_tasks_delete(runtime, format, args).await,
+        TasksCommand::Attachments { command } => {
+            cmd_task_attachments(runtime, format, command).await
+        }
     }
-
-    let updated = client.update_task(work_list_id, task_id, &request).await?;
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&updated).expect("serializing updated task should succeed")
-    );
-    Ok(())
 }
 
-async fn cmd_stats(api_url: &str, format: OutputFormat) -> PublicResult<()> {
-    let mut client = get_authenticated_client(api_url)?;
-    let stats = client.get_dashboard_stats().await?;
-    print_stats(&stats, format);
-    Ok(())
-}
-
-async fn cmd_comments(api_url: &str, command: CommentsCommand) -> PublicResult<()> {
+async fn cmd_task_attachments(
+    runtime: &RuntimeClient,
+    format: OutputFormat,
+    command: TaskAttachmentsCommand,
+) -> CliResult<()> {
     match command {
-        CommentsCommand::Create(args) => cmd_comments_create(api_url, args).await,
-        CommentsCommand::Update(args) => cmd_comments_update(api_url, args).await,
+        TaskAttachmentsCommand::Read(args) => {
+            let attachment = runtime
+                .read_task_attachment(
+                    args.work_list_id,
+                    args.task_id,
+                    args.attachment_id,
+                    args.password_stdin,
+                )
+                .await?;
+            print_readable_attachment(&attachment, format)?;
+            Ok(())
+        }
+        TaskAttachmentsCommand::Download(args) => {
+            let attachment = runtime
+                .download_task_attachment(
+                    args.work_list_id,
+                    args.task_id,
+                    args.attachment_id,
+                    args.password_stdin,
+                )
+                .await?;
+            let output_path =
+                resolve_attachment_output_path(&attachment.attachment.file_name, args.output);
+            write_attachment_file(&output_path, &attachment.bytes, args.force)?;
+            print_download_result(format, &attachment.attachment.file_name, &output_path)?;
+            Ok(())
+        }
     }
 }
 
-async fn cmd_comments_create(api_url: &str, args: CommentCreateArgs) -> PublicResult<()> {
-    let work_list_id = args.work_list_id;
-    let task_id = args.task_id;
-    let input = resolve_comment_input(
-        args.body.as_deref(),
-        args.input_file.as_deref(),
-        args.input_stdin,
-        args.password_stdin,
-    )?;
-    let normalized_body = input.body.trim();
-    if normalized_body.is_empty() {
-        return Err(worklist_client_core::PublicError::validation(
-            "comment body is required",
-        ));
-    }
-
-    let credentials = require_logged_in_credentials(api_url)?;
-
-    let mut client = PublicApiClient::with_credentials(api_url, credentials.clone());
-    let work_list = client.get_work_list(work_list_id).await?;
-
-    let list_key = load_list_key(
-        api_url,
-        &credentials,
-        work_list_id,
-        &work_list.work_list.membership.work_list_key_ciphertext,
-        args.password_stdin,
-        "Password required to create encrypted comments.",
-    )?;
-    let binding_key = derive_payload_binding_key(&list_key)?;
-    let rich_text = plaintext_rich_text(normalized_body)
-        .ok_or_else(|| worklist_client_core::PublicError::validation("comment body is required"))?;
-    let envelope = build_comment_payload_envelope(
-        CommentPayloadBody {
-            content: rich_text,
-            mentions: None,
-            attachments: None,
-            client_meta: None,
-        },
-        1,
-    );
-    let body_ciphertext = encrypt_comment_payload(&envelope, &list_key)?;
-    let body_proof = compute_payload_proof(&body_ciphertext.bytes, &binding_key)?;
-
-    let created: CommentResponse = client
-        .create_comment(
-            work_list_id,
-            task_id,
-            &CreateCommentRequest {
-                body_ciphertext: body_ciphertext.base64,
-                body_ciphertext_proof: body_proof,
-            },
-        )
+async fn cmd_tasks_create(runtime: &RuntimeClient, args: TaskCreateArgsCli) -> CliResult<()> {
+    let input = resolve_task_create_input(&args)?;
+    let created = runtime
+        .create_task(CreateTaskArgs {
+            work_list_id: args.work_list_id,
+            input,
+            password_stdin: args.password_stdin,
+        })
         .await?;
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&created).expect("serializing created comment should succeed")
-    );
-    Ok(())
+    print_pretty_json(&created, "serializing created task should succeed")
 }
 
-async fn cmd_comments_update(api_url: &str, args: CommentUpdateArgs) -> PublicResult<()> {
-    let work_list_id = args.work_list_id;
-    let task_id = args.task_id;
-    let comment_id = args.comment_id;
-    let input = resolve_comment_input(
-        args.body.as_deref(),
-        args.input_file.as_deref(),
-        args.input_stdin,
-        args.password_stdin,
-    )?;
-    let normalized_body = input.body.trim();
-    if normalized_body.is_empty() {
-        return Err(worklist_client_core::PublicError::validation(
-            "comment body is required",
-        ));
-    }
-
-    let credentials = require_logged_in_credentials(api_url)?;
-
-    let mut client = PublicApiClient::with_credentials(api_url, credentials.clone());
-    let work_list = client.get_work_list(work_list_id).await?;
-    let task_detail = client.get_task(work_list_id, task_id).await?;
-
-    let list_key = load_list_key(
-        api_url,
-        &credentials,
-        work_list_id,
-        &work_list.work_list.membership.work_list_key_ciphertext,
-        args.password_stdin,
-        "Password required to update encrypted comments.",
-    )?;
-    let binding_key = derive_payload_binding_key(&list_key)?;
-    let rich_text = plaintext_rich_text(normalized_body)
-        .ok_or_else(|| worklist_client_core::PublicError::validation("comment body is required"))?;
-
-    let existing_comment = task_detail
-        .comments
-        .iter()
-        .find(|comment| comment.id == comment_id)
-        .ok_or_else(|| worklist_client_core::PublicError::validation("comment not found"))?;
-    let existing_body_ciphertext = decode_sealed_blob(&existing_comment.body_ciphertext)?;
-    let existing_payload = decrypt_comment_payload(&list_key, &existing_body_ciphertext)?;
-
-    let envelope = build_comment_payload_envelope(
-        CommentPayloadBody {
-            content: rich_text,
-            mentions: existing_payload.body.mentions,
-            attachments: existing_payload.body.attachments,
-            client_meta: existing_payload.body.client_meta,
-        },
-        1,
-    );
-    let body_ciphertext = encrypt_comment_payload(&envelope, &list_key)?;
-    let body_proof = compute_payload_proof(&body_ciphertext.bytes, &binding_key)?;
-
-    let updated: CommentResponse = client
-        .update_comment(
-            work_list_id,
-            task_id,
-            comment_id,
-            &UpdateCommentRequest {
-                body_ciphertext: Some(body_ciphertext.base64),
-                body_ciphertext_proof: Some(body_proof),
-            },
-        )
+async fn cmd_tasks_update(runtime: &RuntimeClient, args: TaskUpdateArgsCli) -> CliResult<()> {
+    let input = resolve_task_update_input(&args)?;
+    let updated = runtime
+        .update_task(UpdateTaskArgs {
+            work_list_id: args.work_list_id,
+            task_id: args.task_id,
+            input,
+            password_stdin: args.password_stdin,
+        })
         .await?;
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&updated).expect("serializing updated comment should succeed")
-    );
-    Ok(())
+    print_pretty_json(&updated, "serializing updated task should succeed")
 }
 
-async fn cmd_inspect(
-    api_url: &str,
+async fn cmd_tasks_move(runtime: &RuntimeClient, args: TaskMoveArgsCli) -> CliResult<()> {
+    let moved = runtime
+        .move_task(MoveTaskArgs {
+            work_list_id: args.work_list_id,
+            task_id: args.task_id,
+            input: MoveTaskInput {
+                section_id: args.section_id,
+                insert_before_task_id: args.insert_before_task_id,
+            },
+            password_stdin: args.password_stdin,
+        })
+        .await?;
+    print_pretty_json(&moved, "serializing moved task should succeed")
+}
+
+async fn cmd_tasks_archive(runtime: &RuntimeClient, args: TaskArchiveArgsCli) -> CliResult<()> {
+    let archived = runtime
+        .archive_task(ArchiveTaskArgs {
+            work_list_id: args.work_list_id,
+            task_id: args.task_id,
+            password_stdin: args.password_stdin,
+        })
+        .await?;
+    print_pretty_json(&archived, "serializing archived task should succeed")
+}
+
+async fn cmd_tasks_unarchive(runtime: &RuntimeClient, args: TaskUnarchiveArgsCli) -> CliResult<()> {
+    let unarchived = runtime
+        .unarchive_task(UnarchiveTaskArgs {
+            work_list_id: args.work_list_id,
+            task_id: args.task_id,
+            password_stdin: args.password_stdin,
+        })
+        .await?;
+    print_pretty_json(&unarchived, "serializing unarchived task should succeed")
+}
+
+async fn cmd_tasks_delete(
+    runtime: &RuntimeClient,
     format: OutputFormat,
-    work_list_id: Uuid,
-    password_stdin: bool,
-) -> PublicResult<()> {
-    let credentials = require_logged_in_credentials(api_url)?;
-
-    let mut client = PublicApiClient::with_credentials(api_url, credentials.clone());
-    let work_list = client.get_work_list(work_list_id).await?;
-
-    let work_list_key = load_list_key(
-        api_url,
-        &credentials,
-        work_list_id,
-        &work_list.work_list.membership.work_list_key_ciphertext,
-        password_stdin,
-        "Password required to decrypt data.",
-    )?;
-    let payload_bytes = decode_sealed_blob(&work_list.work_list.payload_ciphertext)?;
-    let envelope: serde_json::Value = decrypt_work_list_payload(&work_list_key, &payload_bytes)?;
-
-    print_inspect_result(&work_list, &envelope, format);
-    Ok(())
-}
-
-fn get_authenticated_client(api_url: &str) -> PublicResult<PublicApiClient> {
-    let credentials = require_logged_in_credentials(api_url)?;
-
-    if credentials.is_refresh_expired() {
-        return Err(worklist_client_core::PublicError::validation(
-            "session expired - run 'worklist auth login' to authenticate",
-        ));
-    }
-
-    Ok(PublicApiClient::with_credentials(api_url, credentials))
-}
-
-fn require_logged_in_credentials(api_url: &str) -> PublicResult<Credentials> {
-    load_credentials_for_url(api_url)?.ok_or_else(|| {
-        worklist_client_core::PublicError::validation(
-            "not logged in - run 'worklist auth login' first",
-        )
-    })
-}
-
-fn resolve_list_key(
-    data_key: &worklist_client_crypto::SymmetricKey,
-    work_list_id: Uuid,
-    membership_ciphertext: &str,
-) -> PublicResult<worklist_client_crypto::SymmetricKey> {
-    if membership_ciphertext.trim().is_empty() {
-        return derive_work_list_key(data_key, &work_list_id);
-    }
-
-    let work_list_key_bytes = decode_sealed_blob(membership_ciphertext)?;
-    decrypt_work_list_key(data_key, &work_list_key_bytes)
-}
-
-fn unlock_list_key(
-    password: &str,
-    data_key_ciphertext: &str,
-    work_list_id: Uuid,
-    membership_ciphertext: &str,
-) -> PublicResult<worklist_client_crypto::SymmetricKey> {
-    let data_key = decrypt_user_data_key(password, data_key_ciphertext)?;
-    resolve_list_key(&data_key, work_list_id, membership_ciphertext)
-}
-
-fn load_list_key(
-    api_url: &str,
-    credentials: &Credentials,
-    work_list_id: Uuid,
-    membership_ciphertext: &str,
-    password_stdin: bool,
-    prompt_message: &str,
-) -> PublicResult<worklist_client_crypto::SymmetricKey> {
-    let session_key = daemon_session_key(api_url, credentials)?;
-    if !password_stdin
-        && let Some(data_key) = unlock_daemon::fetch_data_key(&session_key)?
-        && let Ok(list_key) = resolve_list_key(&data_key, work_list_id, membership_ciphertext)
-    {
-        return Ok(list_key);
-    }
-
-    let password = read_required_password(password_stdin, Some(prompt_message))?;
-    unlock_list_key(
-        &password,
-        &credentials.data_key_ciphertext,
-        work_list_id,
-        membership_ciphertext,
+    args: TaskDeleteArgsCli,
+) -> CliResult<()> {
+    let input =
+        resolve_delete_input::<DeleteTaskRequest>(args.input_file.as_deref(), args.input_stdin)?;
+    runtime
+        .delete_task(DeleteTaskArgs {
+            work_list_id: args.work_list_id,
+            task_id: args.task_id,
+            input,
+        })
+        .await?;
+    print_delete_result(
+        format,
+        "task",
+        &json!({
+            "deleted": true,
+            "workListId": args.work_list_id,
+            "taskId": args.task_id,
+        }),
+        &format!("Deleted task {}.", args.task_id),
     )
 }
 
-fn resolve_task_create_input(args: &TaskCreateArgs) -> PublicResult<TaskCreateInput> {
+async fn cmd_stats(runtime: &RuntimeClient, format: OutputFormat) -> CliResult<()> {
+    let stats = runtime.get_stats().await?;
+    print_stats(&stats, format)?;
+    Ok(())
+}
+
+async fn cmd_comments(
+    runtime: &RuntimeClient,
+    format: OutputFormat,
+    command: CommentsCommand,
+) -> CliResult<()> {
+    match command {
+        CommentsCommand::List {
+            work_list_id,
+            task_id,
+            password_stdin,
+        } => cmd_comments_list(runtime, format, work_list_id, task_id, password_stdin).await,
+        CommentsCommand::Create(args) => cmd_comments_create(runtime, args).await,
+        CommentsCommand::Update(args) => cmd_comments_update(runtime, args).await,
+        CommentsCommand::Delete(args) => cmd_comments_delete(runtime, format, args).await,
+    }
+}
+
+async fn cmd_comments_list(
+    runtime: &RuntimeClient,
+    format: OutputFormat,
+    work_list_id: Uuid,
+    task_id: Uuid,
+    password_stdin: bool,
+) -> CliResult<()> {
+    let comments = runtime
+        .list_comments(work_list_id, task_id, password_stdin)
+        .await?;
+    if comments.is_empty() {
+        match format {
+            OutputFormat::Json => {
+                print_pretty_json(&comments, "serializing comments should succeed")?;
+            }
+            OutputFormat::Table => {
+                println!("No comments found.");
+            }
+        }
+        return Ok(());
+    }
+    print_comments(&comments, format)
+}
+
+async fn cmd_comments_create(runtime: &RuntimeClient, args: CommentCreateArgsCli) -> CliResult<()> {
+    let input = resolve_comment_input(
+        args.body.as_deref(),
+        args.input_file.as_deref(),
+        args.input_stdin,
+        args.password_stdin,
+    )?;
+    let created = runtime
+        .create_comment(CreateCommentArgs {
+            work_list_id: args.work_list_id,
+            task_id: args.task_id,
+            input,
+            password_stdin: args.password_stdin,
+        })
+        .await?;
+    print_comment_json(&created)?;
+    Ok(())
+}
+
+async fn cmd_comments_update(runtime: &RuntimeClient, args: CommentUpdateArgsCli) -> CliResult<()> {
+    let input = resolve_comment_input(
+        args.body.as_deref(),
+        args.input_file.as_deref(),
+        args.input_stdin,
+        args.password_stdin,
+    )?;
+    let updated = runtime
+        .update_comment(UpdateCommentArgs {
+            work_list_id: args.work_list_id,
+            task_id: args.task_id,
+            comment_id: args.comment_id,
+            input,
+            password_stdin: args.password_stdin,
+        })
+        .await?;
+    print_comment_json(&updated)?;
+    Ok(())
+}
+
+async fn cmd_comments_delete(
+    runtime: &RuntimeClient,
+    format: OutputFormat,
+    args: CommentDeleteArgsCli,
+) -> CliResult<()> {
+    let input =
+        resolve_delete_input::<DeleteCommentRequest>(args.input_file.as_deref(), args.input_stdin)?;
+    runtime
+        .delete_comment(DeleteCommentArgs {
+            work_list_id: args.work_list_id,
+            task_id: args.task_id,
+            comment_id: args.comment_id,
+            input,
+        })
+        .await?;
+    print_delete_result(
+        format,
+        "comment",
+        &json!({
+            "deleted": true,
+            "workListId": args.work_list_id,
+            "taskId": args.task_id,
+            "commentId": args.comment_id,
+        }),
+        &format!("Deleted comment {}.", args.comment_id),
+    )
+}
+
+fn resolve_task_create_input(args: &TaskCreateArgsCli) -> PublicResult<TaskCreateInput> {
     if let Some(input) = load_structured_input::<TaskCreateInput>(
         args.input_file.as_deref(),
         args.input_stdin,
@@ -943,15 +1126,14 @@ fn resolve_task_create_input(args: &TaskCreateArgs) -> PublicResult<TaskCreateIn
         .title
         .as_deref()
         .map(str::to_owned)
-        .ok_or_else(|| worklist_client_core::PublicError::validation("title is required"))?;
-
+        .ok_or_else(|| PublicError::validation("title is required"))?;
     Ok(TaskCreateInput {
         title,
         body: args.body.as_deref().map(str::to_owned),
     })
 }
 
-fn resolve_task_update_input(args: &TaskUpdateArgs) -> PublicResult<TaskUpdateInput> {
+fn resolve_task_update_input(args: &TaskUpdateArgsCli) -> PublicResult<TaskUpdateInput> {
     if let Some(input) = load_structured_input::<TaskUpdateInput>(
         args.input_file.as_deref(),
         args.input_stdin,
@@ -980,9 +1162,15 @@ fn resolve_comment_input(
 
     let body = body
         .map(str::to_owned)
-        .ok_or_else(|| worklist_client_core::PublicError::validation("comment body is required"))?;
-
+        .ok_or_else(|| PublicError::validation("comment body is required"))?;
     Ok(CommentInput { body })
+}
+
+fn resolve_delete_input<T: Default + DeserializeOwned>(
+    input_file: Option<&Path>,
+    input_stdin: bool,
+) -> PublicResult<T> {
+    load_structured_input(input_file, input_stdin, false).map(|input| input.unwrap_or_default())
 }
 
 fn load_structured_input<T: DeserializeOwned>(
@@ -1005,13 +1193,12 @@ fn select_json_input_source<'a>(
     password_stdin: bool,
 ) -> PublicResult<Option<JsonInputSource<'a>>> {
     if input_file.is_some() && input_stdin {
-        return Err(worklist_client_core::PublicError::validation(
+        return Err(PublicError::validation(
             "use only one of --input-file or --input-stdin",
         ));
     }
-
     if input_stdin && password_stdin {
-        return Err(worklist_client_core::PublicError::validation(
+        return Err(PublicError::validation(
             "--input-stdin cannot be combined with --password-stdin",
         ));
     }
@@ -1027,7 +1214,7 @@ fn select_json_input_source<'a>(
 fn read_json_input(source: JsonInputSource<'_>) -> PublicResult<String> {
     match source {
         JsonInputSource::File(path) => fs::read_to_string(path).map_err(|err| {
-            worklist_client_core::PublicError::unexpected(format!(
+            PublicError::unexpected(format!(
                 "failed to read input file {}: {err}",
                 path.display()
             ))
@@ -1035,9 +1222,7 @@ fn read_json_input(source: JsonInputSource<'_>) -> PublicResult<String> {
         JsonInputSource::Stdin => {
             let mut input = String::new();
             io::stdin().read_to_string(&mut input).map_err(|err| {
-                worklist_client_core::PublicError::unexpected(format!(
-                    "failed to read input from stdin: {err}"
-                ))
+                PublicError::unexpected(format!("failed to read input from stdin: {err}"))
             })?;
             Ok(input)
         }
@@ -1045,84 +1230,205 @@ fn read_json_input(source: JsonInputSource<'_>) -> PublicResult<String> {
 }
 
 fn parse_json_input<T: DeserializeOwned>(contents: &str, source: &str) -> PublicResult<T> {
-    serde_json::from_str(contents).map_err(|err| {
-        worklist_client_core::PublicError::validation(format!(
-            "invalid JSON input from {source}: {err}"
-        ))
-    })
+    serde_json::from_str(contents)
+        .map_err(|err| PublicError::validation(format!("invalid JSON input from {source}: {err}")))
 }
 
-fn daemon_session_key(
-    api_url: &str,
-    credentials: &Credentials,
-) -> PublicResult<unlock_daemon::SessionKey> {
-    unlock_daemon::session_key(
-        api_url,
-        credentials.user_id,
-        &credentials.data_key_ciphertext,
-    )
-}
-
-fn prompt(label: &str) -> PublicResult<String> {
+fn prompt(label: &str) -> CliResult<String> {
     print!("{label}");
-    io::stdout().flush().map_err(|err| {
-        worklist_client_core::PublicError::unexpected(format!("failed to flush stdout: {err}"))
-    })?;
+    flush_stdout()?;
 
     let mut input = String::new();
-    io::stdin().read_line(&mut input).map_err(|err| {
-        worklist_client_core::PublicError::unexpected(format!("failed to read input: {err}"))
-    })?;
+    io::stdin()
+        .read_line(&mut input)
+        .map_err(|err| PublicError::unexpected(format!("failed to read input: {err}")))?;
 
     Ok(input.trim().to_string())
-}
-
-fn read_password(label: &str) -> PublicResult<String> {
-    prompt_password(label).map_err(|err| {
-        worklist_client_core::PublicError::unexpected(format!("failed to read password: {err}"))
-    })
 }
 
 fn read_password_from_stdin() -> PublicResult<String> {
     let mut input = String::new();
     io::stdin().read_to_string(&mut input).map_err(|err| {
-        worklist_client_core::PublicError::unexpected(format!(
-            "failed to read password from stdin: {err}"
-        ))
+        PublicError::unexpected(format!("failed to read password from stdin: {err}"))
     })?;
     Ok(input.trim().to_string())
 }
 
-fn read_required_password(
-    password_stdin: bool,
-    prompt_message: Option<&str>,
-) -> PublicResult<String> {
+fn read_required_password(password_stdin: bool, prompt_message: Option<&str>) -> CliResult<String> {
     let password = if password_stdin {
         read_password_from_stdin()?
     } else {
         if let Some(prompt_message) = prompt_message {
             println!("{prompt_message}");
         }
-        read_password("Password: ")?
+        rpassword::prompt_password("Password: ")
+            .map_err(|err| PublicError::unexpected(format!("failed to read password: {err}")))?
     };
 
     if password.is_empty() {
-        return Err(worklist_client_core::PublicError::validation(
-            "password is required",
-        ));
+        return Err(PublicError::validation("password is required").into());
     }
-
     Ok(password)
 }
 
-fn print_user(user: &CurrentUserResponse, format: OutputFormat) {
+fn resolve_attachment_output_path(file_name: &str, output: Option<PathBuf>) -> PathBuf {
+    output.unwrap_or_else(|| PathBuf::from(sanitize_attachment_file_name(file_name)))
+}
+
+fn sanitize_attachment_file_name(file_name: &str) -> String {
+    let candidate = Path::new(file_name)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && *value != "." && *value != "..")
+        .unwrap_or("attachment.bin");
+
+    candidate
+        .chars()
+        .map(sanitize_attachment_file_name_char)
+        .collect()
+}
+
+fn sanitize_attachment_file_name_char(ch: char) -> char {
+    match ch {
+        '/' | '\\' | '\0' => '_',
+        _ => ch,
+    }
+}
+
+fn write_attachment_file(path: &Path, bytes: &[u8], force: bool) -> PublicResult<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).map_err(|err| {
+            PublicError::unexpected(format!(
+                "failed to create output directory {}: {err}",
+                parent.display()
+            ))
+        })?;
+    }
+
+    let mut options = OpenOptions::new();
+    options.write(true);
+    if force {
+        options.create(true).truncate(true);
+    } else {
+        options.create_new(true);
+    }
+
+    let mut file = options.open(path).map_err(|err| {
+        if err.kind() == io::ErrorKind::AlreadyExists {
+            return PublicError::validation(format!(
+                "output file {} already exists; use --force to overwrite",
+                path.display()
+            ));
+        }
+        PublicError::unexpected(format!(
+            "failed to open output file {}: {err}",
+            path.display()
+        ))
+    })?;
+    file.write_all(bytes).map_err(|err| {
+        PublicError::unexpected(format!(
+            "failed to write output file {}: {err}",
+            path.display()
+        ))
+    })
+}
+
+fn print_download_result(
+    format: OutputFormat,
+    file_name: &str,
+    output_path: &Path,
+) -> CliResult<()> {
+    match format {
+        OutputFormat::Json => print_pretty_json(
+            &json!({
+                "fileName": file_name,
+                "outputPath": output_path.display().to_string(),
+            }),
+            "serializing download result should succeed",
+        )?,
+        OutputFormat::Table => {
+            println!("Saved attachment to {}", output_path.display());
+        }
+    }
+    Ok(())
+}
+
+fn print_readable_attachment(
+    attachment: &ReadableAttachment,
+    format: OutputFormat,
+) -> CliResult<()> {
     match format {
         OutputFormat::Json => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(user).expect("serializing user should succeed")
-            );
+            print_pretty_json(attachment, "serializing readable attachment should succeed")?;
         }
+        OutputFormat::Table => {
+            print!("{}", attachment.text);
+            if !attachment.text.ends_with('\n') {
+                println!();
+            }
+        }
+    }
+    Ok(())
+}
+
+fn print_comment_json(comment: &AgentComment) -> CliResult<()> {
+    print_pretty_json(comment, "serializing comment should succeed")
+}
+
+fn print_comments(comments: &[AgentComment], format: OutputFormat) -> CliResult<()> {
+    match format {
+        OutputFormat::Json => {
+            print_pretty_json(comments, "serializing comments should succeed")?;
+        }
+        OutputFormat::Table => {
+            println!("{:<36}  {:<16}  Comment", "ID", "Updated");
+            println!("{}", "-".repeat(96));
+            for comment in comments {
+                println!(
+                    "{:<36}  {:<16}  {}",
+                    comment.id,
+                    comment.updated_at.format("%Y-%m-%d %H:%M"),
+                    truncate(
+                        comment
+                            .body_markdown
+                            .as_deref()
+                            .unwrap_or("<unreadable comment>"),
+                        40
+                    )
+                );
+            }
+            println!("\nTotal: {} comment(s)", comments.len());
+        }
+    }
+    Ok(())
+}
+
+fn print_delete_result(
+    format: OutputFormat,
+    entity: &str,
+    payload: &serde_json::Value,
+    table_message: &str,
+) -> CliResult<()> {
+    match format {
+        OutputFormat::Json => {
+            print_pretty_json(
+                payload,
+                &format!("serializing deleted {entity} should succeed"),
+            )?;
+        }
+        OutputFormat::Table => {
+            println!("{table_message}");
+        }
+    }
+    Ok(())
+}
+
+fn print_user(user: &CurrentUserResponse, format: OutputFormat) -> CliResult<()> {
+    match format {
+        OutputFormat::Json => print_pretty_json(user, "serializing user should succeed")?,
         OutputFormat::Table => {
             println!("User Information");
             println!("{}", "-".repeat(40));
@@ -1137,86 +1443,102 @@ fn print_user(user: &CurrentUserResponse, format: OutputFormat) {
             );
         }
     }
+    Ok(())
 }
 
-fn print_work_lists(lists: &[WorkListResponse], format: OutputFormat, verbose: bool) {
+fn print_work_lists(
+    lists: &[AgentWorkListSummary],
+    format: OutputFormat,
+    verbose: bool,
+) -> CliResult<()> {
     match format {
         OutputFormat::Json => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(lists).expect("serializing work lists should succeed")
-            );
+            print_pretty_json(lists, "serializing work lists should succeed")?;
         }
         OutputFormat::Table => {
             if verbose {
-                print_work_lists_verbose(lists);
+                for (index, list) in lists.iter().enumerate() {
+                    if index > 0 {
+                        println!();
+                    }
+                    println!("Work List: {}", list.id);
+                    println!("{}", "-".repeat(50));
+                    println!("  Title:         {}", list.title.as_deref().unwrap_or("-"));
+                    println!("  Workspace:     {}", list.workspace_id);
+                    println!("  Owner:         {}", list.owner_user_id);
+                    println!("  Timezone:      {}", list.timezone);
+                    println!("  Sections:      {}", list.section_snapshots.len());
+                    println!("  Your role:     {}", list.membership.role);
+                    println!("  Your status:   {}", list.membership.status);
+                    if let Some(read_error) = list.read_error.as_ref() {
+                        println!("  Read error:    {}", read_error.message);
+                    }
+                    println!(
+                        "  Updated:       {}",
+                        list.updated_at.format("%Y-%m-%d %H:%M:%S UTC")
+                    );
+                }
+                println!("\nTotal: {} work list(s)", lists.len());
             } else {
-                print_work_lists_compact(lists);
+                println!("{:<36}  {:<24}  {:<10}  Updated", "ID", "Title", "Role");
+                println!("{}", "-".repeat(92));
+                for list in lists {
+                    println!(
+                        "{:<36}  {:<24}  {:<10}  {}",
+                        list.id,
+                        truncate(list.title.as_deref().unwrap_or("-"), 24),
+                        list.membership.role,
+                        list.updated_at.format("%Y-%m-%d %H:%M")
+                    );
+                }
+                println!("\nTotal: {} work list(s)", lists.len());
             }
         }
     }
+    Ok(())
 }
 
-fn print_work_lists_compact(lists: &[WorkListResponse]) {
-    println!("{:<36}  {:<10}  {:<8}  Updated", "ID", "Role", "Sections");
-    println!("{}", "-".repeat(80));
-
-    for list in lists {
-        let updated = list.updated_at.format("%Y-%m-%d %H:%M").to_string();
-        println!(
-            "{:<36}  {:<10}  {:<8}  {}",
-            list.id,
-            list.membership.role,
-            list.section_snapshots.len(),
-            updated
-        );
-    }
-
-    println!("\nTotal: {} work list(s)", lists.len());
-}
-
-fn print_work_lists_verbose(lists: &[WorkListResponse]) {
-    for (index, list) in lists.iter().enumerate() {
-        if index > 0 {
-            println!();
-        }
-
-        println!("Work List: {}", list.id);
-        println!("{}", "-".repeat(50));
-        println!("  Workspace:     {}", list.workspace_id);
-        println!("  Owner:         {}", list.owner_user_id);
-        println!("  Timezone:      {}", list.timezone);
-        println!("  Sections:      {}", list.section_snapshots.len());
-        println!("  Your role:     {}", list.membership.role);
-        println!("  Your status:   {}", list.membership.status);
-        println!(
-            "  Created:       {}",
-            list.created_at.format("%Y-%m-%d %H:%M:%S UTC")
-        );
-        println!(
-            "  Updated:       {}",
-            list.updated_at.format("%Y-%m-%d %H:%M:%S UTC")
-        );
-    }
-
-    println!("\nTotal: {} work list(s)", lists.len());
-}
-
-fn print_tasks(tasks: &[TaskResponse], format: OutputFormat) {
+fn print_work_list_detail(detail: &AgentWorkListDetail, format: OutputFormat) -> CliResult<()> {
     match format {
         OutputFormat::Json => {
+            print_pretty_json(detail, "serializing work list detail should succeed")?;
+        }
+        OutputFormat::Table => {
+            println!("Work List");
+            println!("{}", "=".repeat(60));
+            println!("ID:          {}", detail.work_list.id);
             println!(
-                "{}",
-                serde_json::to_string_pretty(tasks).expect("serializing tasks should succeed")
+                "Title:       {}",
+                detail.work_list.title.as_deref().unwrap_or("-")
             );
+            println!("Workspace:   {}", detail.work_list.workspace_id);
+            println!("Owner:       {}", detail.work_list.owner_user_id);
+            println!("Timezone:    {}", detail.work_list.timezone);
+            println!("Members:     {}", detail.members.len());
+            println!("Your role:   {}", detail.work_list.membership.role);
+            println!("Your status: {}", detail.work_list.membership.status);
+            if let Some(description) = detail.work_list.description.as_deref() {
+                println!("Description: {}", description);
+            }
+            if let Some(read_error) = detail.work_list.read_error.as_ref() {
+                println!("Read error:  {}", read_error.message);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn print_tasks(tasks: &[AgentTaskSummary], format: OutputFormat) -> CliResult<()> {
+    match format {
+        OutputFormat::Json => {
+            print_pretty_json(tasks, "serializing tasks should succeed")?;
         }
         OutputFormat::Table => {
             println!(
-                "{:<36}  {:<3}  {:<10}  {:<10}  Comments",
-                "ID", "Pri", "Due", "Status"
+                "{:<36}  {:<40}  {:<3}  {:<10}  Status",
+                "ID", "Title", "Pri", "Due"
             );
-            println!("{}", "-".repeat(80));
-
+            println!("{}", "-".repeat(108));
             for task in tasks {
                 let priority = task
                     .priority
@@ -1233,62 +1555,91 @@ fn print_tasks(tasks: &[TaskResponse], format: OutputFormat) {
                 } else {
                     "Active"
                 };
-
                 println!(
-                    "{:<36}  {:<3}  {:<10}  {:<10}  {}",
-                    task.id, priority, due, status, task.comment_count
+                    "{:<36}  {:<40}  {:<3}  {:<10}  {}",
+                    task.id,
+                    truncate(task.title.as_deref().unwrap_or("-"), 40),
+                    priority,
+                    due,
+                    status
                 );
             }
-
             println!("\nTotal: {} task(s)", tasks.len());
         }
     }
+    Ok(())
 }
 
-fn print_my_tasks(tasks: &[MyTaskResponse], format: OutputFormat) {
+fn print_task_detail(detail: &AgentTaskDetail, format: OutputFormat) -> CliResult<()> {
     match format {
         OutputFormat::Json => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(tasks).expect("serializing my tasks should succeed")
-            );
+            print_pretty_json(detail, "serializing task detail should succeed")?;
         }
         OutputFormat::Table => {
-            println!(
-                "{:<36}  {:<36}  {:<3}  {:<10}  Status",
-                "Task ID", "Work List ID", "Pri", "Due"
-            );
-            println!("{}", "-".repeat(100));
-
-            for task in tasks {
-                let priority = task
-                    .priority
-                    .map(|value| value.to_string())
-                    .unwrap_or_default();
-                let due = task
-                    .due_at
-                    .map(|value| value.format("%Y-%m-%d").to_string())
-                    .unwrap_or_else(|| "-".to_string());
-                let status = if task.is_completed { "Done" } else { "Active" };
-
-                println!(
-                    "{:<36}  {:<36}  {:<3}  {:<10}  {}",
-                    task.id, task.work_list_id, priority, due, status
-                );
+            let task = &detail.task;
+            println!("Task");
+            println!("{}", "=".repeat(60));
+            println!("ID:          {}", task.id);
+            println!("Title:       {}", task.title.as_deref().unwrap_or("-"));
+            println!("Work List:   {}", task.work_list_id);
+            if let Some(work_list_title) = task.work_list_title.as_deref() {
+                println!("List Title:  {}", work_list_title);
             }
-
-            println!("\nTotal: {} task(s)", tasks.len());
+            println!(
+                "Status:      {}",
+                if task.is_completed { "Done" } else { "Active" }
+            );
+            if let Some(body) = task.body_markdown.as_deref() {
+                println!();
+                println!("Body");
+                println!("{}", "-".repeat(60));
+                println!("{body}");
+            }
+            if let Some(read_error) = task.read_error.as_ref() {
+                println!();
+                println!("Read error: {}", read_error.message);
+            }
+            if let Some(attachments) = task.attachments.as_ref()
+                && !attachments.is_empty()
+            {
+                println!();
+                println!("Attachments");
+                println!("{}", "-".repeat(60));
+                println!("{:<36}  {:<24}  Type / Size", "ID", "File");
+                println!("{}", "-".repeat(96));
+                for attachment in attachments {
+                    println!(
+                        "{:<36}  {:<24}  {} / {} B",
+                        attachment.id,
+                        truncate(&attachment.file_name, 24),
+                        attachment.content_type,
+                        attachment.size_bytes
+                    );
+                }
+            }
+            if !detail.comments.is_empty() {
+                println!();
+                println!("Comments");
+                println!("{}", "-".repeat(60));
+                for comment in &detail.comments {
+                    println!(
+                        "- {}",
+                        comment
+                            .body_markdown
+                            .as_deref()
+                            .unwrap_or("<unreadable comment>")
+                    );
+                }
+            }
         }
     }
+    Ok(())
 }
 
-fn print_stats(stats: &DashboardStatsResponse, format: OutputFormat) {
+fn print_stats(stats: &DashboardStatsResponse, format: OutputFormat) -> CliResult<()> {
     match format {
         OutputFormat::Json => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(stats).expect("serializing stats should succeed")
-            );
+            print_pretty_json(stats, "serializing stats should succeed")?;
         }
         OutputFormat::Table => {
             println!("Dashboard Statistics");
@@ -1299,68 +1650,202 @@ fn print_stats(stats: &DashboardStatsResponse, format: OutputFormat) {
             println!("Completed:      {}", stats.completed);
         }
     }
+    Ok(())
 }
 
-fn print_inspect_result(
-    work_list: &WorkListDetailResponse,
-    payload: &serde_json::Value,
+fn print_raw_work_lists(
+    lists: &[WorkListResponse],
     format: OutputFormat,
-) {
+    verbose: bool,
+) -> CliResult<()> {
     match format {
         OutputFormat::Json => {
-            let result = serde_json::json!({
-                "work_list_id": work_list.work_list.id,
-                "workspace_id": work_list.work_list.workspace_id,
-                "owner_user_id": work_list.work_list.owner_user_id,
-                "timezone": work_list.work_list.timezone,
-                "created_at": work_list.work_list.created_at,
-                "updated_at": work_list.work_list.updated_at,
-                "membership": {
-                    "id": work_list.work_list.membership.id,
-                    "role": work_list.work_list.membership.role,
-                    "status": work_list.work_list.membership.status,
-                },
-                "members_count": work_list.members.len(),
-                "decrypted_payload": payload,
-            });
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&result)
-                    .expect("serializing inspect result should succeed")
-            );
+            print_pretty_json(lists, "serializing work lists should succeed")?;
         }
         OutputFormat::Table => {
-            println!("Work List Inspection");
-            println!("{}", "=".repeat(60));
-            println!("ID:          {}", work_list.work_list.id);
-            println!("Workspace:   {}", work_list.work_list.workspace_id);
-            println!("Owner:       {}", work_list.work_list.owner_user_id);
-            println!("Timezone:    {}", work_list.work_list.timezone);
-            println!("Members:     {}", work_list.members.len());
-            println!("Your role:   {}", work_list.work_list.membership.role);
-            println!("Your status: {}", work_list.work_list.membership.status);
-            println!(
-                "Created:     {}",
-                work_list
-                    .work_list
-                    .created_at
-                    .format("%Y-%m-%d %H:%M:%S UTC")
-            );
-            println!(
-                "Updated:     {}",
-                work_list
-                    .work_list
-                    .updated_at
-                    .format("%Y-%m-%d %H:%M:%S UTC")
-            );
-            println!();
-            println!("Decrypted Payload");
-            println!("{}", "-".repeat(60));
-            println!(
-                "{}",
-                serde_json::to_string_pretty(payload)
-                    .expect("serializing decrypted payload should succeed")
-            );
+            if verbose {
+                for (index, list) in lists.iter().enumerate() {
+                    if index > 0 {
+                        println!();
+                    }
+                    println!("Work List: {}", list.id);
+                    println!("{}", "-".repeat(50));
+                    println!("  Workspace:     {}", list.workspace_id);
+                    println!("  Owner:         {}", list.owner_user_id);
+                    println!("  Timezone:      {}", list.timezone);
+                    println!("  Sections:      {}", list.section_snapshots.len());
+                    println!("  Your role:     {}", list.membership.role);
+                    println!("  Your status:   {}", list.membership.status);
+                }
+                println!("\nTotal: {} work list(s)", lists.len());
+            } else {
+                println!("{:<36}  {:<10}  {:<8}  Updated", "ID", "Role", "Sections");
+                println!("{}", "-".repeat(80));
+                for list in lists {
+                    println!(
+                        "{:<36}  {:<10}  {:<8}  {}",
+                        list.id,
+                        list.membership.role,
+                        list.section_snapshots.len(),
+                        list.updated_at.format("%Y-%m-%d %H:%M")
+                    );
+                }
+                println!("\nTotal: {} work list(s)", lists.len());
+            }
         }
+    }
+    Ok(())
+}
+
+fn print_raw_work_list_detail(
+    detail: &WorkListDetailResponse,
+    format: OutputFormat,
+) -> CliResult<()> {
+    match format {
+        OutputFormat::Json => {
+            print_pretty_json(detail, "serializing raw work list detail should succeed")?;
+        }
+        OutputFormat::Table => {
+            println!("Raw Work List");
+            println!("{}", "=".repeat(60));
+            println!("ID:          {}", detail.work_list.id);
+            println!("Workspace:   {}", detail.work_list.workspace_id);
+            println!("Owner:       {}", detail.work_list.owner_user_id);
+            println!("Members:     {}", detail.members.len());
+        }
+    }
+    Ok(())
+}
+
+fn print_raw_tasks(tasks: &[TaskResponse], format: OutputFormat) -> CliResult<()> {
+    match format {
+        OutputFormat::Json => {
+            print_pretty_json(tasks, "serializing tasks should succeed")?;
+        }
+        OutputFormat::Table => {
+            println!(
+                "{:<36}  {:<3}  {:<10}  {:<10}  Comments",
+                "ID", "Pri", "Due", "Status"
+            );
+            println!("{}", "-".repeat(80));
+            for task in tasks {
+                let priority = task
+                    .priority
+                    .map(|value| value.to_string())
+                    .unwrap_or_default();
+                let due = task
+                    .due_at
+                    .map(|value| value.format("%Y-%m-%d").to_string())
+                    .unwrap_or_else(|| "-".to_string());
+                let status = if task.is_completed {
+                    "Done"
+                } else if task.archived_at.is_some() {
+                    "Archived"
+                } else {
+                    "Active"
+                };
+                println!(
+                    "{:<36}  {:<3}  {:<10}  {:<10}  {}",
+                    task.id, priority, due, status, task.comment_count
+                );
+            }
+            println!("\nTotal: {} task(s)", tasks.len());
+        }
+    }
+    Ok(())
+}
+
+fn print_raw_my_tasks(
+    tasks: &[worklist_client_api::MyTaskResponse],
+    format: OutputFormat,
+) -> CliResult<()> {
+    match format {
+        OutputFormat::Json => {
+            print_pretty_json(tasks, "serializing my tasks should succeed")?;
+        }
+        OutputFormat::Table => {
+            println!(
+                "{:<36}  {:<36}  {:<3}  {:<10}  Status",
+                "Task ID", "Work List ID", "Pri", "Due"
+            );
+            println!("{}", "-".repeat(100));
+            for task in tasks {
+                let priority = task
+                    .priority
+                    .map(|value| value.to_string())
+                    .unwrap_or_default();
+                let due = task
+                    .due_at
+                    .map(|value| value.format("%Y-%m-%d").to_string())
+                    .unwrap_or_else(|| "-".to_string());
+                let status = if task.is_completed { "Done" } else { "Active" };
+                println!(
+                    "{:<36}  {:<36}  {:<3}  {:<10}  {}",
+                    task.id, task.work_list_id, priority, due, status
+                );
+            }
+            println!("\nTotal: {} task(s)", tasks.len());
+        }
+    }
+    Ok(())
+}
+
+fn print_raw_task_detail(detail: &TaskDetailResponse, format: OutputFormat) -> CliResult<()> {
+    match format {
+        OutputFormat::Json => {
+            print_pretty_json(detail, "serializing raw task detail should succeed")?;
+        }
+        OutputFormat::Table => {
+            println!("Raw Task");
+            println!("{}", "=".repeat(60));
+            println!("ID:          {}", detail.task.id);
+            println!("Work List:   {}", detail.task.work_list_id);
+            println!("Comments:    {}", detail.comments.len());
+        }
+    }
+    Ok(())
+}
+
+fn truncate(value: &str, width: usize) -> String {
+    let mut chars = value.chars();
+    let truncated: String = chars.by_ref().take(width).collect();
+    if chars.next().is_some() {
+        truncated
+    } else {
+        value.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn broken_pipe_stdout_errors_are_classified_separately() {
+        let error = io::Error::new(io::ErrorKind::BrokenPipe, "stdout closed");
+        assert!(matches!(
+            map_stream_error(error, "print to", "stdout", true),
+            CliError::BrokenPipe
+        ));
+    }
+
+    #[test]
+    fn non_broken_pipe_stdout_errors_become_public_errors() {
+        let error = io::Error::other("disk exploded");
+        assert!(matches!(
+            map_stream_error(error, "print to", "stdout", true),
+            CliError::Public(PublicError::Unexpected(message))
+                if message.contains("failed to print to stdout: disk exploded")
+        ));
+    }
+
+    #[test]
+    fn broken_pipe_stderr_errors_remain_failures() {
+        let error = io::Error::new(io::ErrorKind::BrokenPipe, "stderr closed");
+        assert!(matches!(
+            map_stream_error(error, "print to", "stderr", false),
+            CliError::Public(PublicError::Unexpected(message))
+                if message.contains("failed to print to stderr: stderr closed")
+        ));
     }
 }
