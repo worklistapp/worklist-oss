@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path as FsPath;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -1642,6 +1642,59 @@ async fn cli_json_logout_keychain_clear_warning_is_machine_readable() {
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_json_logout_warning_and_cleanup_error_share_one_stderr_document() {
+    let fixture = TestFixture::new();
+    let state = Arc::new(Mutex::new(TestState::new(fixture.clone())));
+    state.lock().expect("state lock").logout_status = StatusCode::BAD_GATEWAY;
+    let server = spawn_server(state).await;
+    let home = TempDir::new().expect("temp home");
+    seed_credentials(home.path(), &fixture, &server.base_url);
+
+    let socket_path = home.path().join(".worklist").join("unlock.sock");
+    let fake_daemon = spawn_invalid_unlock_daemon(&socket_path);
+
+    let output = run_cli(
+        home.path(),
+        &server.base_url,
+        &["--json", "auth", "logout"],
+        None,
+    );
+    fake_daemon.join().expect("join fake daemon");
+
+    assert!(
+        !output.status.success(),
+        "logout unexpectedly succeeded: {}",
+        output.stdout
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "unexpected stdout: {}",
+        output.stdout
+    );
+
+    let stderr_json = parse_stderr_json(&output.stderr);
+    assert_eq!(stderr_json["warnings"][0]["code"], "logout_revoke_failed");
+    assert!(
+        stderr_json["warnings"][0]["message"]
+            .as_str()
+            .expect("warning message")
+            .contains("502 Bad Gateway"),
+        "unexpected stderr: {}",
+        output.stderr
+    );
+    assert_eq!(stderr_json["error"]["code"], "unexpected");
+    assert!(
+        stderr_json["error"]["message"]
+            .as_str()
+            .expect("error message")
+            .contains("failed to clear unlock daemon session"),
+        "unexpected stderr: {}",
+        output.stderr
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_unlock_creates_user_only_socket_permissions() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -1750,24 +1803,25 @@ async fn cli_json_login_requires_email_non_interactively() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_json_login_requires_password_stdin_non_interactively() {
-    let home = TempDir::new().expect("temp home");
-
-    let output = run_cli(
-        home.path(),
-        "https://worklist.app",
+    assert_json_password_stdin_required(
         &["--json", "auth", "login", "--email", "agent@example.com"],
-        None,
-    );
-    assert!(!output.status.success(), "login unexpectedly succeeded");
-    assert!(
-        output.stdout.is_empty(),
-        "unexpected stdout: {}",
-        output.stdout
-    );
-
-    assert_json_error_message(
-        &output.stderr,
         "--json auth login requires --password-stdin",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_json_unlock_requires_password_stdin_non_interactively() {
+    assert_json_password_stdin_required(
+        &["--json", "auth", "unlock"],
+        "--json auth unlock requires --password-stdin",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_json_keychain_store_requires_password_stdin_non_interactively() {
+    assert_json_password_stdin_required(
+        &["--json", "auth", "keychain", "store"],
+        "--json auth keychain store requires --password-stdin",
     );
 }
 
@@ -3322,6 +3376,45 @@ fn assert_json_warning_contains(stderr: &str, expected_code: &str, expected_frag
             .contains(expected_fragment),
         "unexpected stderr: {stderr}"
     );
+}
+
+fn assert_json_password_stdin_required(args: &[&str], expected_message: &str) {
+    let home = TempDir::new().expect("temp home");
+    let output = run_cli(home.path(), "https://worklist.app", args, None);
+
+    assert!(!output.status.success(), "command unexpectedly succeeded");
+    assert!(
+        output.stdout.is_empty(),
+        "unexpected stdout: {}",
+        output.stdout
+    );
+    assert_json_error_message(&output.stderr, expected_message);
+}
+
+#[cfg(unix)]
+fn spawn_invalid_unlock_daemon(socket_path: &FsPath) -> std::thread::JoinHandle<()> {
+    use std::os::unix::net::UnixListener;
+
+    if socket_path.exists() {
+        std::fs::remove_file(socket_path).expect("remove stale fake daemon socket");
+    }
+
+    let listener = UnixListener::bind(socket_path).expect("bind fake daemon socket");
+    let socket_path = socket_path.to_path_buf();
+
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept fake daemon connection");
+        let mut request = Vec::new();
+        stream
+            .read_to_end(&mut request)
+            .expect("read fake daemon request");
+        stream
+            .write_all(b"{not valid json")
+            .expect("write fake daemon response");
+        drop(stream);
+        drop(listener);
+        let _ = std::fs::remove_file(socket_path);
+    })
 }
 
 fn replace_stored_test_keychain_secret_with_directory(keychain_dir: &FsPath) {

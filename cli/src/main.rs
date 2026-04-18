@@ -36,15 +36,20 @@ type CliResult<T> = Result<T, CliError>;
 enum CliError {
     BrokenPipe,
     Public(PublicError),
+    PublicWithWarnings {
+        error: PublicError,
+        warnings: Vec<WarningResult>,
+    },
 }
 
 impl std::error::Error for CliError {}
 
 impl fmt::Display for CliError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::BrokenPipe => write!(f, "broken pipe"),
-            Self::Public(err) => err.fmt(f),
+        if let Some(err) = self.public_error() {
+            err.fmt(f)
+        } else {
+            write!(f, "broken pipe")
         }
     }
 }
@@ -56,12 +61,40 @@ impl From<PublicError> for CliError {
 }
 
 impl CliError {
-    fn code(&self) -> &'static str {
+    fn public_error(&self) -> Option<&PublicError> {
         match self {
-            Self::BrokenPipe => "broken_pipe",
-            Self::Public(PublicError::Validation(_)) => "validation",
-            Self::Public(PublicError::Crypto(_)) => "crypto",
-            Self::Public(PublicError::Unexpected(_)) => "unexpected",
+            Self::BrokenPipe => None,
+            Self::Public(err) | Self::PublicWithWarnings { error: err, .. } => Some(err),
+        }
+    }
+
+    fn code(&self) -> &'static str {
+        match self.public_error() {
+            None => "broken_pipe",
+            Some(PublicError::Validation(_)) => "validation",
+            Some(PublicError::Crypto(_)) => "crypto",
+            Some(PublicError::Unexpected(_)) => "unexpected",
+        }
+    }
+
+    fn warnings(&self) -> &[WarningResult] {
+        match self {
+            Self::PublicWithWarnings { warnings, .. } => warnings,
+            _ => &[],
+        }
+    }
+
+    fn with_warnings(error: PublicError, warnings: &[WarningResult]) -> Self {
+        Self::PublicWithWarnings {
+            error,
+            warnings: warnings.to_vec(),
+        }
+    }
+
+    fn error_result(&self) -> ErrorResult {
+        ErrorResult {
+            code: self.code(),
+            message: self.to_string(),
         }
     }
 }
@@ -199,11 +232,6 @@ impl OutputFormat {
 }
 
 #[derive(Debug, Serialize)]
-struct ErrorEnvelope {
-    error: ErrorResult,
-}
-
-#[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ErrorResult {
     code: &'static str,
@@ -211,11 +239,14 @@ struct ErrorResult {
 }
 
 #[derive(Debug, Serialize)]
-struct WarningEnvelope<'a> {
+struct StderrEnvelope<'a> {
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
     warnings: &'a [WarningResult],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<ErrorResult>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct WarningResult {
     code: &'static str,
@@ -701,10 +732,13 @@ async fn run(cli: Cli, format: OutputFormat) -> CliResult<()> {
 
 fn print_cli_error(err: &CliError, format: OutputFormat) -> CliResult<()> {
     match format {
-        OutputFormat::Table => write_stderr_line(format_args!("error: {err}")),
-        OutputFormat::Json => print_json_error(
-            err.code(),
-            err.to_string(),
+        OutputFormat::Table => {
+            print_warnings(format, err.warnings())?;
+            write_stderr_line(format_args!("error: {err}"))
+        }
+        OutputFormat::Json => print_json_stderr(
+            err.warnings(),
+            Some(err.error_result()),
             "serializing CLI error should succeed",
         ),
     }
@@ -719,13 +753,7 @@ fn print_clap_error(err: &clap::Error) -> CliResult<()> {
 }
 
 fn print_json_error(code: &'static str, message: String, context: &str) -> CliResult<()> {
-    print_pretty_json_stderr(&error_envelope(code, message), context)
-}
-
-fn error_envelope(code: &'static str, message: String) -> ErrorEnvelope {
-    ErrorEnvelope {
-        error: ErrorResult { code, message },
-    }
+    print_json_stderr(&[], Some(ErrorResult { code, message }), context)
 }
 
 fn print_warnings(format: OutputFormat, warnings: &[WarningResult]) -> CliResult<()> {
@@ -768,8 +796,11 @@ fn write_warnings<W: Write>(
             Ok(())
         }
         OutputFormat::Json => {
-            let output = serde_json::to_string_pretty(&WarningEnvelope { warnings })
-                .expect("serializing CLI warnings should succeed");
+            let output = serde_json::to_string_pretty(&StderrEnvelope {
+                warnings,
+                error: None,
+            })
+            .expect("serializing CLI warnings should succeed");
             write_line_to_stream(
                 stream,
                 format_args!("{output}"),
@@ -779,6 +810,36 @@ fn write_warnings<W: Write>(
             )
         }
     }
+}
+
+fn print_json_stderr(
+    warnings: &[WarningResult],
+    error: Option<ErrorResult>,
+    context: &str,
+) -> CliResult<()> {
+    print_pretty_json_stderr(&StderrEnvelope { warnings, error }, context)
+}
+
+fn require_password_stdin_for_json_command(
+    format: OutputFormat,
+    password_stdin: bool,
+    command_name: &str,
+) -> CliResult<()> {
+    if format == OutputFormat::Json && !password_stdin {
+        return Err(PublicError::validation(format!(
+            "--json {command_name} requires --password-stdin"
+        ))
+        .into());
+    }
+
+    Ok(())
+}
+
+fn public_result_with_warnings<T>(
+    result: PublicResult<T>,
+    warnings: &[WarningResult],
+) -> CliResult<T> {
+    result.map_err(|err| CliError::with_warnings(err, warnings))
 }
 
 fn cmd_info(runtime: &RuntimeClient) -> CliResult<()> {
@@ -828,9 +889,7 @@ async fn cmd_login(
         return Err(PublicError::validation("email is required").into());
     }
 
-    if format == OutputFormat::Json && !password_stdin {
-        return Err(PublicError::validation("--json auth login requires --password-stdin").into());
-    }
+    require_password_stdin_for_json_command(format, password_stdin, "auth login")?;
 
     let password = read_required_password(password_stdin, None)?;
     if format == OutputFormat::Table {
@@ -856,6 +915,7 @@ fn cmd_unlock(
     ttl_seconds: u64,
     password_stdin: bool,
 ) -> CliResult<()> {
+    require_password_stdin_for_json_command(format, password_stdin, "auth unlock")?;
     runtime.unlock_daemon(ttl_seconds, password_stdin)?;
     print_unlock_result(
         format,
@@ -877,6 +937,7 @@ fn cmd_keychain(
 ) -> CliResult<()> {
     let (status, table_message) = match command {
         KeychainCommand::Store { password_stdin } => {
+            require_password_stdin_for_json_command(format, password_stdin, "auth keychain store")?;
             runtime.store_persisted_data_key(password_stdin)?;
             (
                 "available",
@@ -929,10 +990,11 @@ async fn cmd_logout(format: OutputFormat, runtime: &RuntimeClient) -> CliResult<
             format!("failed to clear platform keychain entry: {err}"),
         ));
     }
+    public_result_with_warnings(clear_credentials(), &warnings)?;
+    let session_key =
+        public_result_with_warnings(runtime.current_session_key(&credentials), &warnings)?;
+    public_result_with_warnings(clear_session(&session_key), &warnings)?;
     emit_warnings_best_effort(format, &warnings);
-    clear_credentials()?;
-    let session_key = runtime.current_session_key(&credentials)?;
-    clear_session(&session_key)?;
     print_simple_result(
         format,
         &LogoutResult {
