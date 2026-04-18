@@ -45,9 +45,9 @@ cargo test
 cargo run -p worklist -- --help
 cargo run -p worklist -- auth unlock --password-stdin
 cargo run -p worklist -- auth keychain store --password-stdin
-cargo run -p worklist -- tasks get --work-list-id <list-id> --task-id <task-id>
-cargo run -p worklist -- tasks attachments read --work-list-id <list-id> --task-id <task-id> --attachment-id <attachment-id>
-cargo run -p worklist -- tasks attachments download --work-list-id <list-id> --task-id <task-id> --attachment-id <attachment-id>
+cargo run -p worklist -- --json tasks get --work-list-id <list-id> --task-id <task-id>
+cargo run -p worklist -- --json tasks attachments read --work-list-id <list-id> --task-id <task-id> --attachment-id <attachment-id>
+cargo run -p worklist -- --json tasks attachments download --work-list-id <list-id> --task-id <task-id> --attachment-id <attachment-id>
 ```
 
 Once the crate is published, install the CLI with:
@@ -64,11 +64,11 @@ WORKLIST_API_URL=https://your-worklist.example cargo run -p worklist -- me
 
 ## Development Notes
 
-- The CLI defaults to table output for formatted read commands; pass `--format json` for machine-readable output.
+- The CLI defaults to table/text output for humans; pass `--json` for machine-readable output.
 - Read commands return decrypted agent-facing models by default; raw wire DTOs are only available through hidden debug flags.
 - Encrypted read and write commands are non-interactive by default. Use `auth unlock --password-stdin` for a temporary in-memory session, or `auth keychain store --password-stdin` to persist a local bootstrap secret in the platform keychain.
 - `tasks get` includes typed attachment metadata and lists attachment IDs in table output.
-- `tasks attachments read` prints readable attachments to stdout, including plain text passthrough and DOCX rendered as Markdown; with `--format json` it emits the rendered content plus attachment metadata.
+- `tasks attachments read` prints readable attachments to stdout, including plain text passthrough and DOCX rendered as Markdown; with `--json` it emits the rendered content plus attachment metadata.
 - `tasks attachments download` decrypts binary attachments and saves them locally; if `--output` is omitted it writes `./<attachment-file-name>`.
 - The current workspace targets encrypted Worklist flows, so authenticated reads and writes still depend on credentials, local key unwrap, and workspace keys from a live Worklist deployment.
 - CI for this repository runs from `.github/workflows/ci.yml`.

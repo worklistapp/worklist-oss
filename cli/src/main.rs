@@ -1,12 +1,13 @@
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::json;
 use uuid::Uuid;
@@ -15,18 +16,18 @@ use worklist_client_api::{
     TaskDetailResponse, TaskResponse, WorkListDetailResponse, WorkListResponse,
 };
 use worklist_client_auth::{
-    PersistedDataKeyStatus, UnlockMode, auth_response_to_credentials, clear_credentials,
-    credentials_path, load_credentials, load_credentials_for_url, login, logout, normalize_api_url,
-    persisted_data_key_status, save_credentials,
+    Credentials, PersistedDataKeyStatus, UnlockMode, auth_response_to_credentials,
+    clear_credentials, credentials_path, load_credentials, load_credentials_for_url, login, logout,
+    normalize_api_url, persisted_data_key_status, save_credentials,
 };
 use worklist_client_core::{PublicError, PublicResult};
 use worklist_client_crypto::CryptoCapability;
 use worklist_client_runtime::{
     AgentComment, AgentTaskDetail, AgentTaskSummary, AgentWorkListDetail, AgentWorkListSummary,
     ArchiveTaskArgs, CommentInput, CreateCommentArgs, CreateTaskArgs, DeleteCommentArgs,
-    DeleteTaskArgs, MoveTaskArgs, MoveTaskInput, ReadableAttachment, RuntimeClient,
-    TaskCreateInput, TaskUpdateInput, UnarchiveTaskArgs, UpdateCommentArgs, UpdateTaskArgs,
-    clear_session, lock, serve, session_key, unlock_status,
+    DeleteTaskArgs, MoveTaskArgs, MoveTaskInput, ReadableAttachment, RuntimeClient, SessionKey,
+    TaskCreateInput, TaskUpdateInput, UnarchiveTaskArgs, UnlockStatus, UpdateCommentArgs,
+    UpdateTaskArgs, clear_session, lock, serve, session_key, unlock_status,
 };
 
 type CliResult<T> = Result<T, CliError>;
@@ -54,6 +55,17 @@ impl From<PublicError> for CliError {
     }
 }
 
+impl CliError {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::BrokenPipe => "broken_pipe",
+            Self::Public(PublicError::Validation(_)) => "validation",
+            Self::Public(PublicError::Crypto(_)) => "crypto",
+            Self::Public(PublicError::Unexpected(_)) => "unexpected",
+        }
+    }
+}
+
 macro_rules! print {
     () => {
         write_stdout(format_args!(""))?
@@ -69,15 +81,6 @@ macro_rules! println {
     };
     ($($arg:tt)*) => {
         write_stdout_line(format_args!($($arg)*))?
-    };
-}
-
-macro_rules! eprintln {
-    () => {
-        let _ = write_stderr_line(format_args!(""));
-    };
-    ($($arg:tt)*) => {
-        let _ = write_stderr_line(format_args!($($arg)*));
     };
 }
 
@@ -148,6 +151,11 @@ fn print_pretty_json<T: Serialize + ?Sized>(value: &T, context: &str) -> CliResu
     Ok(())
 }
 
+fn print_pretty_json_stderr<T: Serialize + ?Sized>(value: &T, context: &str) -> CliResult<()> {
+    let output = serde_json::to_string_pretty(value).expect(context);
+    write_stderr_line(format_args!("{output}"))
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "worklist",
@@ -163,8 +171,8 @@ struct Cli {
     )]
     api_url: String,
 
-    #[arg(long, value_enum, default_value_t = OutputFormat::Table, global = true)]
-    format: OutputFormat,
+    #[arg(long, global = true)]
+    json: bool,
 
     #[arg(long, hide = true)]
     serve_unlock_daemon: Option<PathBuf>,
@@ -173,11 +181,135 @@ struct Cli {
     command: Option<Command>,
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum, Default)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum OutputFormat {
-    #[default]
     Table,
     Json,
+}
+
+impl OutputFormat {
+    #[must_use]
+    fn from_raw_args(args: &[OsString]) -> Self {
+        if args.iter().any(|arg| arg == OsStr::new("--json")) {
+            Self::Json
+        } else {
+            Self::Table
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ErrorEnvelope {
+    error: ErrorResult,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ErrorResult {
+    code: &'static str,
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
+struct WarningEnvelope<'a> {
+    warnings: &'a [WarningResult],
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WarningResult {
+    code: &'static str,
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LoginResult {
+    logged_in: bool,
+    already_logged_in: bool,
+    email: String,
+    api_url: String,
+    credentials_path: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UnlockResult {
+    unlocked: bool,
+    mode: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ttl_seconds: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LogoutResult {
+    logged_out: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    api_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedBootstrapEnvelope {
+    persisted_bootstrap: PersistedBootstrapStatus,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedBootstrapStatus {
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UnlockDaemonStatusResult {
+    active: bool,
+    expires_at_unix: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ApiUrlMismatch {
+    stored_api_url: String,
+    current_api_url: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LoggedInStatusResult {
+    logged_in: bool,
+    email: String,
+    api_url: String,
+    user_id: Uuid,
+    access_token_expires_at: String,
+    refresh_token_expires_at: String,
+    #[serde(skip_serializing)]
+    access_token_expires_display: String,
+    #[serde(skip_serializing)]
+    refresh_token_expires_display: String,
+    session_state: &'static str,
+    api_url_mismatch: Option<ApiUrlMismatch>,
+    unlock_daemon: UnlockDaemonStatusResult,
+    persisted_bootstrap: PersistedBootstrapStatus,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LoggedOutStatusResult {
+    logged_in: bool,
+    credentials_path: String,
+    unlock_daemon: UnlockDaemonStatusResult,
+    persisted_bootstrap: PersistedBootstrapStatus,
+}
+
+enum AuthStatusResult {
+    LoggedIn(LoggedInStatusResult),
+    LoggedOut(LoggedOutStatusResult),
 }
 
 #[derive(Subcommand, Debug)]
@@ -488,18 +620,36 @@ enum KeychainCommand {
 
 #[tokio::main]
 async fn main() {
-    let cli = Cli::parse();
-    match run(cli).await {
+    let args = std::env::args_os().collect::<Vec<_>>();
+    let format = OutputFormat::from_raw_args(&args);
+    let cli = parse_cli_or_exit(&args, format);
+    match run(cli, format).await {
         Ok(()) => {}
         Err(CliError::BrokenPipe) => std::process::exit(0),
         Err(err) => {
-            let _ = write_stderr_line(format_args!("error: {err}"));
+            let _ = print_cli_error(&err, format);
             std::process::exit(1);
         }
     }
 }
 
-async fn run(cli: Cli) -> CliResult<()> {
+fn parse_cli_or_exit(args: &[OsString], format: OutputFormat) -> Cli {
+    match Cli::try_parse_from(args.iter().cloned()) {
+        Ok(cli) => cli,
+        Err(err) => exit_after_clap_error(err, format),
+    }
+}
+
+fn exit_after_clap_error(err: clap::Error, format: OutputFormat) -> ! {
+    if format == OutputFormat::Json && err.use_stderr() {
+        let _ = print_clap_error(&err);
+        std::process::exit(err.exit_code());
+    }
+
+    err.exit()
+}
+
+async fn run(cli: Cli, format: OutputFormat) -> CliResult<()> {
     if let Some(socket_path) = cli.serve_unlock_daemon.as_deref() {
         return serve(socket_path).await.map_err(Into::into);
     }
@@ -515,17 +665,17 @@ async fn run(cli: Cli) -> CliResult<()> {
             AuthCommand::Login {
                 email,
                 password_stdin,
-            } => cmd_login(runtime.api_url(), email, password_stdin).await,
+            } => cmd_login(format, runtime.api_url(), email, password_stdin).await,
             AuthCommand::Unlock {
                 ttl_seconds,
                 password_stdin,
-            } => cmd_unlock(&runtime, ttl_seconds, password_stdin),
-            AuthCommand::Lock => cmd_lock(),
-            AuthCommand::Keychain { command } => cmd_keychain(&runtime, command),
-            AuthCommand::Logout => cmd_logout(&runtime).await,
-            AuthCommand::Status => cmd_status(runtime.api_url()),
+            } => cmd_unlock(format, &runtime, ttl_seconds, password_stdin),
+            AuthCommand::Lock => cmd_lock(format),
+            AuthCommand::Keychain { command } => cmd_keychain(format, &runtime, command),
+            AuthCommand::Logout => cmd_logout(format, &runtime).await,
+            AuthCommand::Status => cmd_status(format, runtime.api_url()),
         },
-        Command::Me => cmd_me(&runtime, cli.format).await,
+        Command::Me => cmd_me(&runtime, format).await,
         Command::Lists {
             verbose,
             password_stdin,
@@ -536,16 +686,98 @@ async fn run(cli: Cli) -> CliResult<()> {
                 work_list_id,
                 password_stdin,
                 raw,
-            }) => cmd_lists_get(&runtime, cli.format, work_list_id, password_stdin, raw).await,
-            None => cmd_lists(&runtime, cli.format, verbose, password_stdin, raw).await,
+            }) => cmd_lists_get(&runtime, format, work_list_id, password_stdin, raw).await,
+            None => cmd_lists(&runtime, format, verbose, password_stdin, raw).await,
         },
-        Command::Tasks { command } => cmd_tasks(&runtime, cli.format, command).await,
-        Command::Stats => cmd_stats(&runtime, cli.format).await,
+        Command::Tasks { command } => cmd_tasks(&runtime, format, command).await,
+        Command::Stats => cmd_stats(&runtime, format).await,
         Command::Inspect {
             work_list_id,
             password_stdin,
-        } => cmd_lists_get(&runtime, cli.format, work_list_id, password_stdin, false).await,
-        Command::Comments { command } => cmd_comments(&runtime, cli.format, command).await,
+        } => cmd_lists_get(&runtime, format, work_list_id, password_stdin, false).await,
+        Command::Comments { command } => cmd_comments(&runtime, format, command).await,
+    }
+}
+
+fn print_cli_error(err: &CliError, format: OutputFormat) -> CliResult<()> {
+    match format {
+        OutputFormat::Table => write_stderr_line(format_args!("error: {err}")),
+        OutputFormat::Json => print_json_error(
+            err.code(),
+            err.to_string(),
+            "serializing CLI error should succeed",
+        ),
+    }
+}
+
+fn print_clap_error(err: &clap::Error) -> CliResult<()> {
+    print_json_error(
+        "validation",
+        err.to_string().trim_end().to_string(),
+        "serializing clap parse error should succeed",
+    )
+}
+
+fn print_json_error(code: &'static str, message: String, context: &str) -> CliResult<()> {
+    print_pretty_json_stderr(&error_envelope(code, message), context)
+}
+
+fn error_envelope(code: &'static str, message: String) -> ErrorEnvelope {
+    ErrorEnvelope {
+        error: ErrorResult { code, message },
+    }
+}
+
+fn print_warnings(format: OutputFormat, warnings: &[WarningResult]) -> CliResult<()> {
+    write_warnings(io::stderr().lock(), format, warnings)
+}
+
+fn emit_warnings_best_effort(format: OutputFormat, warnings: &[WarningResult]) {
+    let _ = print_warnings(format, warnings);
+}
+
+#[cfg(test)]
+fn emit_warnings_best_effort_to<W: Write>(
+    stream: W,
+    format: OutputFormat,
+    warnings: &[WarningResult],
+) {
+    let _ = write_warnings(stream, format, warnings);
+}
+
+fn write_warnings<W: Write>(
+    mut stream: W,
+    format: OutputFormat,
+    warnings: &[WarningResult],
+) -> CliResult<()> {
+    if warnings.is_empty() {
+        return Ok(());
+    }
+
+    match format {
+        OutputFormat::Table => {
+            for warning in warnings {
+                write_line_to_stream(
+                    &mut stream,
+                    format_args!("warning: {}", warning.message),
+                    "print to",
+                    "stderr",
+                    false,
+                )?;
+            }
+            Ok(())
+        }
+        OutputFormat::Json => {
+            let output = serde_json::to_string_pretty(&WarningEnvelope { warnings })
+                .expect("serializing CLI warnings should succeed");
+            write_line_to_stream(
+                stream,
+                format_args!("{output}"),
+                "print to",
+                "stderr",
+                false,
+            )
+        }
     }
 }
 
@@ -571,6 +803,7 @@ fn cmd_info(runtime: &RuntimeClient) -> CliResult<()> {
 }
 
 async fn cmd_login(
+    format: OutputFormat,
     api_url: &str,
     email_flag: Option<String>,
     password_stdin: bool,
@@ -578,8 +811,13 @@ async fn cmd_login(
     if let Some(credentials) = load_credentials_for_url(api_url)?
         && !credentials.is_refresh_expired()
     {
-        println!("Already logged in as {} ({})", credentials.email, api_url);
+        let result = build_login_result(normalize_api_url(api_url), credentials.email, true)?;
+        print_login_result(format, &result, api_url)?;
         return Ok(());
+    }
+
+    if format == OutputFormat::Json && email_flag.is_none() {
+        return Err(PublicError::validation("--json auth login requires --email").into());
     }
 
     let email = match email_flag {
@@ -590,139 +828,416 @@ async fn cmd_login(
         return Err(PublicError::validation("email is required").into());
     }
 
+    if format == OutputFormat::Json && !password_stdin {
+        return Err(PublicError::validation("--json auth login requires --password-stdin").into());
+    }
+
     let password = read_required_password(password_stdin, None)?;
-    println!("Authenticating...");
+    if format == OutputFormat::Table {
+        println!("Authenticating...");
+    }
     let client = reqwest::Client::new();
     let auth_response = login(&client, api_url, &email, &password).await?;
     let credentials = auth_response_to_credentials(api_url, auth_response);
     save_credentials(&credentials)?;
 
-    println!("Logged in as {}", credentials.email);
-    println!("Credentials saved to {}", credentials_path()?.display());
+    let result = build_login_result(
+        credentials.api_url.clone(),
+        credentials.email.clone(),
+        false,
+    )?;
+    print_login_result(format, &result, api_url)?;
     Ok(())
 }
 
-fn cmd_unlock(runtime: &RuntimeClient, ttl_seconds: u64, password_stdin: bool) -> CliResult<()> {
+fn cmd_unlock(
+    format: OutputFormat,
+    runtime: &RuntimeClient,
+    ttl_seconds: u64,
+    password_stdin: bool,
+) -> CliResult<()> {
     runtime.unlock_daemon(ttl_seconds, password_stdin)?;
-    println!("Unlocked local daemon for {} seconds.", ttl_seconds);
-    Ok(())
+    print_unlock_result(
+        format,
+        true,
+        Some(ttl_seconds),
+        &format!("Unlocked local daemon for {} seconds.", ttl_seconds),
+    )
 }
 
-fn cmd_lock() -> CliResult<()> {
+fn cmd_lock(format: OutputFormat) -> CliResult<()> {
     lock()?;
-    println!("Locked local daemon.");
-    Ok(())
+    print_unlock_result(format, false, None, "Locked local daemon.")
 }
 
-fn cmd_keychain(runtime: &RuntimeClient, command: KeychainCommand) -> CliResult<()> {
-    match command {
+fn cmd_keychain(
+    format: OutputFormat,
+    runtime: &RuntimeClient,
+    command: KeychainCommand,
+) -> CliResult<()> {
+    let (status, table_message) = match command {
         KeychainCommand::Store { password_stdin } => {
             runtime.store_persisted_data_key(password_stdin)?;
-            println!("Stored a local bootstrap secret in the platform keychain.");
+            (
+                "available",
+                "Stored a local bootstrap secret in the platform keychain.",
+            )
         }
         KeychainCommand::Clear => {
             runtime.clear_persisted_data_key()?;
-            println!("Cleared the local bootstrap secret from the platform keychain.");
-        }
-    }
-    Ok(())
-}
-
-async fn cmd_logout(runtime: &RuntimeClient) -> CliResult<()> {
-    let credentials = match load_credentials_for_url(runtime.api_url())? {
-        Some(credentials) => credentials,
-        None => {
-            println!("Not logged in.");
-            return Ok(());
+            (
+                "cleared",
+                "Cleared the local bootstrap secret from the platform keychain.",
+            )
         }
     };
 
+    print_simple_result(
+        format,
+        &persisted_bootstrap_envelope(status),
+        "serializing keychain result should succeed",
+        table_message,
+    )
+}
+
+async fn cmd_logout(format: OutputFormat, runtime: &RuntimeClient) -> CliResult<()> {
+    let Some(credentials) = load_credentials_for_url(runtime.api_url())? else {
+        return print_simple_result(
+            format,
+            &LogoutResult {
+                logged_out: false,
+                api_url: None,
+                reason: Some("not_logged_in"),
+            },
+            "serializing logout result should succeed",
+            "Not logged in.",
+        );
+    };
+
     let client = reqwest::Client::new();
-    if let Err(err) = logout(&client, runtime.api_url(), &credentials.refresh_token).await {
-        eprintln!("warning: failed to revoke token on server: {err}");
+    let mut warnings = Vec::new();
+
+    if let Some(warning) =
+        logout_revoke_warning(logout(&client, runtime.api_url(), &credentials.refresh_token).await)
+    {
+        warnings.push(warning);
     }
 
     if let Err(err) = runtime.clear_persisted_data_key() {
-        eprintln!("warning: failed to clear platform keychain entry: {err}");
+        warnings.push(warning_result(
+            "logout_persisted_bootstrap_clear_failed",
+            format!("failed to clear platform keychain entry: {err}"),
+        ));
     }
+    emit_warnings_best_effort(format, &warnings);
     clear_credentials()?;
     let session_key = runtime.current_session_key(&credentials)?;
     clear_session(&session_key)?;
-    println!("Logged out successfully.");
+    print_simple_result(
+        format,
+        &LogoutResult {
+            logged_out: true,
+            api_url: Some(runtime.api_url().to_string()),
+            reason: None,
+        },
+        "serializing logout result should succeed",
+        "Logged out successfully.",
+    )?;
     Ok(())
 }
 
-fn cmd_status(api_url: &str) -> CliResult<()> {
-    match load_credentials()? {
-        Some(credentials) => {
-            println!("Logged in as: {}", credentials.email);
-            println!("API URL: {}", credentials.api_url);
-            println!("User ID: {}", credentials.user_id);
-            println!(
-                "Access token expires: {}",
-                credentials
-                    .access_expires_at
-                    .format("%Y-%m-%d %H:%M:%S UTC")
-            );
-            println!(
-                "Refresh token expires: {}",
-                credentials
-                    .refresh_expires_at
-                    .format("%Y-%m-%d %H:%M:%S UTC")
-            );
-
-            let status_api_url = credentials.api_url.clone();
-            if status_api_url != normalize_api_url(api_url) {
-                println!("\nNote: Stored credentials are for a different API URL.");
-                println!("Stored: {}", status_api_url);
-                println!("Current: {}", api_url);
+fn cmd_status(format: OutputFormat, api_url: &str) -> CliResult<()> {
+    match load_auth_status(api_url)? {
+        AuthStatusResult::LoggedIn(status) => match format {
+            OutputFormat::Json => {
+                print_pretty_json(&status, "serializing auth status should succeed")
             }
+            OutputFormat::Table => print_logged_in_auth_status(&status),
+        },
+        AuthStatusResult::LoggedOut(status) => match format {
+            OutputFormat::Json => print_pretty_json(
+                &status,
+                "serializing unauthenticated auth status should succeed",
+            ),
+            OutputFormat::Table => print_logged_out_auth_status(&status),
+        },
+    }
+}
 
-            if credentials.is_refresh_expired() {
-                println!("\nWarning: Session has expired. Please login again.");
-            } else if credentials.is_access_expired() {
-                println!("\nNote: Access token has expired but will be refreshed automatically.");
-            }
-
-            let session_key = session_key(
-                &status_api_url,
-                credentials.user_id,
-                &credentials.data_key_ciphertext,
-            )?;
-            let status = unlock_status(Some(&session_key))?;
-            if status.unlocked {
-                if let Some(expires_at_unix) = status.expires_at_unix {
-                    println!("\nUnlock daemon: active until unix {}", expires_at_unix);
-                } else {
-                    println!("\nUnlock daemon: active");
-                }
-            } else {
-                println!("\nUnlock daemon: inactive");
-            }
-
-            match persisted_data_key_status(&credentials) {
-                PersistedDataKeyStatus::Available => {
-                    println!("Persisted bootstrap: available");
-                }
-                PersistedDataKeyStatus::Missing => {
-                    println!("Persisted bootstrap: missing");
-                }
-                PersistedDataKeyStatus::Unavailable(message) => {
-                    println!("Persisted bootstrap: unavailable ({message})");
-                }
-            }
-        }
-        None => {
-            println!("Not logged in.");
-            println!(
-                "Credentials would be stored at: {}",
-                credentials_path()?.display()
-            );
-            println!("Unlock daemon: inactive for current target");
-            println!("Persisted bootstrap: unavailable for current target");
+fn print_simple_result<T: Serialize + ?Sized>(
+    format: OutputFormat,
+    payload: &T,
+    context: &str,
+    table_message: &str,
+) -> CliResult<()> {
+    match format {
+        OutputFormat::Json => print_pretty_json(payload, context),
+        OutputFormat::Table => {
+            println!("{table_message}");
+            Ok(())
         }
     }
+}
+
+fn print_unlock_result(
+    format: OutputFormat,
+    unlocked: bool,
+    ttl_seconds: Option<u64>,
+    table_message: &str,
+) -> CliResult<()> {
+    print_simple_result(
+        format,
+        &UnlockResult {
+            unlocked,
+            mode: "daemon",
+            ttl_seconds,
+        },
+        "serializing unlock result should succeed",
+        table_message,
+    )
+}
+
+fn build_login_result(
+    api_url: String,
+    email: String,
+    already_logged_in: bool,
+) -> CliResult<LoginResult> {
+    Ok(LoginResult {
+        logged_in: true,
+        already_logged_in,
+        email,
+        api_url,
+        credentials_path: credentials_path_string()?,
+    })
+}
+
+fn print_login_result(format: OutputFormat, result: &LoginResult, api_url: &str) -> CliResult<()> {
+    match format {
+        OutputFormat::Json => print_pretty_json(result, "serializing login result should succeed"),
+        OutputFormat::Table => {
+            if result.already_logged_in {
+                println!("Already logged in as {} ({api_url})", result.email);
+            } else {
+                println!("Logged in as {}", result.email);
+                println!("Credentials saved to {}", result.credentials_path);
+            }
+            Ok(())
+        }
+    }
+}
+
+fn credentials_path_string() -> CliResult<String> {
+    Ok(credentials_path()?.display().to_string())
+}
+
+fn load_auth_status(api_url: &str) -> CliResult<AuthStatusResult> {
+    let current_api_url = normalize_api_url(api_url);
+    let Some(credentials) = load_credentials()? else {
+        return logged_out_auth_status();
+    };
+
+    logged_in_auth_status(credentials, &current_api_url)
+}
+
+fn logged_in_auth_status(
+    credentials: Credentials,
+    current_api_url: &str,
+) -> CliResult<AuthStatusResult> {
+    let session_key = current_session_key(&credentials)?;
+    let unlock_status = unlock_status(Some(&session_key))?;
+
+    Ok(AuthStatusResult::LoggedIn(LoggedInStatusResult {
+        logged_in: true,
+        email: credentials.email.clone(),
+        api_url: credentials.api_url.clone(),
+        user_id: credentials.user_id,
+        access_token_expires_at: credentials.access_expires_at.to_rfc3339(),
+        refresh_token_expires_at: credentials.refresh_expires_at.to_rfc3339(),
+        access_token_expires_display: credentials
+            .access_expires_at
+            .format("%Y-%m-%d %H:%M:%S UTC")
+            .to_string(),
+        refresh_token_expires_display: credentials
+            .refresh_expires_at
+            .format("%Y-%m-%d %H:%M:%S UTC")
+            .to_string(),
+        session_state: session_state(&credentials),
+        api_url_mismatch: api_url_mismatch(&credentials.api_url, current_api_url),
+        unlock_daemon: unlock_daemon_status(unlock_status),
+        persisted_bootstrap: persisted_bootstrap_status(persisted_data_key_status(&credentials)),
+    }))
+}
+
+fn logged_out_auth_status() -> CliResult<AuthStatusResult> {
+    Ok(AuthStatusResult::LoggedOut(LoggedOutStatusResult {
+        logged_in: false,
+        credentials_path: credentials_path_string()?,
+        unlock_daemon: inactive_unlock_daemon_status(),
+        persisted_bootstrap: unavailable_persisted_bootstrap_status(),
+    }))
+}
+
+fn current_session_key(credentials: &Credentials) -> CliResult<SessionKey> {
+    Ok(session_key(
+        &credentials.api_url,
+        credentials.user_id,
+        &credentials.data_key_ciphertext,
+    )?)
+}
+
+fn api_url_mismatch(stored_api_url: &str, current_api_url: &str) -> Option<ApiUrlMismatch> {
+    (stored_api_url != current_api_url).then(|| ApiUrlMismatch {
+        stored_api_url: stored_api_url.to_string(),
+        current_api_url: current_api_url.to_string(),
+    })
+}
+
+fn unlock_daemon_status(status: UnlockStatus) -> UnlockDaemonStatusResult {
+    UnlockDaemonStatusResult {
+        active: status.unlocked,
+        expires_at_unix: status.expires_at_unix,
+    }
+}
+
+fn inactive_unlock_daemon_status() -> UnlockDaemonStatusResult {
+    unlock_daemon_status(UnlockStatus {
+        unlocked: false,
+        session_key: None,
+        expires_at_unix: None,
+    })
+}
+
+fn persisted_bootstrap_status(status: PersistedDataKeyStatus) -> PersistedBootstrapStatus {
+    match status {
+        PersistedDataKeyStatus::Available => simple_persisted_bootstrap_status("available"),
+        PersistedDataKeyStatus::Missing => simple_persisted_bootstrap_status("missing"),
+        PersistedDataKeyStatus::Unavailable(message) => PersistedBootstrapStatus {
+            status: "unavailable",
+            message: Some(message),
+        },
+    }
+}
+
+fn simple_persisted_bootstrap_status(status: &'static str) -> PersistedBootstrapStatus {
+    PersistedBootstrapStatus {
+        status,
+        message: None,
+    }
+}
+
+fn persisted_bootstrap_envelope(status: &'static str) -> PersistedBootstrapEnvelope {
+    PersistedBootstrapEnvelope {
+        persisted_bootstrap: simple_persisted_bootstrap_status(status),
+    }
+}
+
+fn unavailable_persisted_bootstrap_status() -> PersistedBootstrapStatus {
+    PersistedBootstrapStatus {
+        status: "unavailable",
+        message: Some("unavailable for current target".to_string()),
+    }
+}
+
+fn print_logged_in_auth_status(status: &LoggedInStatusResult) -> CliResult<()> {
+    println!("Logged in as: {}", status.email);
+    println!("API URL: {}", status.api_url);
+    println!("User ID: {}", status.user_id);
+    println!(
+        "Access token expires: {}",
+        status.access_token_expires_display
+    );
+    println!(
+        "Refresh token expires: {}",
+        status.refresh_token_expires_display
+    );
+
+    if let Some(mismatch) = status.api_url_mismatch.as_ref() {
+        println!("\nNote: Stored credentials are for a different API URL.");
+        println!("Stored: {}", mismatch.stored_api_url);
+        println!("Current: {}", mismatch.current_api_url);
+    }
+
+    if let Some(notice) = session_state_notice(status.session_state) {
+        println!("\n{notice}");
+    }
+
+    print_unlock_daemon_status(&status.unlock_daemon, "\n")?;
+    print_persisted_bootstrap_status(&status.persisted_bootstrap)
+}
+
+fn print_logged_out_auth_status(status: &LoggedOutStatusResult) -> CliResult<()> {
+    println!("Not logged in.");
+    println!(
+        "Credentials would be stored at: {}",
+        status.credentials_path
+    );
+    println!("Unlock daemon: inactive for current target");
+    println!("Persisted bootstrap: unavailable for current target");
     Ok(())
+}
+
+fn print_unlock_daemon_status(
+    status: &UnlockDaemonStatusResult,
+    line_prefix: &str,
+) -> CliResult<()> {
+    match (status.active, status.expires_at_unix) {
+        (true, Some(expires_at_unix)) => {
+            println!(
+                "{line_prefix}Unlock daemon: active until unix {}",
+                expires_at_unix
+            )
+        }
+        (true, None) => println!("{line_prefix}Unlock daemon: active"),
+        (false, _) => println!("{line_prefix}Unlock daemon: inactive"),
+    }
+    Ok(())
+}
+
+fn print_persisted_bootstrap_status(status: &PersistedBootstrapStatus) -> CliResult<()> {
+    match status.message.as_deref() {
+        Some(message) => println!("Persisted bootstrap: {} ({message})", status.status),
+        None => println!("Persisted bootstrap: {}", status.status),
+    }
+    Ok(())
+}
+
+fn session_state(credentials: &Credentials) -> &'static str {
+    if credentials.is_refresh_expired() {
+        "refresh_expired"
+    } else if credentials.is_access_expired() {
+        "access_expired"
+    } else {
+        "active"
+    }
+}
+
+fn session_state_notice(session_state: &str) -> Option<&'static str> {
+    match session_state {
+        "refresh_expired" => Some("Warning: Session has expired. Please login again."),
+        "access_expired" => {
+            Some("Note: Access token has expired but will be refreshed automatically.")
+        }
+        "active" => None,
+        _ => None,
+    }
+}
+
+fn logout_revoke_warning(result: PublicResult<Option<String>>) -> Option<WarningResult> {
+    match result {
+        Ok(Some(message)) => Some(warning_result(
+            "logout_revoke_failed",
+            format!("failed to revoke token on server: {message}"),
+        )),
+        Ok(None) => None,
+        Err(err) => Some(warning_result(
+            "logout_revoke_failed",
+            format!("failed to revoke token on server: {err}"),
+        )),
+    }
+}
+
+fn warning_result(code: &'static str, message: String) -> WarningResult {
+    WarningResult { code, message }
 }
 
 async fn cmd_me(runtime: &RuntimeClient, format: OutputFormat) -> CliResult<()> {
@@ -1820,6 +2335,18 @@ fn truncate(value: &str, width: usize) -> String {
 mod tests {
     use super::*;
 
+    struct AlwaysFailWriter;
+
+    impl Write for AlwaysFailWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "stderr closed"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn broken_pipe_stdout_errors_are_classified_separately() {
         let error = io::Error::new(io::ErrorKind::BrokenPipe, "stdout closed");
@@ -1847,5 +2374,16 @@ mod tests {
             CliError::Public(PublicError::Unexpected(message))
                 if message.contains("failed to print to stderr: stderr closed")
         ));
+    }
+
+    #[test]
+    fn best_effort_warning_emission_ignores_stderr_failures() {
+        let warnings = [warning_result(
+            "logout_revoke_failed",
+            "failed to revoke token on server: stderr closed".to_string(),
+        )];
+
+        assert!(write_warnings(AlwaysFailWriter, OutputFormat::Json, &warnings).is_err());
+        emit_warnings_best_effort_to(AlwaysFailWriter, OutputFormat::Json, &warnings);
     }
 }

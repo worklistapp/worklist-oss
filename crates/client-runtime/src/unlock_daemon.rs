@@ -14,6 +14,7 @@ use worklist_client_auth::{config_dir, normalize_api_url};
 use worklist_client_core::{PublicError, PublicResult};
 use worklist_client_crypto::SymmetricKey;
 
+const DAEMON_EXECUTABLE_ENV: &str = "WORKLIST_UNLOCK_DAEMON_EXECUTABLE";
 const SOCKET_FILE_NAME: &str = "unlock.sock";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -447,16 +448,8 @@ fn ensure_running() -> PublicResult<()> {
 
 fn spawn_daemon() -> PublicResult<()> {
     let socket_path = socket_path()?;
-    let executable = std::env::current_exe().map_err(|err| {
-        PublicError::unexpected(format!("failed to locate current executable: {err}"))
-    })?;
-    let mut command = std::process::Command::new(executable);
-    command
-        .arg("--serve-unlock-daemon")
-        .arg(&socket_path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+    let executable = resolve_daemon_executable()?;
+    let mut command = daemon_spawn_command(&executable, &socket_path);
 
     command
         .spawn()
@@ -476,6 +469,49 @@ fn spawn_daemon() -> PublicResult<()> {
 
 fn is_daemon_unavailable(err: &PublicError) -> bool {
     matches!(err, PublicError::Unexpected(message) if message.contains("failed to connect to unlock daemon"))
+}
+
+fn daemon_spawn_command(executable: &Path, socket_path: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new(executable);
+    command
+        .current_dir(std::env::temp_dir())
+        .arg("--serve-unlock-daemon")
+        .arg(socket_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command
+}
+
+fn resolve_daemon_executable() -> PublicResult<PathBuf> {
+    if let Some(configured) = configured_daemon_executable() {
+        return Ok(configured);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let proc_self_exe = PathBuf::from("/proc/self/exe");
+        if proc_self_exe.exists() {
+            return Ok(proc_self_exe);
+        }
+    }
+
+    let current_exe = std::env::current_exe().map_err(|err| {
+        PublicError::unexpected(format!("failed to locate current executable: {err}"))
+    })?;
+    if current_exe.exists() {
+        return Ok(current_exe);
+    }
+
+    Err(PublicError::unexpected(format!(
+        "failed to locate unlock daemon executable: {} does not exist",
+        current_exe.display()
+    )))
+}
+
+fn configured_daemon_executable() -> Option<PathBuf> {
+    let path = std::env::var_os(DAEMON_EXECUTABLE_ENV).map(PathBuf::from)?;
+    path.exists().then_some(path)
 }
 
 fn build_status(session_key: Option<SessionKey>, expires_at_unix: Option<u64>) -> UnlockStatus {
@@ -498,4 +534,89 @@ fn unix_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .expect("time should be after unix epoch")
         .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct EnvVarGuard {
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn clear() -> Self {
+            let previous = std::env::var_os(DAEMON_EXECUTABLE_ENV);
+            unsafe {
+                std::env::remove_var(DAEMON_EXECUTABLE_ENV);
+            }
+            Self { previous }
+        }
+
+        fn set(path: &Path) -> Self {
+            let previous = std::env::var_os(DAEMON_EXECUTABLE_ENV);
+            unsafe {
+                std::env::set_var(DAEMON_EXECUTABLE_ENV, path);
+            }
+            Self { previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.previous.as_ref() {
+                Some(value) => unsafe {
+                    std::env::set_var(DAEMON_EXECUTABLE_ENV, value);
+                },
+                None => unsafe {
+                    std::env::remove_var(DAEMON_EXECUTABLE_ENV);
+                },
+            }
+        }
+    }
+
+    #[test]
+    fn daemon_spawn_command_uses_stable_working_directory() {
+        let command = daemon_spawn_command(
+            Path::new("/proc/self/exe"),
+            Path::new("/tmp/worklist-unlock.sock"),
+        );
+
+        let args = command.get_args().collect::<Vec<_>>();
+        assert_eq!(command.get_program(), "/proc/self/exe");
+        assert_eq!(
+            command.get_current_dir(),
+            Some(std::env::temp_dir().as_path())
+        );
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0], "--serve-unlock-daemon");
+        assert_eq!(args[1], "/tmp/worklist-unlock.sock");
+    }
+
+    #[test]
+    fn resolve_daemon_executable_prefers_configured_path() {
+        let _lock = env_lock().lock().expect("env lock");
+        let configured = tempfile::NamedTempFile::new().expect("temp executable path");
+        let _guard = EnvVarGuard::set(configured.path());
+
+        let resolved = resolve_daemon_executable().expect("configured executable");
+        assert_eq!(resolved, configured.path());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resolve_daemon_executable_falls_back_to_proc_self_exe() {
+        let _lock = env_lock().lock().expect("env lock");
+        let _guard = EnvVarGuard::clear();
+
+        let resolved = resolve_daemon_executable().expect("fallback executable");
+        assert_eq!(resolved, PathBuf::from("/proc/self/exe"));
+    }
 }

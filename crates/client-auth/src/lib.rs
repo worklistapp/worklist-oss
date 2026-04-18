@@ -413,24 +413,18 @@ pub async fn logout(
     client: &reqwest::Client,
     base_url: &str,
     refresh_token: &str,
-) -> PublicResult<()> {
-    let response = client
+) -> PublicResult<Option<String>> {
+    let status = client
         .post(format!("{}/auth/logout", base_url.trim_end_matches('/')))
         .json(&RefreshRequest {
             refresh_token: refresh_token.to_string(),
         })
         .send()
         .await
-        .map_err(|err| map_reqwest_error(err, "logout"))?;
+        .map_err(|err| map_reqwest_error(err, "logout"))?
+        .status();
 
-    if !response.status().is_success() {
-        eprintln!(
-            "warning: server logout returned status {}",
-            response.status()
-        );
-    }
-
-    Ok(())
+    Ok((!status.is_success()).then(|| format!("server logout returned status {status}")))
 }
 
 pub fn auth_response_to_credentials(api_url: &str, response: AuthResponse) -> Credentials {

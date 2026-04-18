@@ -28,3 +28,6 @@ worklist-client-api = { version = "0.1.0", path = "../client-api" }
 worklist-client-auth = { version = "0.1.0", path = "../client-auth" }
 worklist-client-core = { version = "0.1.0", path = "../client-core" }
 worklist-client-crypto = { version = "0.1.0", path = "../client-crypto" }
+
+[dev-dependencies]
+tempfile = "3.14"

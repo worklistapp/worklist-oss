@@ -44,8 +44,7 @@ async fn cli_proven_flows_round_trip_through_mock_api() {
         home.path(),
         &server.base_url,
         &[
-            "--format",
-            "json",
+            "--json",
             "lists",
             "get",
             &fixture.work_list_id.to_string(),
@@ -247,8 +246,7 @@ async fn cli_proven_flows_round_trip_through_mock_api() {
         home.path(),
         &server.base_url,
         &[
-            "--format",
-            "json",
+            "--json",
             "comments",
             "list",
             "--work-list-id",
@@ -276,8 +274,7 @@ async fn cli_proven_flows_round_trip_through_mock_api() {
         home.path(),
         &server.base_url,
         &[
-            "--format",
-            "json",
+            "--json",
             "comments",
             "delete",
             "--work-list-id",
@@ -306,8 +303,7 @@ async fn cli_proven_flows_round_trip_through_mock_api() {
         home.path(),
         &server.base_url,
         &[
-            "--format",
-            "json",
+            "--json",
             "comments",
             "list",
             "--work-list-id",
@@ -335,8 +331,7 @@ async fn cli_proven_flows_round_trip_through_mock_api() {
         home.path(),
         &server.base_url,
         &[
-            "--format",
-            "json",
+            "--json",
             "tasks",
             "delete",
             "--work-list-id",
@@ -460,7 +455,7 @@ async fn cli_task_reads_parse_current_api_shapes() {
     let lists_output = run_cli(
         home.path(),
         &server.base_url,
-        &["--format", "json", "lists", "--password-stdin"],
+        &["--json", "lists", "--password-stdin"],
         Some(&fixture.password),
     );
     assert!(
@@ -476,8 +471,7 @@ async fn cli_task_reads_parse_current_api_shapes() {
         home.path(),
         &server.base_url,
         &[
-            "--format",
-            "json",
+            "--json",
             "lists",
             "get",
             &fixture.work_list_id.to_string(),
@@ -497,14 +491,7 @@ async fn cli_task_reads_parse_current_api_shapes() {
     let my_tasks_output = run_cli(
         home.path(),
         &server.base_url,
-        &[
-            "--format",
-            "json",
-            "tasks",
-            "list",
-            "--all",
-            "--password-stdin",
-        ],
+        &["--json", "tasks", "list", "--all", "--password-stdin"],
         Some(&fixture.password),
     );
     assert!(
@@ -524,8 +511,7 @@ async fn cli_task_reads_parse_current_api_shapes() {
         home.path(),
         &server.base_url,
         &[
-            "--format",
-            "json",
+            "--json",
             "tasks",
             "list",
             "--work-list-id",
@@ -547,8 +533,7 @@ async fn cli_task_reads_parse_current_api_shapes() {
         home.path(),
         &server.base_url,
         &[
-            "--format",
-            "json",
+            "--json",
             "tasks",
             "get",
             "--work-list-id",
@@ -606,8 +591,7 @@ async fn cli_persists_rotated_refresh_tokens_after_automatic_refresh() {
         home.path(),
         &server.base_url,
         &[
-            "--format",
-            "json",
+            "--json",
             "tasks",
             "get",
             "--work-list-id",
@@ -640,8 +624,7 @@ async fn cli_persists_rotated_refresh_tokens_after_automatic_refresh() {
         home.path(),
         &server.base_url,
         &[
-            "--format",
-            "json",
+            "--json",
             "tasks",
             "get",
             "--work-list-id",
@@ -680,8 +663,7 @@ async fn cli_inspect_returns_decrypted_work_list_detail() {
         home.path(),
         &server.base_url,
         &[
-            "--format",
-            "json",
+            "--json",
             "inspect",
             &fixture.work_list_id.to_string(),
             "--password-stdin",
@@ -718,7 +700,7 @@ async fn cli_reads_surface_partial_decryption_errors() {
     let lists_output = run_cli(
         home.path(),
         &server.base_url,
-        &["--format", "json", "lists", "--password-stdin"],
+        &["--json", "lists", "--password-stdin"],
         Some(&fixture.password),
     );
     assert!(
@@ -733,14 +715,7 @@ async fn cli_reads_surface_partial_decryption_errors() {
     let tasks_output = run_cli(
         home.path(),
         &server.base_url,
-        &[
-            "--format",
-            "json",
-            "tasks",
-            "list",
-            "--all",
-            "--password-stdin",
-        ],
+        &["--json", "tasks", "list", "--all", "--password-stdin"],
         Some(&fixture.password),
     );
     assert!(
@@ -768,14 +743,7 @@ async fn cli_tasks_do_not_inherit_work_list_payload_errors_when_task_decrypts() 
     let tasks_output = run_cli(
         home.path(),
         &server.base_url,
-        &[
-            "--format",
-            "json",
-            "tasks",
-            "list",
-            "--all",
-            "--password-stdin",
-        ],
+        &["--json", "tasks", "list", "--all", "--password-stdin"],
         Some(&fixture.password),
     );
     assert!(
@@ -805,8 +773,7 @@ async fn cli_reads_surface_attachment_projection_errors() {
         home.path(),
         &server.base_url,
         &[
-            "--format",
-            "json",
+            "--json",
             "tasks",
             "get",
             "--work-list-id",
@@ -975,8 +942,7 @@ async fn cli_reads_markdown_text_attachment_as_json() {
         home.path(),
         &server.base_url,
         &[
-            "--format",
-            "json",
+            "--json",
             "tasks",
             "attachments",
             "read",
@@ -1052,8 +1018,7 @@ async fn cli_reads_docx_attachment_as_json() {
         home.path(),
         &server.base_url,
         &[
-            "--format",
-            "json",
+            "--json",
             "tasks",
             "attachments",
             "read",
@@ -1205,8 +1170,7 @@ async fn cli_download_respects_output_path_and_force() {
         download_dir.path(),
         &server.base_url,
         &[
-            "--format",
-            "json",
+            "--json",
             "tasks",
             "attachments",
             "download",
@@ -1373,8 +1337,7 @@ async fn cli_unlock_daemon_enables_later_decrypt_without_password_flag() {
         home.path(),
         &server.base_url,
         &[
-            "--format",
-            "json",
+            "--json",
             "tasks",
             "get",
             "--work-list-id",
@@ -1413,7 +1376,7 @@ async fn cli_keychain_store_bootstraps_later_decrypt_without_password_flag() {
         home.path(),
         &server.base_url,
         keychain_dir.path(),
-        &["auth", "keychain", "store", "--password-stdin"],
+        &["--json", "auth", "keychain", "store", "--password-stdin"],
         Some(&fixture.password),
     );
     assert!(
@@ -1421,12 +1384,14 @@ async fn cli_keychain_store_bootstraps_later_decrypt_without_password_flag() {
         "keychain store failed: {}",
         store_output.stderr
     );
+    let store_json: Value = parse_stdout_json(&store_output.stdout);
+    assert_eq!(store_json["persistedBootstrap"]["status"], "available");
 
     let initial_status = run_cli_with_test_keychain(
         home.path(),
         &server.base_url,
         keychain_dir.path(),
-        &["auth", "status"],
+        &["--json", "auth", "status"],
         None,
     );
     assert!(
@@ -1434,11 +1399,12 @@ async fn cli_keychain_store_bootstraps_later_decrypt_without_password_flag() {
         "status failed: {}",
         initial_status.stderr
     );
-    assert!(initial_status.stdout.contains("Unlock daemon: inactive"));
-    assert!(
-        initial_status
-            .stdout
-            .contains("Persisted bootstrap: available")
+    let initial_status_json: Value = parse_stdout_json(&initial_status.stdout);
+    assert_eq!(initial_status_json["loggedIn"], true);
+    assert_eq!(initial_status_json["unlockDaemon"]["active"], false);
+    assert_eq!(
+        initial_status_json["persistedBootstrap"]["status"],
+        "available"
     );
 
     let task_output = run_cli_with_test_keychain(
@@ -1446,8 +1412,7 @@ async fn cli_keychain_store_bootstraps_later_decrypt_without_password_flag() {
         &server.base_url,
         keychain_dir.path(),
         &[
-            "--format",
-            "json",
+            "--json",
             "tasks",
             "get",
             "--work-list-id",
@@ -1469,7 +1434,7 @@ async fn cli_keychain_store_bootstraps_later_decrypt_without_password_flag() {
         home.path(),
         &server.base_url,
         keychain_dir.path(),
-        &["auth", "status"],
+        &["--json", "auth", "status"],
         None,
     );
     assert!(
@@ -1477,11 +1442,11 @@ async fn cli_keychain_store_bootstraps_later_decrypt_without_password_flag() {
         "status after bootstrap failed: {}",
         seeded_status.stderr
     );
-    assert!(seeded_status.stdout.contains("Unlock daemon: active"));
-    assert!(
-        seeded_status
-            .stdout
-            .contains("Persisted bootstrap: available")
+    let seeded_status_json: Value = parse_stdout_json(&seeded_status.stdout);
+    assert_eq!(seeded_status_json["unlockDaemon"]["active"], true);
+    assert_eq!(
+        seeded_status_json["persistedBootstrap"]["status"],
+        "available"
     );
 
     let _ = run_cli(home.path(), &server.base_url, &["auth", "lock"], None);
@@ -1498,7 +1463,14 @@ async fn cli_logout_locks_daemon() {
     let unlock_output = run_cli(
         home.path(),
         &server.base_url,
-        &["auth", "unlock", "--ttl-seconds", "300", "--password-stdin"],
+        &[
+            "--json",
+            "auth",
+            "unlock",
+            "--ttl-seconds",
+            "300",
+            "--password-stdin",
+        ],
         Some(&fixture.password),
     );
     assert!(
@@ -1506,21 +1478,38 @@ async fn cli_logout_locks_daemon() {
         "unlock failed: {}",
         unlock_output.stderr
     );
+    let unlock_json: Value = parse_stdout_json(&unlock_output.stdout);
+    assert_eq!(unlock_json["unlocked"], true);
+    assert_eq!(unlock_json["ttlSeconds"], 300);
 
-    let logout_output = run_cli(home.path(), &server.base_url, &["auth", "logout"], None);
+    let logout_output = run_cli(
+        home.path(),
+        &server.base_url,
+        &["--json", "auth", "logout"],
+        None,
+    );
     assert!(
         logout_output.status.success(),
         "logout failed: {}",
         logout_output.stderr
     );
+    let logout_json: Value = parse_stdout_json(&logout_output.stdout);
+    assert_eq!(logout_json["loggedOut"], true);
 
-    let status_output = run_cli(home.path(), &server.base_url, &["auth", "status"], None);
+    let status_output = run_cli(
+        home.path(),
+        &server.base_url,
+        &["--json", "auth", "status"],
+        None,
+    );
     assert!(
         status_output.status.success(),
         "status failed: {}",
         status_output.stderr
     );
-    assert!(status_output.stdout.contains("Unlock daemon: inactive"));
+    let status_json: Value = parse_stdout_json(&status_output.stdout);
+    assert_eq!(status_json["loggedIn"], false);
+    assert_eq!(status_json["unlockDaemon"]["active"], false);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1564,8 +1553,7 @@ async fn cli_logout_clears_persisted_bootstrap() {
         &server.base_url,
         keychain_dir.path(),
         &[
-            "--format",
-            "json",
+            "--json",
             "tasks",
             "get",
             "--work-list-id",
@@ -1583,6 +1571,72 @@ async fn cli_logout_clears_persisted_bootstrap() {
         task_output
             .stderr
             .contains("No unlocked local session or persisted bootstrap secret is available")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_json_logout_revoke_warning_is_machine_readable() {
+    let fixture = TestFixture::new();
+    let state = Arc::new(Mutex::new(TestState::new(fixture.clone())));
+    state.lock().expect("state lock").logout_status = StatusCode::BAD_GATEWAY;
+    let server = spawn_server(state).await;
+    let home = TempDir::new().expect("temp home");
+    seed_credentials(home.path(), &fixture, &server.base_url);
+
+    let output = run_cli(
+        home.path(),
+        &server.base_url,
+        &["--json", "auth", "logout"],
+        None,
+    );
+    assert!(output.status.success(), "logout failed: {}", output.stderr);
+
+    let stdout_json = parse_stdout_json(&output.stdout);
+    assert_eq!(stdout_json["loggedOut"], true);
+
+    assert_json_warning_contains(&output.stderr, "logout_revoke_failed", "502 Bad Gateway");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_json_logout_keychain_clear_warning_is_machine_readable() {
+    let fixture = TestFixture::new();
+    let state = Arc::new(Mutex::new(TestState::new(fixture.clone())));
+    let server = spawn_server(state).await;
+    let home = TempDir::new().expect("temp home");
+    let keychain_dir = TempDir::new().expect("temp keychain");
+    seed_credentials(home.path(), &fixture, &server.base_url);
+
+    let store_output = run_cli_with_test_keychain(
+        home.path(),
+        &server.base_url,
+        keychain_dir.path(),
+        &["auth", "keychain", "store", "--password-stdin"],
+        Some(&fixture.password),
+    );
+    assert!(
+        store_output.status.success(),
+        "keychain store failed: {}",
+        store_output.stderr
+    );
+
+    replace_stored_test_keychain_secret_with_directory(keychain_dir.path());
+
+    let output = run_cli_with_test_keychain(
+        home.path(),
+        &server.base_url,
+        keychain_dir.path(),
+        &["--json", "auth", "logout"],
+        None,
+    );
+    assert!(output.status.success(), "logout failed: {}", output.stderr);
+
+    let stdout_json = parse_stdout_json(&output.stdout);
+    assert_eq!(stdout_json["loggedOut"], true);
+
+    assert_json_warning_contains(
+        &output.stderr,
+        "logout_persisted_bootstrap_clear_failed",
+        "failed to clear platform keychain entry",
     );
 }
 
@@ -1631,7 +1685,14 @@ async fn cli_status_reports_stored_session_daemon_state_when_api_url_differs() {
     let unlock_output = run_cli(
         home.path(),
         &server.base_url,
-        &["auth", "unlock", "--ttl-seconds", "300", "--password-stdin"],
+        &[
+            "--json",
+            "auth",
+            "unlock",
+            "--ttl-seconds",
+            "300",
+            "--password-stdin",
+        ],
         Some(&fixture.password),
     );
     assert!(
@@ -1639,11 +1700,13 @@ async fn cli_status_reports_stored_session_daemon_state_when_api_url_differs() {
         "unlock failed: {}",
         unlock_output.stderr
     );
+    let unlock_json: Value = parse_stdout_json(&unlock_output.stdout);
+    assert_eq!(unlock_json["unlocked"], true);
 
     let status_output = run_cli(
         home.path(),
         "https://worklist.app",
-        &["auth", "status"],
+        &["--json", "auth", "status"],
         None,
     );
     assert!(
@@ -1651,15 +1714,102 @@ async fn cli_status_reports_stored_session_daemon_state_when_api_url_differs() {
         "status failed: {}",
         status_output.stderr
     );
-    assert!(status_output.stdout.contains("Stored:"));
-    assert!(
-        status_output
-            .stdout
-            .contains("Current: https://worklist.app")
+    let status_json: Value = parse_stdout_json(&status_output.stdout);
+    assert_eq!(status_json["unlockDaemon"]["active"], true);
+    assert_eq!(
+        status_json["apiUrlMismatch"]["currentApiUrl"],
+        "https://worklist.app"
     );
-    assert!(status_output.stdout.contains("Unlock daemon: active"));
+    assert_eq!(
+        status_json["apiUrlMismatch"]["storedApiUrl"],
+        server.base_url
+    );
 
     let _ = run_cli(home.path(), &server.base_url, &["auth", "lock"], None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_json_login_requires_email_non_interactively() {
+    let home = TempDir::new().expect("temp home");
+
+    let output = run_cli(
+        home.path(),
+        "https://worklist.app",
+        &["--json", "auth", "login"],
+        None,
+    );
+    assert!(!output.status.success(), "login unexpectedly succeeded");
+    assert!(
+        output.stdout.is_empty(),
+        "unexpected stdout: {}",
+        output.stdout
+    );
+
+    assert_json_error_message(&output.stderr, "--json auth login requires --email");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_json_login_requires_password_stdin_non_interactively() {
+    let home = TempDir::new().expect("temp home");
+
+    let output = run_cli(
+        home.path(),
+        "https://worklist.app",
+        &["--json", "auth", "login", "--email", "agent@example.com"],
+        None,
+    );
+    assert!(!output.status.success(), "login unexpectedly succeeded");
+    assert!(
+        output.stdout.is_empty(),
+        "unexpected stdout: {}",
+        output.stdout
+    );
+
+    assert_json_error_message(
+        &output.stderr,
+        "--json auth login requires --password-stdin",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_json_unknown_argument_errors_are_machine_readable() {
+    let home = TempDir::new().expect("temp home");
+
+    let output = run_cli(
+        home.path(),
+        "https://worklist.app",
+        &["--json", "--bogus"],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        output.stdout.is_empty(),
+        "unexpected stdout: {}",
+        output.stdout
+    );
+
+    assert_json_error_contains(&output.stderr, "--bogus");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_json_invalid_value_errors_are_machine_readable() {
+    let home = TempDir::new().expect("temp home");
+
+    let output = run_cli(
+        home.path(),
+        "https://worklist.app",
+        &["--json", "auth", "unlock", "--ttl-seconds", "nope"],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        output.stdout.is_empty(),
+        "unexpected stdout: {}",
+        output.stdout
+    );
+
+    assert_json_error_contains(&output.stderr, "--ttl-seconds");
+    assert_json_error_contains(&output.stderr, "nope");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1674,8 +1824,7 @@ async fn cli_decrypted_commands_fail_non_interactively_without_unlock_or_keychai
         home.path(),
         &server.base_url,
         &[
-            "--format",
-            "json",
+            "--json",
             "tasks",
             "get",
             "--work-list-id",
@@ -1693,6 +1842,10 @@ async fn cli_decrypted_commands_fail_non_interactively_without_unlock_or_keychai
         task_output
             .stderr
             .contains("No unlocked local session or persisted bootstrap secret is available")
+    );
+    assert_json_error_contains(
+        &task_output.stderr,
+        "No unlocked local session or persisted bootstrap secret is available",
     );
 }
 
@@ -1743,6 +1896,7 @@ struct TestState {
     fixture: TestFixture,
     current_access_token: String,
     current_refresh_token: String,
+    logout_status: StatusCode,
     refresh_request_count: usize,
     created_task_body: Option<TaskPayloadBody>,
     updated_task_body: Option<TaskPayloadBody>,
@@ -1771,6 +1925,7 @@ impl TestState {
         Self {
             current_access_token: fixture.access_token.clone(),
             current_refresh_token: fixture.refresh_token.clone(),
+            logout_status: StatusCode::OK,
             refresh_request_count: 0,
             fixture,
             created_task_body: None,
@@ -2005,6 +2160,7 @@ struct IncludeArchivedQuery {
 async fn spawn_server(state: Arc<Mutex<TestState>>) -> TestServer {
     let app = Router::new()
         .route("/auth/refresh", post(refresh_session))
+        .route("/auth/logout", post(logout_session))
         .route("/work-lists", get(list_work_lists))
         .route("/work-lists/{id}", get(get_work_list))
         .route("/work-lists/{id}/tasks", get(list_tasks).post(create_task))
@@ -2077,6 +2233,21 @@ async fn refresh_session(
             "expiresIn": 3600,
             "refreshExpiresIn": 3600,
             "tokenType": "Bearer"
+        })),
+    )
+}
+
+async fn logout_session(
+    State(state): State<Arc<Mutex<TestState>>>,
+    Json(payload): Json<RefreshRequestBody>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let state = state.lock().expect("state lock");
+    assert_eq!(payload.refresh_token, state.current_refresh_token);
+
+    (
+        state.logout_status,
+        Json(json!({
+            "loggedOut": state.logout_status.is_success()
         })),
     )
 }
@@ -3117,6 +3288,50 @@ fn attachment_payload_value(attachment: &TestAttachmentFixture) -> FlexibleValue
 
 fn parse_stdout_json(stdout: &str) -> Value {
     serde_json::from_str(stdout).expect("stdout JSON")
+}
+
+fn parse_stderr_json(stderr: &str) -> Value {
+    serde_json::from_str(stderr).expect("stderr JSON")
+}
+
+fn assert_json_error_message(stderr: &str, expected_message: &str) {
+    let error_json = parse_stderr_json(stderr);
+    assert_eq!(error_json["error"]["code"], "validation");
+    assert_eq!(error_json["error"]["message"], expected_message);
+}
+
+fn assert_json_error_contains(stderr: &str, expected_fragment: &str) {
+    let error_json = parse_stderr_json(stderr);
+    assert_eq!(error_json["error"]["code"], "validation");
+    assert!(
+        error_json["error"]["message"]
+            .as_str()
+            .expect("error message")
+            .contains(expected_fragment),
+        "unexpected stderr: {stderr}"
+    );
+}
+
+fn assert_json_warning_contains(stderr: &str, expected_code: &str, expected_fragment: &str) {
+    let stderr_json = parse_stderr_json(stderr);
+    assert_eq!(stderr_json["warnings"][0]["code"], expected_code);
+    assert!(
+        stderr_json["warnings"][0]["message"]
+            .as_str()
+            .expect("warning message")
+            .contains(expected_fragment),
+        "unexpected stderr: {stderr}"
+    );
+}
+
+fn replace_stored_test_keychain_secret_with_directory(keychain_dir: &FsPath) {
+    let secret_path = std::fs::read_dir(keychain_dir)
+        .expect("list keychain dir")
+        .map(|entry| entry.expect("dir entry").path())
+        .next()
+        .expect("stored secret path");
+    std::fs::remove_file(&secret_path).expect("remove stored secret");
+    std::fs::create_dir(&secret_path).expect("replace stored secret with directory");
 }
 
 struct CliOutput {
