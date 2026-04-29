@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use worklist_client_auth::{
-    Credentials, refresh_access_token, save_credentials, update_credentials_with_refresh,
+    AgentEnrollmentStatusResponse, AgentTokenResponse, PrincipalCredentials,
+    mint_agent_access_token, refresh_access_token, save_agent_credentials, save_credentials,
+    update_credentials_with_refresh,
 };
 use worklist_client_core::{PublicError, PublicResult};
 
@@ -15,7 +17,7 @@ pub type SealedBlob = String;
 pub struct PublicApiClient {
     client: reqwest::Client,
     base_url: String,
-    credentials: Option<Credentials>,
+    credentials: Option<PrincipalCredentials>,
 }
 
 impl PublicApiClient {
@@ -27,7 +29,10 @@ impl PublicApiClient {
         }
     }
 
-    pub fn with_credentials(base_url: impl Into<String>, credentials: Credentials) -> Self {
+    pub fn with_credentials(
+        base_url: impl Into<String>,
+        credentials: PrincipalCredentials,
+    ) -> Self {
         Self {
             client: reqwest::Client::new(),
             base_url: normalize_base_url(base_url.into()),
@@ -49,21 +54,44 @@ impl PublicApiClient {
             .as_mut()
             .ok_or_else(|| PublicError::validation("not logged in"))?;
 
-        if credentials.access_expires_within(60) {
-            if credentials.is_refresh_expired() {
-                return Err(PublicError::validation(
-                    "session expired, please login again",
-                ));
-            }
+        match credentials {
+            PrincipalCredentials::User(credentials) => {
+                if credentials.access_expires_within(60) {
+                    if credentials.is_refresh_expired() {
+                        return Err(PublicError::validation(
+                            "session expired, please login again",
+                        ));
+                    }
 
-            let refresh_response =
-                refresh_access_token(&self.client, &self.base_url, &credentials.refresh_token)
+                    let refresh_response = refresh_access_token(
+                        &self.client,
+                        &self.base_url,
+                        &credentials.refresh_token,
+                    )
                     .await?;
-            update_credentials_with_refresh(credentials, refresh_response);
-            save_credentials(credentials)?;
-        }
+                    update_credentials_with_refresh(credentials, refresh_response);
+                    save_credentials(credentials)?;
+                }
 
-        Ok(credentials.access_token.clone())
+                Ok(credentials.access_token.clone())
+            }
+            PrincipalCredentials::Agent(credentials) => {
+                if credentials.access_expires_within(60) {
+                    let response: AgentTokenResponse =
+                        mint_agent_access_token(&self.client, credentials).await?;
+                    credentials.access_token = Some(response.access_token);
+                    credentials.access_expires_at =
+                        Some(Utc::now() + chrono::Duration::seconds(response.expires_in as i64));
+                    credentials.owner_user_id = Some(response.owner_user_id);
+                    save_agent_credentials(credentials)?;
+                }
+
+                credentials
+                    .access_token
+                    .clone()
+                    .ok_or_else(|| PublicError::validation("agent access token missing"))
+            }
+        }
     }
 
     async fn get<T: for<'de> Deserialize<'de>>(&mut self, path: &str) -> PublicResult<T> {
@@ -120,6 +148,30 @@ impl PublicApiClient {
 
     pub async fn get_dashboard_stats(&mut self) -> PublicResult<DashboardStatsResponse> {
         self.get("/me/dashboard-stats").await
+    }
+
+    pub async fn get_agent_enrollment(
+        &mut self,
+        code: &str,
+    ) -> PublicResult<AgentEnrollmentStatusResponse> {
+        self.get(&format!("/agents/enrollments/{code}")).await
+    }
+
+    pub async fn list_agents(&mut self) -> PublicResult<Vec<AgentSummaryResponse>> {
+        self.get("/agents").await
+    }
+
+    pub async fn approve_agent_enrollment(
+        &mut self,
+        code: &str,
+        payload: &ApproveAgentEnrollmentRequest,
+    ) -> PublicResult<AgentSummaryResponse> {
+        self.post(&format!("/agents/enrollments/{code}/approve"), payload)
+            .await
+    }
+
+    pub async fn revoke_agent(&mut self, agent_id: Uuid) -> PublicResult<AgentSummaryResponse> {
+        self.post_empty(&format!("/agents/{agent_id}/revoke")).await
     }
 
     pub async fn get_task(
@@ -296,6 +348,11 @@ impl PublicApiClient {
             .await
     }
 
+    async fn post_empty<T: for<'de> Deserialize<'de>>(&mut self, path: &str) -> PublicResult<T> {
+        let url = format!("{}{}", self.base_url, path);
+        self.send(self.client.post(url), path).await
+    }
+
     async fn send<T: for<'de> Deserialize<'de>>(
         &mut self,
         request: reqwest::RequestBuilder,
@@ -406,6 +463,48 @@ pub struct MembershipResponse {
     pub expires_at: Option<DateTime<Utc>>,
     pub joined_at: DateTime<Utc>,
     pub payload_binding_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApproveAgentGrantRequest {
+    pub work_list_id: Uuid,
+    pub key_ciphertext: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApproveAgentEnrollmentRequest {
+    pub handle: String,
+    pub display_name: String,
+    pub scope_mode: String,
+    pub fingerprint: String,
+    pub grants: Vec<ApproveAgentGrantRequest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentGrantResponse {
+    pub work_list_id: Uuid,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSummaryResponse {
+    pub agent_id: Uuid,
+    pub owner_user_id: Option<Uuid>,
+    pub status: String,
+    pub approved: bool,
+    pub handle: Option<String>,
+    pub proposed_handle: Option<String>,
+    pub display_name: Option<String>,
+    pub scope_mode: String,
+    pub fingerprint: String,
+    pub activated_at: Option<DateTime<Utc>>,
+    pub revoked_at: Option<DateTime<Utc>>,
+    pub last_seen_at: Option<DateTime<Utc>>,
+    pub grants: Vec<AgentGrantResponse>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -7,18 +7,23 @@ use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::json;
 use uuid::Uuid;
 use worklist_client_api::{
-    CurrentUserResponse, DashboardStatsResponse, DeleteCommentRequest, DeleteTaskRequest,
+    AgentSummaryResponse, ApproveAgentEnrollmentRequest, CurrentUserResponse,
+    DashboardStatsResponse, DeleteCommentRequest, DeleteTaskRequest, PublicApiClient,
     TaskDetailResponse, TaskResponse, WorkListDetailResponse, WorkListResponse,
 };
 use worklist_client_auth::{
-    Credentials, PersistedDataKeyStatus, UnlockMode, auth_response_to_credentials,
-    clear_credentials, credentials_path, load_credentials, load_credentials_for_url, login, logout,
-    normalize_api_url, persisted_data_key_status, save_credentials,
+    AgentCredentials, Credentials, PersistedDataKeyStatus, PrincipalCredentials,
+    PrincipalSelection, UnlockMode, agent_credentials_path, auth_response_to_credentials,
+    clear_agent_credentials, clear_agent_seed, clear_credentials, credentials_path,
+    fetch_agent_enrollment, generate_agent_key_material, load_agent_credentials, load_credentials,
+    load_credentials_for_url, load_principal_credentials_for_url, login, logout, normalize_api_url,
+    persisted_data_key_status, register_agent, save_agent_credentials, save_agent_seed,
+    save_credentials,
 };
 use worklist_client_core::{PublicError, PublicResult};
 use worklist_client_crypto::CryptoCapability;
@@ -207,6 +212,9 @@ struct Cli {
     #[arg(long, global = true)]
     json: bool,
 
+    #[arg(long, value_enum, global = true)]
+    principal: Option<PrincipalArg>,
+
     #[arg(long, hide = true)]
     serve_unlock_daemon: Option<PathBuf>,
 
@@ -218,6 +226,21 @@ struct Cli {
 enum OutputFormat {
     Table,
     Json,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum PrincipalArg {
+    User,
+    Agent,
+}
+
+impl From<PrincipalArg> for PrincipalSelection {
+    fn from(value: PrincipalArg) -> Self {
+        match value {
+            PrincipalArg::User => PrincipalSelection::User,
+            PrincipalArg::Agent => PrincipalSelection::Agent,
+        }
+    }
 }
 
 impl OutputFormat {
@@ -259,6 +282,17 @@ struct LoginResult {
     logged_in: bool,
     already_logged_in: bool,
     email: String,
+    api_url: String,
+    credentials_path: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentRegisterResult {
+    registered: bool,
+    agent_id: Uuid,
+    enrollment_code: Option<String>,
+    fingerprint: String,
     api_url: String,
     credentials_path: String,
 }
@@ -314,15 +348,28 @@ struct ApiUrlMismatch {
 #[serde(rename_all = "camelCase")]
 struct LoggedInStatusResult {
     logged_in: bool,
-    email: String,
+    principal_type: &'static str,
     api_url: String,
-    user_id: Uuid,
-    access_token_expires_at: String,
-    refresh_token_expires_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owner_user_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    handle: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    access_token_expires_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refresh_token_expires_at: Option<String>,
     #[serde(skip_serializing)]
-    access_token_expires_display: String,
+    access_token_expires_display: Option<String>,
     #[serde(skip_serializing)]
-    refresh_token_expires_display: String,
+    refresh_token_expires_display: Option<String>,
     session_state: &'static str,
     api_url_mismatch: Option<ApiUrlMismatch>,
     unlock_daemon: UnlockDaemonStatusResult,
@@ -339,7 +386,7 @@ struct LoggedOutStatusResult {
 }
 
 enum AuthStatusResult {
-    LoggedIn(LoggedInStatusResult),
+    LoggedIn(Box<LoggedInStatusResult>),
     LoggedOut(LoggedOutStatusResult),
 }
 
@@ -349,6 +396,10 @@ enum Command {
     Auth {
         #[command(subcommand)]
         command: AuthCommand,
+    },
+    Agent {
+        #[command(subcommand)]
+        command: AgentCommand,
     },
     Me,
     Lists {
@@ -375,6 +426,27 @@ enum Command {
     Comments {
         #[command(subcommand)]
         command: CommentsCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum AgentCommand {
+    Register {
+        #[arg(long)]
+        proposed_handle: Option<String>,
+    },
+    Approve {
+        code: String,
+        #[arg(long)]
+        handle: String,
+        #[arg(long)]
+        display_name: String,
+        #[arg(long)]
+        password_stdin: bool,
+    },
+    List,
+    Revoke {
+        selector: String,
     },
 }
 
@@ -685,7 +757,8 @@ async fn run(cli: Cli, format: OutputFormat) -> CliResult<()> {
         return serve(socket_path).await.map_err(Into::into);
     }
 
-    let runtime = RuntimeClient::new(&cli.api_url);
+    let principal_selection = cli.principal.map(Into::into).unwrap_or_default();
+    let runtime = RuntimeClient::with_principal_selection(&cli.api_url, principal_selection);
     let Some(command) = cli.command else {
         return Err(PublicError::validation("a command is required").into());
     };
@@ -703,8 +776,33 @@ async fn run(cli: Cli, format: OutputFormat) -> CliResult<()> {
             } => cmd_unlock(format, &runtime, ttl_seconds, password_stdin),
             AuthCommand::Lock => cmd_lock(format),
             AuthCommand::Keychain { command } => cmd_keychain(format, &runtime, command),
-            AuthCommand::Logout => cmd_logout(format, &runtime).await,
-            AuthCommand::Status => cmd_status(format, runtime.api_url()),
+            AuthCommand::Logout => cmd_logout(format, &runtime, principal_selection).await,
+            AuthCommand::Status => cmd_status(format, runtime.api_url(), principal_selection),
+        },
+        Command::Agent { command } => match command {
+            AgentCommand::Register { proposed_handle } => {
+                cmd_agent_register(format, runtime.api_url(), proposed_handle).await
+            }
+            AgentCommand::Approve {
+                code,
+                handle,
+                display_name,
+                password_stdin,
+            } => {
+                cmd_agent_approve(
+                    format,
+                    &runtime,
+                    &code,
+                    handle,
+                    display_name,
+                    password_stdin,
+                )
+                .await
+            }
+            AgentCommand::List => cmd_agent_list(format, &runtime).await,
+            AgentCommand::Revoke { selector } => {
+                cmd_agent_revoke(format, &runtime, &selector).await
+            }
         },
         Command::Me => cmd_me(&runtime, format).await,
         Command::Lists {
@@ -835,13 +933,6 @@ fn require_password_stdin_for_json_command(
     Ok(())
 }
 
-fn public_result_with_warnings<T>(
-    result: PublicResult<T>,
-    warnings: &[WarningResult],
-) -> CliResult<T> {
-    result.map_err(|err| CliError::with_warnings(err, warnings))
-}
-
 fn cmd_info(runtime: &RuntimeClient) -> CliResult<()> {
     let payload = json!({
         "apiBaseUrl": runtime.api_url(),
@@ -961,8 +1052,14 @@ fn cmd_keychain(
     )
 }
 
-async fn cmd_logout(format: OutputFormat, runtime: &RuntimeClient) -> CliResult<()> {
-    let Some(credentials) = load_credentials_for_url(runtime.api_url())? else {
+async fn cmd_logout(
+    format: OutputFormat,
+    runtime: &RuntimeClient,
+    principal_selection: PrincipalSelection,
+) -> CliResult<()> {
+    let principal_credentials =
+        load_principal_credentials_for_url(runtime.api_url(), principal_selection)?;
+    let Some(principal_credentials) = principal_credentials else {
         return print_simple_result(
             format,
             &LogoutResult {
@@ -975,25 +1072,50 @@ async fn cmd_logout(format: OutputFormat, runtime: &RuntimeClient) -> CliResult<
         );
     };
 
-    let client = reqwest::Client::new();
     let mut warnings = Vec::new();
+    let mut cleanup_error = None;
 
-    if let Some(warning) =
-        logout_revoke_warning(logout(&client, runtime.api_url(), &credentials.refresh_token).await)
-    {
-        warnings.push(warning);
+    match principal_credentials {
+        PrincipalCredentials::User(credentials) => {
+            let client = reqwest::Client::new();
+            if let Some(warning) = logout_revoke_warning(
+                logout(&client, runtime.api_url(), &credentials.refresh_token).await,
+            ) {
+                warnings.push(warning);
+            }
+
+            if let Err(err) = runtime.clear_persisted_data_key() {
+                warnings.push(warning_result(
+                    "logout_persisted_bootstrap_clear_failed",
+                    format!("failed to clear platform keychain entry: {err}"),
+                ));
+            }
+
+            record_logout_cleanup_result(clear_credentials(), &mut cleanup_error);
+
+            match runtime.current_session_key(&credentials) {
+                Ok(session_key) => {
+                    record_logout_cleanup_result(clear_session(&session_key), &mut cleanup_error);
+                }
+                Err(err) => record_logout_cleanup_result(Err(err), &mut cleanup_error),
+            }
+        }
+        PrincipalCredentials::Agent(credentials) => {
+            if let Err(err) = clear_agent_seed(&credentials) {
+                warnings.push(warning_result(
+                    "logout_agent_seed_clear_failed",
+                    format!("failed to clear local agent seed: {err}"),
+                ));
+            }
+
+            record_logout_cleanup_result(clear_agent_credentials(), &mut cleanup_error);
+        }
     }
 
-    if let Err(err) = runtime.clear_persisted_data_key() {
-        warnings.push(warning_result(
-            "logout_persisted_bootstrap_clear_failed",
-            format!("failed to clear platform keychain entry: {err}"),
-        ));
+    if let Some(err) = cleanup_error {
+        return Err(CliError::with_warnings(err, &warnings));
     }
-    public_result_with_warnings(clear_credentials(), &warnings)?;
-    let session_key =
-        public_result_with_warnings(runtime.current_session_key(&credentials), &warnings)?;
-    public_result_with_warnings(clear_session(&session_key), &warnings)?;
+
     emit_warnings_best_effort(format, &warnings);
     print_simple_result(
         format,
@@ -1008,8 +1130,12 @@ async fn cmd_logout(format: OutputFormat, runtime: &RuntimeClient) -> CliResult<
     Ok(())
 }
 
-fn cmd_status(format: OutputFormat, api_url: &str) -> CliResult<()> {
-    match load_auth_status(api_url)? {
+fn cmd_status(
+    format: OutputFormat,
+    api_url: &str,
+    principal_selection: PrincipalSelection,
+) -> CliResult<()> {
+    match load_auth_status(api_url, principal_selection)? {
         AuthStatusResult::LoggedIn(status) => match format {
             OutputFormat::Json => {
                 print_pretty_json(&status, "serializing auth status should succeed")
@@ -1088,17 +1214,232 @@ fn print_login_result(format: OutputFormat, result: &LoginResult, api_url: &str)
     }
 }
 
+async fn cmd_agent_register(
+    format: OutputFormat,
+    api_url: &str,
+    proposed_handle: Option<String>,
+) -> CliResult<()> {
+    let current_api_url = normalize_api_url(api_url);
+    ensure_agent_registration_slot_available(&current_api_url)?;
+
+    let key_material = generate_agent_key_material()?;
+    let client = reqwest::Client::new();
+    let enrollment = register_agent(&client, api_url, &key_material, proposed_handle).await?;
+    let credentials = AgentCredentials {
+        api_url: current_api_url,
+        agent_id: enrollment.agent_id,
+        owner_user_id: enrollment.owner_user_id,
+        handle: enrollment
+            .handle
+            .clone()
+            .or_else(|| enrollment.proposed_handle.clone()),
+        display_name: enrollment.display_name.clone(),
+        access_token: None,
+        access_expires_at: None,
+    };
+    save_agent_credentials(&credentials)?;
+    if let Err(err) = save_agent_seed(&credentials, &key_material.seed) {
+        let _ = clear_agent_credentials();
+        return Err(err.into());
+    }
+
+    let result = AgentRegisterResult {
+        registered: true,
+        agent_id: enrollment.agent_id,
+        enrollment_code: enrollment.enrollment_code.clone(),
+        fingerprint: enrollment.fingerprint,
+        api_url: credentials.api_url,
+        credentials_path: agent_credentials_path()?.display().to_string(),
+    };
+
+    match format {
+        OutputFormat::Json => {
+            print_pretty_json(&result, "serializing agent register result should succeed")
+        }
+        OutputFormat::Table => {
+            println!(
+                "Enrollment code: {}",
+                enrollment.enrollment_code.unwrap_or_else(|| "-".into())
+            );
+            println!("Public-key fingerprint: {}", result.fingerprint);
+            println!("Agent ID: {}", result.agent_id);
+            println!("Agent credentials saved to {}", result.credentials_path);
+            Ok(())
+        }
+    }
+}
+
+fn ensure_agent_registration_slot_available(current_api_url: &str) -> CliResult<()> {
+    let Some(existing_credentials) = load_agent_credentials()? else {
+        return Ok(());
+    };
+
+    let message =
+        agent_registration_conflict_message(&existing_credentials.api_url, current_api_url);
+    Err(PublicError::validation(message).into())
+}
+
+fn agent_registration_conflict_message(existing_api_url: &str, current_api_url: &str) -> String {
+    if existing_api_url == current_api_url {
+        return "agent credentials already exist for this API URL".to_string();
+    }
+
+    format!(
+        "agent credentials already exist for {existing_api_url}; remove that registration before registering an agent for {current_api_url}"
+    )
+}
+
+async fn cmd_agent_approve(
+    format: OutputFormat,
+    runtime: &RuntimeClient,
+    code: &str,
+    handle: String,
+    display_name: String,
+    password_stdin: bool,
+) -> CliResult<()> {
+    require_password_stdin_for_json_command(format, password_stdin, "agent approve")?;
+    let Some(credentials) = load_credentials_for_url(runtime.api_url())? else {
+        return Err(PublicError::validation(
+            "owner credentials required - run 'worklist auth login' first",
+        )
+        .into());
+    };
+    let client = reqwest::Client::new();
+    let enrollment = fetch_agent_enrollment(&client, runtime.api_url(), code)
+        .await?
+        .into_pending()?;
+    let grants = runtime
+        .build_agent_grants_for_enrollment(&enrollment, password_stdin)
+        .await?;
+    let mut api = PublicApiClient::with_credentials(
+        runtime.api_url(),
+        PrincipalCredentials::User(credentials),
+    );
+    let approved = api
+        .approve_agent_enrollment(
+            code,
+            &ApproveAgentEnrollmentRequest {
+                handle,
+                display_name,
+                scope_mode: "inherit_owner".to_string(),
+                fingerprint: enrollment.fingerprint,
+                grants,
+            },
+        )
+        .await?;
+    print_agent_summaries(
+        format,
+        &[approved],
+        "serializing agent approve result should succeed",
+    )
+}
+
+async fn cmd_agent_list(format: OutputFormat, runtime: &RuntimeClient) -> CliResult<()> {
+    let Some(credentials) = load_credentials_for_url(runtime.api_url())? else {
+        return Err(PublicError::validation(
+            "owner credentials required - run 'worklist auth login' first",
+        )
+        .into());
+    };
+    let mut api = PublicApiClient::with_credentials(
+        runtime.api_url(),
+        PrincipalCredentials::User(credentials),
+    );
+    let agents = api.list_agents().await?;
+    print_agent_summaries(format, &agents, "serializing agent list should succeed")
+}
+
+async fn cmd_agent_revoke(
+    format: OutputFormat,
+    runtime: &RuntimeClient,
+    selector: &str,
+) -> CliResult<()> {
+    let Some(credentials) = load_credentials_for_url(runtime.api_url())? else {
+        return Err(PublicError::validation(
+            "owner credentials required - run 'worklist auth login' first",
+        )
+        .into());
+    };
+    let mut api = PublicApiClient::with_credentials(
+        runtime.api_url(),
+        PrincipalCredentials::User(credentials),
+    );
+    let agents = api.list_agents().await?;
+    let agent = agents
+        .iter()
+        .find(|agent| {
+            agent.agent_id.to_string() == selector
+                || agent
+                    .handle
+                    .as_deref()
+                    .map(|handle| handle == selector || format!("@{handle}") == selector)
+                    .unwrap_or(false)
+        })
+        .cloned()
+        .ok_or_else(|| PublicError::validation("agent not found"))?;
+    let revoked = api.revoke_agent(agent.agent_id).await?;
+    print_agent_summaries(
+        format,
+        &[revoked],
+        "serializing agent revoke result should succeed",
+    )
+}
+
+fn print_agent_summaries(
+    format: OutputFormat,
+    agents: &[AgentSummaryResponse],
+    context: &str,
+) -> CliResult<()> {
+    match format {
+        OutputFormat::Json => print_pretty_json(agents, context),
+        OutputFormat::Table => {
+            if agents.is_empty() {
+                println!("No agents found.");
+                return Ok(());
+            }
+            for agent in agents {
+                println!(
+                    "{}  {}  {}  grants={}  last_seen={}",
+                    agent.handle.as_deref().unwrap_or("-"),
+                    agent.display_name.as_deref().unwrap_or("-"),
+                    agent.status,
+                    agent.grants.len(),
+                    agent
+                        .last_seen_at
+                        .map(|value| value.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                        .unwrap_or_else(|| "-".into())
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
 fn credentials_path_string() -> CliResult<String> {
     Ok(credentials_path()?.display().to_string())
 }
 
-fn load_auth_status(api_url: &str) -> CliResult<AuthStatusResult> {
+fn load_auth_status(
+    api_url: &str,
+    principal_selection: PrincipalSelection,
+) -> CliResult<AuthStatusResult> {
     let current_api_url = normalize_api_url(api_url);
-    let Some(credentials) = load_credentials()? else {
-        return logged_out_auth_status();
-    };
+    let user_credentials = load_credentials()?;
+    let agent_credentials = load_agent_credentials()?;
 
-    logged_in_auth_status(credentials, &current_api_url)
+    match (principal_selection, user_credentials, agent_credentials) {
+        (PrincipalSelection::Auto, Some(credentials), _)
+        | (PrincipalSelection::User, Some(credentials), _) => {
+            logged_in_auth_status(credentials, &current_api_url)
+        }
+        (PrincipalSelection::Auto, None, Some(credentials))
+        | (PrincipalSelection::Agent, _, Some(credentials)) => {
+            logged_in_agent_auth_status(credentials, &current_api_url)
+        }
+        (PrincipalSelection::Auto, None, None)
+        | (PrincipalSelection::User, None, _)
+        | (PrincipalSelection::Agent, _, None) => logged_out_auth_status(),
+    }
 }
 
 fn logged_in_auth_status(
@@ -1107,27 +1448,90 @@ fn logged_in_auth_status(
 ) -> CliResult<AuthStatusResult> {
     let session_key = current_session_key(&credentials)?;
     let unlock_status = unlock_status(Some(&session_key))?;
+    let session_state = session_state(&credentials);
+    let api_url_mismatch = api_url_mismatch(&credentials.api_url, current_api_url);
+    let persisted_bootstrap = persisted_bootstrap_status(persisted_data_key_status(&credentials));
+    let Credentials {
+        api_url,
+        access_token: _,
+        refresh_token: _,
+        access_expires_at,
+        refresh_expires_at,
+        user_id,
+        email,
+        data_key_ciphertext: _,
+    } = credentials;
 
-    Ok(AuthStatusResult::LoggedIn(LoggedInStatusResult {
+    Ok(AuthStatusResult::LoggedIn(Box::new(LoggedInStatusResult {
         logged_in: true,
-        email: credentials.email.clone(),
-        api_url: credentials.api_url.clone(),
-        user_id: credentials.user_id,
-        access_token_expires_at: credentials.access_expires_at.to_rfc3339(),
-        refresh_token_expires_at: credentials.refresh_expires_at.to_rfc3339(),
-        access_token_expires_display: credentials
-            .access_expires_at
-            .format("%Y-%m-%d %H:%M:%S UTC")
-            .to_string(),
-        refresh_token_expires_display: credentials
-            .refresh_expires_at
-            .format("%Y-%m-%d %H:%M:%S UTC")
-            .to_string(),
-        session_state: session_state(&credentials),
-        api_url_mismatch: api_url_mismatch(&credentials.api_url, current_api_url),
+        principal_type: "user",
+        api_url,
+        email: Some(email),
+        user_id: Some(user_id),
+        agent_id: None,
+        owner_user_id: None,
+        handle: None,
+        display_name: None,
+        access_token_expires_at: Some(access_expires_at.to_rfc3339()),
+        refresh_token_expires_at: Some(refresh_expires_at.to_rfc3339()),
+        access_token_expires_display: Some(
+            access_expires_at
+                .format("%Y-%m-%d %H:%M:%S UTC")
+                .to_string(),
+        ),
+        refresh_token_expires_display: Some(
+            refresh_expires_at
+                .format("%Y-%m-%d %H:%M:%S UTC")
+                .to_string(),
+        ),
+        session_state,
+        api_url_mismatch,
         unlock_daemon: unlock_daemon_status(unlock_status),
-        persisted_bootstrap: persisted_bootstrap_status(persisted_data_key_status(&credentials)),
-    }))
+        persisted_bootstrap,
+    })))
+}
+
+fn logged_in_agent_auth_status(
+    credentials: AgentCredentials,
+    current_api_url: &str,
+) -> CliResult<AuthStatusResult> {
+    let session_state = agent_session_state(&credentials);
+    let api_url_mismatch = api_url_mismatch(&credentials.api_url, current_api_url);
+    let access_token_expires_at = credentials
+        .access_expires_at
+        .map(|value| value.to_rfc3339());
+    let access_token_expires_display = credentials
+        .access_expires_at
+        .map(|value| value.format("%Y-%m-%d %H:%M:%S UTC").to_string());
+    let AgentCredentials {
+        api_url,
+        agent_id,
+        owner_user_id,
+        handle,
+        display_name,
+        access_token: _,
+        access_expires_at: _,
+    } = credentials;
+
+    Ok(AuthStatusResult::LoggedIn(Box::new(LoggedInStatusResult {
+        logged_in: true,
+        principal_type: "agent",
+        api_url,
+        email: None,
+        user_id: None,
+        agent_id: Some(agent_id),
+        owner_user_id,
+        handle,
+        display_name,
+        access_token_expires_at,
+        refresh_token_expires_at: None,
+        access_token_expires_display,
+        refresh_token_expires_display: None,
+        session_state,
+        api_url_mismatch,
+        unlock_daemon: inactive_unlock_daemon_status(),
+        persisted_bootstrap: unavailable_persisted_bootstrap_status(),
+    })))
 }
 
 fn logged_out_auth_status() -> CliResult<AuthStatusResult> {
@@ -1201,17 +1605,50 @@ fn unavailable_persisted_bootstrap_status() -> PersistedBootstrapStatus {
 }
 
 fn print_logged_in_auth_status(status: &LoggedInStatusResult) -> CliResult<()> {
-    println!("Logged in as: {}", status.email);
-    println!("API URL: {}", status.api_url);
-    println!("User ID: {}", status.user_id);
-    println!(
-        "Access token expires: {}",
-        status.access_token_expires_display
-    );
-    println!(
-        "Refresh token expires: {}",
-        status.refresh_token_expires_display
-    );
+    match status.principal_type {
+        "user" => {
+            println!(
+                "Logged in as: {}",
+                status.email.as_deref().unwrap_or("unknown user")
+            );
+            println!("API URL: {}", status.api_url);
+            println!("User ID: {}", status.user_id.unwrap_or_default());
+            println!(
+                "Access token expires: {}",
+                status
+                    .access_token_expires_display
+                    .as_deref()
+                    .unwrap_or("-")
+            );
+            println!(
+                "Refresh token expires: {}",
+                status
+                    .refresh_token_expires_display
+                    .as_deref()
+                    .unwrap_or("-")
+            );
+        }
+        "agent" => {
+            println!(
+                "Logged in as agent: {}",
+                format_agent_identity(status)
+                    .as_deref()
+                    .unwrap_or("unknown agent")
+            );
+            println!("API URL: {}", status.api_url);
+            println!("Agent ID: {}", status.agent_id.unwrap_or_default());
+            if let Some(owner_user_id) = status.owner_user_id {
+                println!("Owner User ID: {}", owner_user_id);
+            }
+            if let Some(expires_at) = status.access_token_expires_display.as_deref() {
+                println!("Access token expires: {expires_at}");
+            }
+        }
+        _ => {
+            println!("Logged in.");
+            println!("API URL: {}", status.api_url);
+        }
+    }
 
     if let Some(mismatch) = status.api_url_mismatch.as_ref() {
         println!("\nNote: Stored credentials are for a different API URL.");
@@ -1273,14 +1710,45 @@ fn session_state(credentials: &Credentials) -> &'static str {
     }
 }
 
+fn agent_session_state(credentials: &AgentCredentials) -> &'static str {
+    match credentials.access_expires_at {
+        Some(_) if credentials.access_expires_within(0) => "access_expired",
+        Some(_) if credentials.access_token.is_some() => "active",
+        _ => "registered",
+    }
+}
+
 fn session_state_notice(session_state: &str) -> Option<&'static str> {
     match session_state {
         "refresh_expired" => Some("Warning: Session has expired. Please login again."),
         "access_expired" => {
             Some("Note: Access token has expired but will be refreshed automatically.")
         }
+        "registered" => Some(
+            "Note: Agent credentials are registered locally and will mint access tokens automatically when needed.",
+        ),
         "active" => None,
         _ => None,
+    }
+}
+
+fn record_logout_cleanup_result(result: PublicResult<()>, cleanup_error: &mut Option<PublicError>) {
+    if let Err(err) = result {
+        cleanup_error.get_or_insert(err);
+    }
+}
+
+fn format_agent_identity(status: &LoggedInStatusResult) -> Option<String> {
+    match (
+        status.display_name.as_deref(),
+        status.handle.as_deref(),
+        status.agent_id,
+    ) {
+        (Some(display_name), Some(handle), _) => Some(format!("{display_name} (@{handle})")),
+        (Some(display_name), None, _) => Some(display_name.to_string()),
+        (None, Some(handle), _) => Some(format!("@{handle}")),
+        (None, None, Some(agent_id)) => Some(agent_id.to_string()),
+        (None, None, None) => None,
     }
 }
 

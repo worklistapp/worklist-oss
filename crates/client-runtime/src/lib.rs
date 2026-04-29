@@ -2,6 +2,7 @@
 
 mod unlock_daemon;
 
+use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use rpassword::prompt_password;
 use serde::{Deserialize, Serialize};
@@ -11,26 +12,28 @@ use std::io::{self, Read};
 use std::path::Path;
 use uuid::Uuid;
 use worklist_client_api::{
-    ArchiveTaskRequest, CommentResponse, CreateCommentRequest, CreateTaskRequest,
-    CurrentUserResponse, DashboardStatsResponse, DeleteCommentRequest, DeleteTaskRequest,
-    DownloadAttachmentResponse, MembershipResponse, MoveTaskRequest, MyTaskResponse,
-    PublicApiClient, TaskResponse, UnarchiveTaskRequest, UpdateCommentRequest, UpdateTaskRequest,
-    WorkListDetailResponse, WorkListResponse,
+    ApproveAgentGrantRequest, ArchiveTaskRequest, CommentResponse, CreateCommentRequest,
+    CreateTaskRequest, CurrentUserResponse, DashboardStatsResponse, DeleteCommentRequest,
+    DeleteTaskRequest, DownloadAttachmentResponse, MembershipResponse, MoveTaskRequest,
+    MyTaskResponse, PublicApiClient, TaskResponse, UnarchiveTaskRequest, UpdateCommentRequest,
+    UpdateTaskRequest, WorkListDetailResponse, WorkListResponse,
 };
 use worklist_client_auth::{
-    Credentials, PersistedDataKeyStatus,
-    clear_persisted_data_key as clear_persisted_data_key_secret, load_credentials,
-    load_credentials_for_url, load_persisted_data_key, normalize_api_url,
-    persisted_data_key_status, save_persisted_data_key,
+    AgentCredentials, AgentEnrollmentResponse, Credentials, PersistedDataKeyStatus,
+    PrincipalCredentials, PrincipalSelection, agent_key_material_from_seed,
+    clear_persisted_data_key as clear_persisted_data_key_secret, load_agent_seed, load_credentials,
+    load_credentials_for_url, load_persisted_data_key, load_principal_credentials_for_url,
+    normalize_api_url, persisted_data_key_status, save_persisted_data_key,
 };
 use worklist_client_core::{PublicError, PublicResult};
 use worklist_client_crypto::{
     AttachmentBlobRef, ChecklistItemPayload, CommentPayloadBody, FlexibleValue, SymmetricKey,
     TaskPayloadBody, TaskPayloadRichText, build_comment_payload_envelope,
     build_task_payload_envelope, compute_payload_proof, decode_attachment_blob_key,
-    decode_sealed_blob, decrypt_attachment_bytes, decrypt_comment_payload, decrypt_task_payload,
-    decrypt_text_value, decrypt_user_data_key, decrypt_work_list_key, decrypt_work_list_payload,
-    derive_payload_binding_key, derive_work_list_key, encrypt_comment_payload,
+    decode_sealed_blob, decrypt_agent_work_list_key, decrypt_attachment_bytes,
+    decrypt_comment_payload, decrypt_task_payload, decrypt_text_value, decrypt_user_data_key,
+    decrypt_work_list_key, decrypt_work_list_payload, derive_payload_binding_key,
+    derive_work_list_key, encrypt_agent_work_list_key, encrypt_comment_payload,
     encrypt_task_payload, flexible_value_to_json, plaintext_rich_text, seal_text_value,
 };
 
@@ -205,6 +208,7 @@ pub struct ReadableAttachment {
 #[derive(Debug, Clone)]
 pub struct RuntimeClient {
     api_url: String,
+    principal_selection: PrincipalSelection,
 }
 
 #[derive(Debug, Clone)]
@@ -212,6 +216,12 @@ struct WorkListContext {
     work_list_title: Option<String>,
     list_key: Option<SymmetricKey>,
     read_error: Option<ReadError>,
+}
+
+#[derive(Debug, Clone)]
+enum PrincipalWorkListKeySource {
+    UserDataKey(SymmetricKey),
+    AgentRecipientPrivateKey([u8; 32]),
 }
 
 #[derive(Debug)]
@@ -353,8 +363,16 @@ impl AttachmentReadStrategy {
 
 impl RuntimeClient {
     pub fn new(api_url: impl Into<String>) -> Self {
+        Self::with_principal_selection(api_url, PrincipalSelection::Auto)
+    }
+
+    pub fn with_principal_selection(
+        api_url: impl Into<String>,
+        principal_selection: PrincipalSelection,
+    ) -> Self {
         Self {
             api_url: normalize_api_url(&api_url.into()),
+            principal_selection,
         }
     }
 
@@ -376,17 +394,43 @@ impl RuntimeClient {
         })
     }
 
+    pub fn require_principal_credentials(&self) -> PublicResult<PrincipalCredentials> {
+        load_principal_credentials_for_url(&self.api_url, self.principal_selection)?.ok_or_else(
+            || {
+                PublicError::validation(
+                    "not logged in - run 'worklist auth login' or 'worklist agent register' first",
+                )
+            },
+        )
+    }
+
     pub fn authenticated_api_client(&self) -> PublicResult<PublicApiClient> {
-        let credentials = self.require_logged_in_credentials()?;
-        if credentials.is_refresh_expired() {
-            return Err(PublicError::validation(
-                "session expired - run 'worklist auth login' to authenticate",
-            ));
+        let credentials = self.require_principal_credentials()?;
+        match &credentials {
+            PrincipalCredentials::User(user) if user.is_refresh_expired() => {
+                Err(PublicError::validation(
+                    "session expired - run 'worklist auth login' to authenticate",
+                ))
+            }
+            _ => Ok(PublicApiClient::with_credentials(
+                &self.api_url,
+                credentials,
+            )),
         }
-        Ok(PublicApiClient::with_credentials(
-            &self.api_url,
-            credentials,
-        ))
+    }
+
+    fn require_user_principal_credentials(&self, operation: &str) -> PublicResult<Credentials> {
+        match self.require_principal_credentials()? {
+            PrincipalCredentials::User(credentials) if credentials.is_refresh_expired() => {
+                Err(PublicError::validation(
+                    "session expired - run 'worklist auth login' to authenticate",
+                ))
+            }
+            PrincipalCredentials::User(credentials) => Ok(credentials),
+            PrincipalCredentials::Agent(_) => Err(PublicError::validation(format!(
+                "{operation} requires user credentials; rerun with --principal user until agent-authored content is supported"
+            ))),
+        }
     }
 
     pub async fn get_me(&self) -> PublicResult<CurrentUserResponse> {
@@ -457,21 +501,60 @@ impl RuntimeClient {
             .map(|credentials| persisted_data_key_status(&credentials)))
     }
 
-    pub async fn list_work_lists(
+    pub async fn build_agent_grants_for_enrollment(
         &self,
+        enrollment: &AgentEnrollmentResponse,
         password_stdin: bool,
-    ) -> PublicResult<Vec<AgentWorkListSummary>> {
+    ) -> PublicResult<Vec<ApproveAgentGrantRequest>> {
         let credentials = self.require_logged_in_credentials()?;
         let data_key = self.load_data_key(
             &credentials,
             password_stdin,
+            "Password required to approve agent access.",
+        )?;
+        let recipient_public_key = base64::engine::general_purpose::STANDARD_NO_PAD
+            .decode(enrollment.recipient_public_key.trim())
+            .map_err(|err| {
+                PublicError::validation(format!("invalid recipient public key: {err}"))
+            })?;
+        let mut client = PublicApiClient::with_credentials(
+            &self.api_url,
+            PrincipalCredentials::User(credentials),
+        );
+        let work_lists = client.list_work_lists().await?;
+        let mut grants = Vec::new();
+        for work_list in work_lists
+            .into_iter()
+            .filter(|work_list| work_list.membership.role.eq_ignore_ascii_case("owner"))
+        {
+            let list_key = resolve_list_key(
+                &data_key,
+                work_list.id,
+                &work_list.membership.work_list_key_ciphertext,
+            )?;
+            let ciphertext =
+                encrypt_agent_work_list_key(&recipient_public_key, &work_list.id, &list_key)?;
+            grants.push(ApproveAgentGrantRequest {
+                work_list_id: work_list.id,
+                key_ciphertext: ciphertext.base64,
+            });
+        }
+        Ok(grants)
+    }
+
+    pub async fn list_work_lists(
+        &self,
+        password_stdin: bool,
+    ) -> PublicResult<Vec<AgentWorkListSummary>> {
+        let key_source = self.load_principal_work_list_key_source(
+            password_stdin,
             "Password required to decrypt work lists.",
         )?;
-        let mut client = PublicApiClient::with_credentials(&self.api_url, credentials);
+        let mut client = self.authenticated_api_client()?;
         let lists = client.list_work_lists().await?;
         Ok(lists
             .into_iter()
-            .map(|list| self.project_work_list_summary(list, Some(&data_key)))
+            .map(|list| self.project_work_list_summary(list, Some(&key_source)))
             .collect())
     }
 
@@ -480,15 +563,13 @@ impl RuntimeClient {
         work_list_id: Uuid,
         password_stdin: bool,
     ) -> PublicResult<AgentWorkListDetail> {
-        let credentials = self.require_logged_in_credentials()?;
-        let data_key = self.load_data_key(
-            &credentials,
+        let key_source = self.load_principal_work_list_key_source(
             password_stdin,
             "Password required to decrypt work list data.",
         )?;
-        let mut client = PublicApiClient::with_credentials(&self.api_url, credentials);
+        let mut client = self.authenticated_api_client()?;
         let detail = client.get_work_list(work_list_id).await?;
-        Ok(self.project_work_list_detail(detail, Some(&data_key)))
+        Ok(self.project_work_list_detail(detail, Some(&key_source)))
     }
 
     pub async fn list_tasks(
@@ -498,17 +579,15 @@ impl RuntimeClient {
         all: bool,
         password_stdin: bool,
     ) -> PublicResult<Vec<AgentTaskSummary>> {
-        let credentials = self.require_logged_in_credentials()?;
-        let data_key = self.load_data_key(
-            &credentials,
+        let key_source = self.load_principal_work_list_key_source(
             password_stdin,
             "Password required to decrypt task data.",
         )?;
-        let mut client = PublicApiClient::with_credentials(&self.api_url, credentials);
+        let mut client = self.authenticated_api_client()?;
 
         if all || work_list_id.is_none() {
             let work_lists = client.list_work_lists().await?;
-            let contexts = self.build_work_list_contexts(&work_lists, Some(&data_key));
+            let contexts = self.build_work_list_contexts(&work_lists, Some(&key_source));
             let response = client.get_my_tasks(Some(100), None).await?;
             let tasks = if include_completed {
                 response.tasks
@@ -531,7 +610,7 @@ impl RuntimeClient {
 
         let work_list_id = work_list_id.expect("validated work list id");
         let work_list = client.get_work_list(work_list_id).await?;
-        let context = self.context_from_work_list_detail(&work_list, Some(&data_key));
+        let context = self.context_from_work_list_detail(&work_list, Some(&key_source));
         let response = client.get_tasks(work_list_id, false).await?;
         let tasks = if include_completed {
             response.tasks
@@ -662,10 +741,11 @@ impl RuntimeClient {
 
     pub async fn create_task(&self, args: CreateTaskArgs) -> PublicResult<AgentTaskSummary> {
         let (mut client, context) = self
-            .load_work_list_context(
+            .load_user_work_list_context(
                 args.work_list_id,
                 args.password_stdin,
                 "Password required to create encrypted task payloads.",
+                "task creation",
             )
             .await?;
         let list_key = self.require_work_list_key(&context)?;
@@ -850,10 +930,11 @@ impl RuntimeClient {
 
     pub async fn create_comment(&self, args: CreateCommentArgs) -> PublicResult<AgentComment> {
         let (mut client, context) = self
-            .load_work_list_context(
+            .load_user_work_list_context(
                 args.work_list_id,
                 args.password_stdin,
                 "Password required to create encrypted comments.",
+                "comment creation",
             )
             .await?;
         let list_key = self.require_work_list_key(&context)?;
@@ -962,11 +1043,33 @@ impl RuntimeClient {
         password_stdin: bool,
         prompt_message: &str,
     ) -> PublicResult<(PublicApiClient, WorkListContext)> {
-        let credentials = self.require_logged_in_credentials()?;
-        let data_key = self.load_data_key(&credentials, password_stdin, prompt_message)?;
-        let mut client = PublicApiClient::with_credentials(&self.api_url, credentials);
+        let key_source =
+            self.load_principal_work_list_key_source(password_stdin, prompt_message)?;
+        let mut client = self.authenticated_api_client()?;
         let work_list = client.get_work_list(work_list_id).await?;
-        let context = self.context_from_work_list_detail(&work_list, Some(&data_key));
+        let context = self.context_from_work_list_detail(&work_list, Some(&key_source));
+        Ok((client, context))
+    }
+
+    async fn load_user_work_list_context(
+        &self,
+        work_list_id: Uuid,
+        password_stdin: bool,
+        prompt_message: &str,
+        operation: &str,
+    ) -> PublicResult<(PublicApiClient, WorkListContext)> {
+        let credentials = self.require_user_principal_credentials(operation)?;
+        let key_source = PrincipalWorkListKeySource::UserDataKey(self.load_data_key(
+            &credentials,
+            password_stdin,
+            prompt_message,
+        )?);
+        let mut client = PublicApiClient::with_credentials(
+            &self.api_url,
+            PrincipalCredentials::User(credentials),
+        );
+        let work_list = client.get_work_list(work_list_id).await?;
+        let context = self.context_from_work_list_detail(&work_list, Some(&key_source));
         Ok((client, context))
     }
 
@@ -1018,17 +1121,44 @@ impl RuntimeClient {
         Ok(Some(data_key))
     }
 
+    fn load_principal_work_list_key_source(
+        &self,
+        password_stdin: bool,
+        prompt_message: &str,
+    ) -> PublicResult<PrincipalWorkListKeySource> {
+        match self.require_principal_credentials()? {
+            PrincipalCredentials::User(credentials) => Ok(PrincipalWorkListKeySource::UserDataKey(
+                self.load_data_key(&credentials, password_stdin, prompt_message)?,
+            )),
+            PrincipalCredentials::Agent(credentials) => {
+                Ok(PrincipalWorkListKeySource::AgentRecipientPrivateKey(
+                    self.load_agent_recipient_private_key(&credentials)?,
+                ))
+            }
+        }
+    }
+
+    fn load_agent_recipient_private_key(
+        &self,
+        credentials: &AgentCredentials,
+    ) -> PublicResult<[u8; 32]> {
+        let seed = load_agent_seed(credentials)?.ok_or_else(|| {
+            PublicError::validation("agent seed missing from local secure storage")
+        })?;
+        Ok(agent_key_material_from_seed(seed)?.recipient_private_key)
+    }
+
     fn build_work_list_contexts(
         &self,
         work_lists: &[WorkListResponse],
-        data_key: Option<&SymmetricKey>,
+        key_source: Option<&PrincipalWorkListKeySource>,
     ) -> HashMap<Uuid, WorkListContext> {
         work_lists
             .iter()
             .map(|work_list| {
                 (
                     work_list.id,
-                    self.context_from_work_list_response(work_list, data_key),
+                    self.context_from_work_list_response(work_list, key_source),
                 )
             })
             .collect()
@@ -1037,20 +1167,20 @@ impl RuntimeClient {
     fn context_from_work_list_detail(
         &self,
         work_list: &WorkListDetailResponse,
-        data_key: Option<&SymmetricKey>,
+        key_source: Option<&PrincipalWorkListKeySource>,
     ) -> WorkListContext {
-        self.context_from_work_list_response(&work_list.work_list, data_key)
+        self.context_from_work_list_response(&work_list.work_list, key_source)
     }
 
     fn context_from_work_list_response(
         &self,
         work_list: &WorkListResponse,
-        data_key: Option<&SymmetricKey>,
+        key_source: Option<&PrincipalWorkListKeySource>,
     ) -> WorkListContext {
         let fallback_title = decode_text_fallback(&work_list.title_ciphertext);
-        match data_key {
-            Some(data_key) => match resolve_list_key(
-                data_key,
+        match key_source {
+            Some(key_source) => match resolve_work_list_key_for_principal_source(
+                key_source,
                 work_list.id,
                 &work_list.membership.work_list_key_ciphertext,
             ) {
@@ -1070,27 +1200,21 @@ impl RuntimeClient {
                             .map(|err| make_read_error("work_list_payload", err)),
                     }
                 }
-                Err(err) => WorkListContext {
-                    work_list_title: fallback_title,
-                    list_key: None,
-                    read_error: Some(make_read_error("work_list_key", err)),
-                },
+                Err(err) => unreadable_work_list_context(
+                    fallback_title,
+                    make_read_error("work_list_key", err),
+                ),
             },
-            None => WorkListContext {
-                work_list_title: fallback_title,
-                list_key: None,
-                read_error: Some(ReadError {
-                    code: "data_key_missing".to_string(),
-                    message: "could not load data key for work list decryption".to_string(),
-                }),
-            },
+            None => {
+                unreadable_work_list_context(fallback_title, missing_work_list_key_source_error())
+            }
         }
     }
 
     fn project_work_list_summary(
         &self,
         work_list: WorkListResponse,
-        data_key: Option<&worklist_client_crypto::SymmetricKey>,
+        key_source: Option<&PrincipalWorkListKeySource>,
     ) -> AgentWorkListSummary {
         let fallback_title = decode_text_fallback(&work_list.title_ciphertext);
         let fallback_description = work_list
@@ -1099,88 +1223,82 @@ impl RuntimeClient {
             .and_then(decode_text_fallback);
         let membership = project_membership(&work_list.membership);
 
-        match data_key {
-            Some(data_key) => match resolve_list_key(
-                data_key,
-                work_list.id,
-                &work_list.membership.work_list_key_ciphertext,
-            ) {
-                Ok(list_key) => {
-                    match decode_work_list_payload_value(&list_key, &work_list.payload_ciphertext) {
-                        Ok(payload) => AgentWorkListSummary {
-                            id: work_list.id,
-                            owner_user_id: work_list.owner_user_id,
-                            workspace_id: work_list.workspace_id,
-                            timezone: work_list.timezone,
-                            section_snapshots: work_list.section_snapshots,
-                            created_at: work_list.created_at,
-                            updated_at: work_list.updated_at,
-                            membership,
-                            title: extract_work_list_title(&payload).or(fallback_title),
-                            description: extract_work_list_description(&payload)
-                                .or(fallback_description),
-                            payload: Some(payload),
-                            read_error: None,
-                        },
-                        Err(err) => AgentWorkListSummary {
-                            id: work_list.id,
-                            owner_user_id: work_list.owner_user_id,
-                            workspace_id: work_list.workspace_id,
-                            timezone: work_list.timezone,
-                            section_snapshots: work_list.section_snapshots,
-                            created_at: work_list.created_at,
-                            updated_at: work_list.updated_at,
-                            membership,
-                            title: fallback_title,
-                            description: fallback_description,
-                            payload: None,
-                            read_error: Some(make_read_error("work_list_payload", err)),
-                        },
-                    }
-                }
-                Err(err) => AgentWorkListSummary {
-                    id: work_list.id,
-                    owner_user_id: work_list.owner_user_id,
-                    workspace_id: work_list.workspace_id,
-                    timezone: work_list.timezone,
-                    section_snapshots: work_list.section_snapshots,
-                    created_at: work_list.created_at,
-                    updated_at: work_list.updated_at,
-                    membership,
-                    title: fallback_title,
-                    description: fallback_description,
-                    payload: None,
-                    read_error: Some(make_read_error("work_list_key", err)),
-                },
-            },
-            None => AgentWorkListSummary {
-                id: work_list.id,
-                owner_user_id: work_list.owner_user_id,
-                workspace_id: work_list.workspace_id,
-                timezone: work_list.timezone,
-                section_snapshots: work_list.section_snapshots,
-                created_at: work_list.created_at,
-                updated_at: work_list.updated_at,
+        match key_source {
+            Some(key_source) => self.project_work_list_summary_with_key_source(
+                work_list,
                 membership,
-                title: fallback_title,
-                description: fallback_description,
-                payload: None,
-                read_error: Some(ReadError {
-                    code: "data_key_missing".to_string(),
-                    message: "could not load data key for work list decryption".to_string(),
-                }),
-            },
+                fallback_title,
+                fallback_description,
+                key_source,
+            ),
+            None => build_work_list_summary(
+                work_list,
+                membership,
+                fallback_title,
+                fallback_description,
+                None,
+                Some(missing_work_list_key_source_error()),
+            ),
+        }
+    }
+
+    fn project_work_list_summary_with_key_source(
+        &self,
+        work_list: WorkListResponse,
+        membership: AgentMembership,
+        fallback_title: Option<String>,
+        fallback_description: Option<String>,
+        key_source: &PrincipalWorkListKeySource,
+    ) -> AgentWorkListSummary {
+        match resolve_work_list_key_for_principal_source(
+            key_source,
+            work_list.id,
+            &work_list.membership.work_list_key_ciphertext,
+        ) {
+            Ok(list_key) => {
+                match decode_work_list_payload_value(&list_key, &work_list.payload_ciphertext) {
+                    Ok(payload) => {
+                        let title = extract_work_list_title(&payload).or(fallback_title);
+                        let description =
+                            extract_work_list_description(&payload).or(fallback_description);
+                        build_work_list_summary(
+                            work_list,
+                            membership,
+                            title,
+                            description,
+                            Some(payload),
+                            None,
+                        )
+                    }
+                    Err(err) => build_work_list_summary(
+                        work_list,
+                        membership,
+                        fallback_title,
+                        fallback_description,
+                        None,
+                        Some(make_read_error("work_list_payload", err)),
+                    ),
+                }
+            }
+            Err(err) => build_work_list_summary(
+                work_list,
+                membership,
+                fallback_title,
+                fallback_description,
+                None,
+                Some(make_read_error("work_list_key", err)),
+            ),
         }
     }
 
     fn project_work_list_detail(
         &self,
         work_list: WorkListDetailResponse,
-        data_key: Option<&SymmetricKey>,
+        key_source: Option<&PrincipalWorkListKeySource>,
     ) -> AgentWorkListDetail {
         let members = work_list.members.iter().map(project_membership).collect();
         AgentWorkListDetail {
-            work_list: self.project_work_list_summary(work_list.work_list, data_key),
+            work_list: self.project_work_list_summary(work_list.work_list, key_source),
             members,
         }
     }
@@ -1696,6 +1814,68 @@ fn project_delegation(delegation: worklist_client_api::DelegationResponse) -> Ag
     }
 }
 
+fn unreadable_work_list_context(
+    work_list_title: Option<String>,
+    read_error: ReadError,
+) -> WorkListContext {
+    WorkListContext {
+        work_list_title,
+        list_key: None,
+        read_error: Some(read_error),
+    }
+}
+
+fn build_work_list_summary(
+    work_list: WorkListResponse,
+    membership: AgentMembership,
+    title: Option<String>,
+    description: Option<String>,
+    payload: Option<Value>,
+    read_error: Option<ReadError>,
+) -> AgentWorkListSummary {
+    AgentWorkListSummary {
+        id: work_list.id,
+        owner_user_id: work_list.owner_user_id,
+        workspace_id: work_list.workspace_id,
+        timezone: work_list.timezone,
+        section_snapshots: work_list.section_snapshots,
+        created_at: work_list.created_at,
+        updated_at: work_list.updated_at,
+        membership,
+        title,
+        description,
+        payload,
+        read_error,
+    }
+}
+
+fn missing_work_list_key_source_error() -> ReadError {
+    ReadError {
+        code: "work_list_key_source_missing".to_string(),
+        message: "could not load work list key material for decryption".to_string(),
+    }
+}
+
+fn resolve_work_list_key_for_principal_source(
+    key_source: &PrincipalWorkListKeySource,
+    work_list_id: Uuid,
+    membership_ciphertext: &str,
+) -> PublicResult<SymmetricKey> {
+    match key_source {
+        PrincipalWorkListKeySource::UserDataKey(data_key) => {
+            resolve_list_key(data_key, work_list_id, membership_ciphertext)
+        }
+        PrincipalWorkListKeySource::AgentRecipientPrivateKey(recipient_private_key) => {
+            if membership_ciphertext.trim().is_empty() {
+                return Err(PublicError::validation("agent work list grant missing"));
+            }
+
+            let work_list_key_bytes = decode_sealed_blob(membership_ciphertext)?;
+            decrypt_agent_work_list_key(recipient_private_key, &work_list_id, &work_list_key_bytes)
+        }
+    }
+}
+
 fn resolve_list_key(
     data_key: &SymmetricKey,
     work_list_id: Uuid,
@@ -2133,7 +2313,6 @@ fn read_required_password(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::Engine as _;
 
     const TEST_DOCX_BASE64: &str = "UEsDBBQAAAAIAOp8kVzXeYTq8QAAALgBAAATAAAAW0NvbnRlbnRfVHlwZXNdLnhtbH2QzU7DMBCE730Ky9cqccoBIZSkB36OwKE8wMreJFb9J69b2rdn00KREOVozXwz62nXB+/EHjPZGDq5qhspMOhobBg7+b55ru6koALBgIsBO3lEkut+0W6OCUkwHKiTUynpXinSE3qgOiYMrAwxeyj8zKNKoLcworppmlulYygYSlXmDNkvhGgfcYCdK+LpwMr5loyOpHg4e+e6TkJKzmoorKt9ML+Kqq+SmsmThyabaMkGqa6VzOL1jh/0lSfK1qB4g1xewLNRfcRslIl65xmu/0/649o4DFbjhZ/TUo4aiXh77+qL4sGG71+06jR8/wlQSwMEFAAAAAgA6nyRXCAbhuqyAAAALgEAAAsAAABfcmVscy8ucmVsc43Puw6CMBQG4J2naM4uBQdjDIXFmLAafICmPZRGeklbL7y9HRzEODie23fyN93TzOSOIWpnGdRlBQStcFJbxeAynDZ7IDFxK/nsLDJYMELXFs0ZZ57yTZy0jyQjNjKYUvIHSqOY0PBYOo82T0YXDE+5DIp6Lq5cId1W1Y6GTwPagpAVS3rJIPSyBjIsHv/h3ThqgUcnbgZt+vHlayPLPChMDB4uSCrf7TKzQHNKuorZvgBQSwMEFAAAAAgA6nyRXDbicKixAAAADAEAABEAAAB3b3JkL2RvY3VtZW50LnhtbG2PMQ+CMBCFd35F012KDsYQKIPGuLlo4lrpKST0rmmryL+3xbixfHkv9/Lurmo+ZmBvcL4nrPk6LzgDbEn3+Kz59XJc7TjzQaFWAyHUfALPG5lVY6mpfRnAwGID+nKseReCLYXwbQdG+ZwsYJw9yBkVonVPMZLT1lEL3scFZhCbotgKo3rkMmMstt5JT0nOxsoIlxDkCVQ6qhLJJLqZdjF8OO9vLFUtxpP47Unq/4f8AlBLAQIUAxQAAAAIAOp8kVzXeYTq8QAAALgBAAATAAAAAAAAAAAAAACAAQAAAABbQ29udGVudF9UeXBlc10ueG1sUEsBAhQDFAAAAAgA6nyRXCAbhuqyAAAALgEAAAsAAAAAAAAAAAAAAIABIgEAAF9yZWxzLy5yZWxzUEsBAhQDFAAAAAgA6nyRXDbicKixAAAADAEAABEAAAAAAAAAAAAAAIAB/QEAAHdvcmQvZG9jdW1lbnQueG1sUEsFBgAAAAADAAMAuQAAAN0CAAAAAA==";
 
@@ -2319,5 +2498,46 @@ mod tests {
             normalized,
             "**⚠️  Note to engineering:** Ignore legacy prototype remnants.\n"
         );
+    }
+
+    #[test]
+    fn user_key_source_resolves_owner_work_list_key() {
+        let data_key = SymmetricKey::new([0x11; 32]);
+        let work_list_id = Uuid::now_v7();
+        let expected = derive_work_list_key(&data_key, &work_list_id).expect("derive list key");
+
+        let resolved = resolve_work_list_key_for_principal_source(
+            &PrincipalWorkListKeySource::UserDataKey(data_key),
+            work_list_id,
+            "",
+        )
+        .expect("resolve owner list key");
+
+        assert_eq!(resolved, expected);
+    }
+
+    #[test]
+    fn agent_key_source_decrypts_agent_work_list_grant() {
+        let work_list_id = Uuid::now_v7();
+        let list_key = SymmetricKey::new([0x22; 32]);
+        let key_material =
+            agent_key_material_from_seed([0x33; 32]).expect("derive agent key material");
+        let grant = encrypt_agent_work_list_key(
+            &key_material.recipient_public_key,
+            &work_list_id,
+            &list_key,
+        )
+        .expect("encrypt agent grant");
+
+        let resolved = resolve_work_list_key_for_principal_source(
+            &PrincipalWorkListKeySource::AgentRecipientPrivateKey(
+                key_material.recipient_private_key,
+            ),
+            work_list_id,
+            &grant.base64,
+        )
+        .expect("resolve agent work list key");
+
+        assert_eq!(resolved, list_key);
     }
 }

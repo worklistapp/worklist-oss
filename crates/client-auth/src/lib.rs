@@ -8,22 +8,28 @@ use argon2::{Algorithm, Argon2, Params, Version};
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
+use ed25519_dalek::{Signer, SigningKey};
 use generic_array::{ArrayLength, GenericArray};
+use hkdf::Hkdf;
 use opaque_ke::{
     CipherSuite, ClientLogin, ClientLoginFinishParameters, ClientLoginStartResult,
     CredentialResponse, Identifiers, Ristretto255, errors::InternalError,
     key_exchange::tripledh::TripleDh, ksf::Ksf,
 };
-use rand_core::OsRng;
+use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
 use uuid::Uuid;
+use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
 
 use worklist_client_core::{PublicError, PublicResult};
 
 const OPAQUE_SERVER_ID: &[u8] = b"worklist.api";
 const DATA_KEY_KEYCHAIN_SERVICE: &str = "worklist.data-key";
+const AGENT_SEED_KEYCHAIN_SERVICE: &str = "worklist.agent-seed";
 const TEST_KEYCHAIN_DIR_ENV: &str = "WORKLIST_TEST_KEYCHAIN_DIR";
+const AGENT_SEED_FILE_ONLY_ENV: &str = "WORKLIST_AGENT_SEED_FILE_ONLY";
+const KEY_SIZE: usize = 32;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -73,6 +79,115 @@ impl Credentials {
     pub fn access_expires_within(&self, seconds: i64) -> bool {
         Utc::now() + chrono::Duration::seconds(seconds) >= self.access_expires_at
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentCredentials {
+    pub api_url: String,
+    pub agent_id: Uuid,
+    pub owner_user_id: Option<Uuid>,
+    pub handle: Option<String>,
+    pub display_name: Option<String>,
+    pub access_token: Option<String>,
+    pub access_expires_at: Option<DateTime<Utc>>,
+}
+
+impl AgentCredentials {
+    pub fn access_expires_within(&self, seconds: i64) -> bool {
+        match self.access_expires_at {
+            Some(expires_at) => Utc::now() + chrono::Duration::seconds(seconds) >= expires_at,
+            None => true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "principal_type", rename_all = "snake_case")]
+pub enum PrincipalCredentials {
+    User(Credentials),
+    Agent(AgentCredentials),
+}
+
+impl PrincipalCredentials {
+    pub fn api_url(&self) -> &str {
+        match self {
+            Self::User(credentials) => &credentials.api_url,
+            Self::Agent(credentials) => &credentials.api_url,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrincipalSelection {
+    #[default]
+    Auto,
+    User,
+    Agent,
+}
+
+impl PrincipalSelection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::User => "user",
+            Self::Agent => "agent",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentEnrollmentResponse {
+    pub agent_id: Uuid,
+    pub owner_user_id: Option<Uuid>,
+    pub status: String,
+    pub approved: bool,
+    pub auth_public_key: String,
+    pub recipient_public_key: String,
+    pub enrollment_code: Option<String>,
+    pub enrollment_expires_at: Option<DateTime<Utc>>,
+    pub handle: Option<String>,
+    pub proposed_handle: Option<String>,
+    pub display_name: Option<String>,
+    pub scope_mode: String,
+    pub fingerprint: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FinalizedAgentEnrollmentResponse {
+    pub status: String,
+    pub fingerprint: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum AgentEnrollmentStatusResponse {
+    Pending(Box<AgentEnrollmentResponse>),
+    Finalized(FinalizedAgentEnrollmentResponse),
+}
+
+impl AgentEnrollmentStatusResponse {
+    pub fn into_pending(self) -> PublicResult<AgentEnrollmentResponse> {
+        match self {
+            Self::Pending(enrollment) => Ok(*enrollment),
+            Self::Finalized(enrollment) => Err(PublicError::validation(format!(
+                "agent enrollment is already {}",
+                enrollment.status
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentTokenResponse {
+    pub access_token: String,
+    pub expires_in: u64,
+    pub token_type: String,
+    pub agent_id: Uuid,
+    pub owner_user_id: Uuid,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -157,6 +272,20 @@ struct RefreshRequest {
     refresh_token: String,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateAgentEnrollmentRequest {
+    auth_public_key: String,
+    recipient_public_key: String,
+    proposed_handle: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentTokenRequestBody {
+    assertion: String,
+}
+
 pub struct ClientKsf {
     argon: Argon2<'static>,
 }
@@ -202,24 +331,16 @@ pub fn credentials_path() -> PublicResult<PathBuf> {
     Ok(config_dir()?.join("credentials.json"))
 }
 
+pub fn agent_credentials_path() -> PublicResult<PathBuf> {
+    Ok(config_dir()?.join("agent.json"))
+}
+
 pub fn normalize_api_url(api_url: &str) -> String {
     api_url.trim_end_matches('/').to_string()
 }
 
 pub fn load_credentials() -> PublicResult<Option<Credentials>> {
-    let path = credentials_path()?;
-    if !path.exists() {
-        return Ok(None);
-    }
-
-    let file = File::open(&path).map_err(|err| {
-        PublicError::unexpected(format!("failed to open credentials file: {err}"))
-    })?;
-    let reader = BufReader::new(file);
-    let credentials: Credentials = serde_json::from_reader(reader).map_err(|err| {
-        PublicError::unexpected(format!("failed to parse credentials file: {err}"))
-    })?;
-    Ok(Some(credentials))
+    load_config_file(&credentials_path()?, "credentials")
 }
 
 pub fn load_credentials_for_url(api_url: &str) -> PublicResult<Option<Credentials>> {
@@ -230,45 +351,73 @@ pub fn load_credentials_for_url(api_url: &str) -> PublicResult<Option<Credential
     }
 }
 
-pub fn save_credentials(credentials: &Credentials) -> PublicResult<()> {
-    let dir = config_dir()?;
-    if !dir.exists() {
-        fs::create_dir_all(&dir).map_err(|err| {
-            PublicError::unexpected(format!("failed to create config directory: {err}"))
-        })?;
-    }
-    set_config_dir_permissions(&dir)?;
-
-    let path = credentials_path()?;
-    let file = File::create(&path).map_err(|err| {
-        PublicError::unexpected(format!("failed to create credentials file: {err}"))
-    })?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        let permissions = fs::Permissions::from_mode(0o600);
-        fs::set_permissions(&path, permissions).map_err(|err| {
-            PublicError::unexpected(format!("failed to set credentials file permissions: {err}"))
-        })?;
-    }
-
-    let writer = BufWriter::new(file);
-    serde_json::to_writer_pretty(writer, credentials).map_err(|err| {
-        PublicError::unexpected(format!("failed to write credentials file: {err}"))
-    })?;
-    Ok(())
+pub fn load_agent_credentials() -> PublicResult<Option<AgentCredentials>> {
+    load_config_file(&agent_credentials_path()?, "agent credentials")
 }
 
-pub fn clear_credentials() -> PublicResult<()> {
-    let path = credentials_path()?;
-    if path.exists() {
-        fs::remove_file(&path).map_err(|err| {
-            PublicError::unexpected(format!("failed to remove credentials file: {err}"))
-        })?;
+pub fn load_agent_credentials_for_url(api_url: &str) -> PublicResult<Option<AgentCredentials>> {
+    let normalized_api_url = normalize_api_url(api_url);
+    match load_agent_credentials()? {
+        Some(credentials) if credentials.api_url == normalized_api_url => Ok(Some(credentials)),
+        _ => Ok(None),
     }
-    Ok(())
+}
+
+pub fn load_principal_credentials_for_url(
+    api_url: &str,
+    selection: PrincipalSelection,
+) -> PublicResult<Option<PrincipalCredentials>> {
+    let user_credentials = load_credentials_for_url(api_url)?;
+    let agent_credentials = load_agent_credentials_for_url(api_url)?;
+    select_principal_credentials(selection, user_credentials, agent_credentials)
+}
+
+fn select_principal_credentials(
+    selection: PrincipalSelection,
+    user_credentials: Option<Credentials>,
+    agent_credentials: Option<AgentCredentials>,
+) -> PublicResult<Option<PrincipalCredentials>> {
+    match (selection, user_credentials, agent_credentials) {
+        (PrincipalSelection::Auto, None, None) => Ok(None),
+        (PrincipalSelection::Auto, Some(credentials), None) => {
+            Ok(Some(PrincipalCredentials::User(credentials)))
+        }
+        (PrincipalSelection::Auto, None, Some(credentials)) => {
+            Ok(Some(PrincipalCredentials::Agent(credentials)))
+        }
+        (PrincipalSelection::Auto, Some(_), Some(_)) => Err(PublicError::validation(
+            "both user and agent credentials exist for this API URL; rerun with --principal user or --principal agent",
+        )),
+        (PrincipalSelection::User, Some(credentials), _) => {
+            Ok(Some(PrincipalCredentials::User(credentials)))
+        }
+        (PrincipalSelection::User, None, _) => Err(PublicError::validation(
+            "user credentials not found for this API URL - run 'worklist auth login' first",
+        )),
+        (PrincipalSelection::Agent, _, Some(credentials)) => {
+            Ok(Some(PrincipalCredentials::Agent(credentials)))
+        }
+        (PrincipalSelection::Agent, _, None) => Err(PublicError::validation(
+            "agent credentials not found for this API URL - run 'worklist agent register' first",
+        )),
+    }
+}
+
+pub fn save_credentials(credentials: &Credentials) -> PublicResult<()> {
+    save_config_file(&credentials_path()?, credentials, "credentials")
+}
+
+pub fn save_agent_credentials(credentials: &AgentCredentials) -> PublicResult<()> {
+    save_config_file(&agent_credentials_path()?, credentials, "agent credentials")
+}
+
+/// Clears persisted user credentials without affecting local agent credentials.
+pub fn clear_credentials() -> PublicResult<()> {
+    remove_config_file(&credentials_path()?, "credentials")
+}
+
+pub fn clear_agent_credentials() -> PublicResult<()> {
+    remove_config_file(&agent_credentials_path()?, "agent credentials")
 }
 
 pub fn load_persisted_data_key(credentials: &Credentials) -> PublicResult<Option<Vec<u8>>> {
@@ -306,6 +455,72 @@ fn set_config_dir_permissions(dir: &Path) -> PublicResult<()> {
 
 #[cfg(not(unix))]
 fn set_config_dir_permissions(_dir: &Path) -> PublicResult<()> {
+    Ok(())
+}
+
+fn load_config_file<T>(path: &Path, label: &str) -> PublicResult<Option<T>>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let file = File::open(path)
+        .map_err(|err| PublicError::unexpected(format!("failed to open {label} file: {err}")))?;
+    let reader = BufReader::new(file);
+    let value = serde_json::from_reader(reader)
+        .map_err(|err| PublicError::unexpected(format!("failed to parse {label} file: {err}")))?;
+    Ok(Some(value))
+}
+
+fn save_config_file<T>(path: &Path, value: &T, label: &str) -> PublicResult<()>
+where
+    T: Serialize,
+{
+    ensure_config_dir()?;
+
+    let file = File::create(path)
+        .map_err(|err| PublicError::unexpected(format!("failed to create {label} file: {err}")))?;
+    set_config_file_permissions(path, label)?;
+
+    let writer = BufWriter::new(file);
+    serde_json::to_writer_pretty(writer, value)
+        .map_err(|err| PublicError::unexpected(format!("failed to write {label} file: {err}")))
+}
+
+#[cfg(unix)]
+fn set_config_file_permissions(path: &Path, label: &str) -> PublicResult<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let permissions = fs::Permissions::from_mode(0o600);
+    fs::set_permissions(path, permissions).map_err(|err| {
+        PublicError::unexpected(format!("failed to set {label} file permissions: {err}"))
+    })
+}
+
+#[cfg(not(unix))]
+fn set_config_file_permissions(_path: &Path, _label: &str) -> PublicResult<()> {
+    Ok(())
+}
+
+fn ensure_config_dir() -> PublicResult<PathBuf> {
+    let dir = config_dir()?;
+    if !dir.exists() {
+        fs::create_dir_all(&dir).map_err(|err| {
+            PublicError::unexpected(format!("failed to create config directory: {err}"))
+        })?;
+    }
+    set_config_dir_permissions(&dir)?;
+    Ok(dir)
+}
+
+fn remove_config_file(path: &Path, label: &str) -> PublicResult<()> {
+    if path.exists() {
+        fs::remove_file(path).map_err(|err| {
+            PublicError::unexpected(format!("failed to remove {label} file: {err}"))
+        })?;
+    }
     Ok(())
 }
 
@@ -352,13 +567,12 @@ pub async fn login(
     email: &str,
     password: &str,
 ) -> PublicResult<AuthResponse> {
+    let login_start_url = api_endpoint(base_url, "/auth/opaque/login/start");
+    let login_finish_url = api_endpoint(base_url, "/auth/opaque/login/finish");
     let (opaque_state, client_login_state) = opaque_login_start(password)?;
 
     let start_response = client
-        .post(format!(
-            "{}/auth/opaque/login/start",
-            base_url.trim_end_matches('/')
-        ))
+        .post(login_start_url)
         .json(&LoginStartRequest {
             email: email.to_string(),
             client_login_state,
@@ -377,10 +591,7 @@ pub async fn login(
     )?;
 
     let finish_response = client
-        .post(format!(
-            "{}/auth/opaque/login/finish",
-            base_url.trim_end_matches('/')
-        ))
+        .post(login_finish_url)
         .json(&LoginFinishRequest {
             session_token: start_result.session_token,
             client_finish_message,
@@ -398,7 +609,7 @@ pub async fn refresh_access_token(
     refresh_token: &str,
 ) -> PublicResult<RefreshResponse> {
     let response = client
-        .post(format!("{}/auth/refresh", base_url.trim_end_matches('/')))
+        .post(api_endpoint(base_url, "/auth/refresh"))
         .json(&RefreshRequest {
             refresh_token: refresh_token.to_string(),
         })
@@ -415,7 +626,7 @@ pub async fn logout(
     refresh_token: &str,
 ) -> PublicResult<Option<String>> {
     let status = client
-        .post(format!("{}/auth/logout", base_url.trim_end_matches('/')))
+        .post(api_endpoint(base_url, "/auth/logout"))
         .json(&RefreshRequest {
             refresh_token: refresh_token.to_string(),
         })
@@ -425,6 +636,90 @@ pub async fn logout(
         .status();
 
     Ok((!status.is_success()).then(|| format!("server logout returned status {status}")))
+}
+
+pub struct AgentKeyMaterial {
+    pub seed: [u8; KEY_SIZE],
+    pub signing_key: SigningKey,
+    pub auth_public_key: [u8; KEY_SIZE],
+    pub recipient_private_key: [u8; KEY_SIZE],
+    pub recipient_public_key: [u8; KEY_SIZE],
+}
+
+pub fn generate_agent_key_material() -> PublicResult<AgentKeyMaterial> {
+    let mut seed = [0u8; KEY_SIZE];
+    getrandom_fill(&mut seed)?;
+    agent_key_material_from_seed(seed)
+}
+
+pub fn agent_key_material_from_seed(seed: [u8; KEY_SIZE]) -> PublicResult<AgentKeyMaterial> {
+    let auth_seed = hkdf_expand_label(&seed, b"worklist.agent.auth")?;
+    let recipient_seed = hkdf_expand_label(&seed, b"worklist.agent.recipient")?;
+    let signing_key = SigningKey::from_bytes(&auth_seed);
+    let auth_public_key = signing_key.verifying_key().to_bytes();
+    let recipient_private_key = recipient_seed;
+    let recipient_private = X25519StaticSecret::from(recipient_private_key);
+    let recipient_public_key = X25519PublicKey::from(&recipient_private).to_bytes();
+
+    Ok(AgentKeyMaterial {
+        seed,
+        signing_key,
+        auth_public_key,
+        recipient_private_key,
+        recipient_public_key,
+    })
+}
+
+pub async fn register_agent(
+    client: &reqwest::Client,
+    base_url: &str,
+    key_material: &AgentKeyMaterial,
+    proposed_handle: Option<String>,
+) -> PublicResult<AgentEnrollmentResponse> {
+    let response = client
+        .post(api_endpoint(base_url, "/agents/enrollments"))
+        .json(&CreateAgentEnrollmentRequest {
+            auth_public_key: encode_bytes(&key_material.auth_public_key),
+            recipient_public_key: encode_bytes(&key_material.recipient_public_key),
+            proposed_handle,
+        })
+        .send()
+        .await
+        .map_err(|err| map_reqwest_error(err, "agent enrollment"))?;
+    parse_json_response(response, "agent enrollment response").await
+}
+
+pub async fn fetch_agent_enrollment(
+    client: &reqwest::Client,
+    base_url: &str,
+    code: &str,
+) -> PublicResult<AgentEnrollmentStatusResponse> {
+    let response = client
+        .get(api_endpoint(
+            base_url,
+            &format!("/agents/enrollments/{code}"),
+        ))
+        .send()
+        .await
+        .map_err(|err| map_reqwest_error(err, "agent enrollment lookup"))?;
+    parse_json_response(response, "agent enrollment response").await
+}
+
+pub async fn mint_agent_access_token(
+    client: &reqwest::Client,
+    credentials: &AgentCredentials,
+) -> PublicResult<AgentTokenResponse> {
+    let seed = load_agent_seed(credentials)?
+        .ok_or_else(|| PublicError::validation("agent seed missing from local secure storage"))?;
+    let key_material = agent_key_material_from_seed(seed)?;
+    let assertion = build_agent_assertion(&credentials.agent_id, &key_material.signing_key)?;
+    let response = client
+        .post(api_endpoint(&credentials.api_url, "/auth/agents/token"))
+        .json(&AgentTokenRequestBody { assertion })
+        .send()
+        .await
+        .map_err(|err| map_reqwest_error(err, "agent token mint"))?;
+    parse_json_response(response, "agent token response").await
 }
 
 pub fn auth_response_to_credentials(api_url: &str, response: AuthResponse) -> Credentials {
@@ -456,9 +751,54 @@ fn expires_at_from(now: DateTime<Utc>, expires_in_seconds: u64) -> DateTime<Utc>
     now + chrono::Duration::seconds(expires_in_seconds as i64)
 }
 
+fn api_endpoint(base_url: &str, path: &str) -> String {
+    format!("{}{}", base_url.trim_end_matches('/'), path)
+}
+
 enum PersistedDataKeyBackend {
     PlatformKeyring,
     TestDirectory(PathBuf),
+}
+
+fn hkdf_expand_label(seed: &[u8; KEY_SIZE], label: &[u8]) -> PublicResult<[u8; KEY_SIZE]> {
+    let hkdf = Hkdf::<Sha256>::new(None, seed);
+    let mut output = [0u8; KEY_SIZE];
+    hkdf.expand(label, &mut output)
+        .map_err(|err| PublicError::crypto(format!("hkdf expansion failed: {err}")))?;
+    Ok(output)
+}
+
+fn getrandom_fill(bytes: &mut [u8]) -> PublicResult<()> {
+    let mut rng = OsRng;
+    rng.try_fill_bytes(bytes)
+        .map_err(|err| PublicError::crypto(format!("os random generation failed: {err}")))
+}
+
+fn build_agent_assertion(agent_id: &Uuid, signing_key: &SigningKey) -> PublicResult<String> {
+    let now = Utc::now().timestamp();
+    let header_json = serde_json::json!({
+        "alg": "EdDSA",
+        "typ": "JWT",
+    });
+    let claims_json = serde_json::json!({
+        "iss": agent_id,
+        "aud": "worklist.api",
+        "jti": Uuid::now_v7(),
+        "iat": now,
+        "exp": now + 60,
+    });
+    let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header_json).map_err(|err| {
+        PublicError::unexpected(format!("failed to serialize JWT header: {err}"))
+    })?);
+    let claims_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims_json).map_err(|err| {
+        PublicError::unexpected(format!("failed to serialize JWT claims: {err}"))
+    })?);
+    let signing_input = format!("{header_b64}.{claims_b64}");
+    let signature = signing_key.sign(signing_input.as_bytes()).to_bytes();
+    Ok(format!(
+        "{signing_input}.{}",
+        URL_SAFE_NO_PAD.encode(signature)
+    ))
 }
 
 impl PersistedDataKeyBackend {
@@ -509,10 +849,166 @@ fn persisted_data_key_backend() -> PersistedDataKeyBackend {
     }
 }
 
+pub fn save_agent_seed(credentials: &AgentCredentials, seed: &[u8; KEY_SIZE]) -> PublicResult<()> {
+    if should_force_agent_seed_file_backend() {
+        return save_agent_seed_to_file(credentials, seed);
+    }
+
+    let entry = agent_seed_keyring_entry(credentials)?;
+    match entry.set_secret(seed) {
+        Ok(()) => {
+            let _ = clear_agent_seed_file(credentials);
+            Ok(())
+        }
+        Err(err) if should_fallback_from_keyring(&err) => {
+            save_agent_seed_to_file(credentials, seed)
+        }
+        Err(err) => Err(map_keyring_error(
+            "write agent seed to the platform keychain",
+            err,
+        )),
+    }
+}
+
+pub fn load_agent_seed(credentials: &AgentCredentials) -> PublicResult<Option<[u8; KEY_SIZE]>> {
+    if should_force_agent_seed_file_backend() {
+        return load_agent_seed_from_file(credentials);
+    }
+
+    let entry = agent_seed_keyring_entry(credentials)?;
+    match entry.get_secret() {
+        Ok(secret) => Ok(Some(decode_agent_seed_bytes(
+            secret,
+            "agent seed in keychain",
+        )?)),
+        Err(keyring::Error::NoEntry) => load_agent_seed_from_file(credentials),
+        Err(err) if should_fallback_from_keyring(&err) => load_agent_seed_from_file(credentials),
+        Err(err) => Err(map_keyring_error(
+            "read agent seed from the platform keychain",
+            err,
+        )),
+    }
+}
+
+pub fn clear_agent_seed(credentials: &AgentCredentials) -> PublicResult<()> {
+    if should_force_agent_seed_file_backend() {
+        return clear_agent_seed_file(credentials);
+    }
+
+    let entry = agent_seed_keyring_entry(credentials)?;
+    match entry.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => clear_agent_seed_file(credentials),
+        Err(err) if should_fallback_from_keyring(&err) => clear_agent_seed_file(credentials),
+        Err(err) => Err(map_keyring_error(
+            "clear the agent seed platform keychain entry",
+            err,
+        )),
+    }
+}
+
 fn platform_keyring_entry(credentials: &Credentials) -> PublicResult<keyring::Entry> {
     let entry_name = persisted_data_key_entry_name(credentials)?;
     keyring::Entry::new(DATA_KEY_KEYCHAIN_SERVICE, &entry_name)
         .map_err(|err| map_keyring_error("create the platform keychain entry", err))
+}
+
+fn agent_seed_keyring_entry(credentials: &AgentCredentials) -> PublicResult<keyring::Entry> {
+    let entry_name = agent_seed_entry_name(credentials);
+    keyring::Entry::new(AGENT_SEED_KEYCHAIN_SERVICE, &entry_name)
+        .map_err(|err| map_keyring_error("create the agent seed keychain entry", err))
+}
+
+fn should_force_agent_seed_file_backend() -> bool {
+    matches!(
+        std::env::var(AGENT_SEED_FILE_ONLY_ENV),
+        Ok(value) if matches!(value.trim(), "1" | "true" | "yes" | "on")
+    )
+}
+
+fn should_fallback_from_keyring(err: &keyring::Error) -> bool {
+    matches!(
+        err,
+        keyring::Error::PlatformFailure(_) | keyring::Error::NoStorageAccess(_)
+    )
+}
+
+fn decode_agent_seed_bytes(secret: Vec<u8>, source: &str) -> PublicResult<[u8; KEY_SIZE]> {
+    if secret.len() != KEY_SIZE {
+        return Err(PublicError::validation(format!(
+            "{source} has invalid length",
+        )));
+    }
+
+    let mut output = [0u8; KEY_SIZE];
+    output.copy_from_slice(&secret);
+    Ok(output)
+}
+
+fn agent_seed_file_path(credentials: &AgentCredentials) -> PublicResult<PathBuf> {
+    let entry_name = agent_seed_entry_name(credentials);
+    let file_name = format!(
+        "agent-seed-{}.bin",
+        URL_SAFE_NO_PAD.encode(Sha256::digest(entry_name.as_bytes()))
+    );
+    Ok(config_dir()?.join(file_name))
+}
+
+fn agent_seed_entry_name(credentials: &AgentCredentials) -> String {
+    format!(
+        "{}::{}",
+        normalize_api_url(&credentials.api_url),
+        credentials.agent_id
+    )
+}
+
+fn load_agent_seed_from_file(
+    credentials: &AgentCredentials,
+) -> PublicResult<Option<[u8; KEY_SIZE]>> {
+    let path = agent_seed_file_path(credentials)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let secret = fs::read(&path).map_err(|err| {
+        PublicError::unexpected(format!(
+            "failed to read the local agent seed file {}: {err}",
+            path.display()
+        ))
+    })?;
+    Ok(Some(decode_agent_seed_bytes(
+        secret,
+        "local agent seed file",
+    )?))
+}
+
+fn save_agent_seed_to_file(
+    credentials: &AgentCredentials,
+    seed: &[u8; KEY_SIZE],
+) -> PublicResult<()> {
+    ensure_config_dir()?;
+    let path = agent_seed_file_path(credentials)?;
+    fs::write(&path, seed).map_err(|err| {
+        PublicError::unexpected(format!(
+            "failed to write the local agent seed file {}: {err}",
+            path.display()
+        ))
+    })?;
+    set_secret_file_permissions(&path)?;
+    Ok(())
+}
+
+fn clear_agent_seed_file(credentials: &AgentCredentials) -> PublicResult<()> {
+    let path = agent_seed_file_path(credentials)?;
+    if !path.exists() {
+        return Ok(());
+    }
+
+    fs::remove_file(&path).map_err(|err| {
+        PublicError::unexpected(format!(
+            "failed to remove the local agent seed file {}: {err}",
+            path.display()
+        ))
+    })
 }
 
 fn persisted_data_key_entry_name(credentials: &Credentials) -> PublicResult<String> {
@@ -683,7 +1179,52 @@ fn set_secret_file_permissions(_path: &Path) -> PublicResult<()> {
 mod tests {
     use super::*;
     use chrono::Duration;
+    use std::{
+        ffi::OsString,
+        sync::{Mutex, OnceLock},
+    };
     use tempfile::TempDir;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set_path(key: &'static str, value: &std::path::Path) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+
+        fn set_value(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => unsafe {
+                    std::env::set_var(self.key, value);
+                },
+                None => unsafe {
+                    std::env::remove_var(self.key);
+                },
+            }
+        }
+    }
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     fn test_credentials() -> Credentials {
         Credentials {
@@ -698,13 +1239,41 @@ mod tests {
         }
     }
 
+    fn test_agent_credentials() -> AgentCredentials {
+        AgentCredentials {
+            api_url: "https://worklist.example.test".to_string(),
+            agent_id: Uuid::now_v7(),
+            owner_user_id: None,
+            handle: Some("fixture-agent".to_string()),
+            display_name: Some("Fixture Agent".to_string()),
+            access_token: Some("agent-access".to_string()),
+            access_expires_at: Some(Utc::now() + Duration::hours(1)),
+        }
+    }
+
+    fn assert_agent_credentials_eq(actual: &AgentCredentials, expected: &AgentCredentials) {
+        assert_eq!(actual.api_url, expected.api_url);
+        assert_eq!(actual.agent_id, expected.agent_id);
+        assert_eq!(actual.owner_user_id, expected.owner_user_id);
+        assert_eq!(actual.handle, expected.handle);
+        assert_eq!(actual.display_name, expected.display_name);
+        assert_eq!(actual.access_token, expected.access_token);
+        assert_eq!(
+            actual
+                .access_expires_at
+                .map(|value| value.timestamp_micros()),
+            expected
+                .access_expires_at
+                .map(|value| value.timestamp_micros())
+        );
+    }
+
     #[test]
     fn test_persisted_data_key_round_trips_through_test_backend() {
+        let _guard = env_lock().lock().expect("env lock");
         let temp = TempDir::new().expect("temp dir");
         let credentials = test_credentials();
-        unsafe {
-            std::env::set_var(TEST_KEYCHAIN_DIR_ENV, temp.path());
-        }
+        let _keychain_dir = EnvVarGuard::set_path(TEST_KEYCHAIN_DIR_ENV, temp.path());
 
         save_persisted_data_key(&credentials, b"secret").expect("store key");
         let loaded = load_persisted_data_key(&credentials).expect("load key");
@@ -724,9 +1293,147 @@ mod tests {
             persisted_data_key_status(&credentials),
             PersistedDataKeyStatus::Missing
         );
+    }
 
-        unsafe {
-            std::env::remove_var(TEST_KEYCHAIN_DIR_ENV);
-        }
+    #[test]
+    fn agent_seed_round_trips_through_file_backend() {
+        let _guard = env_lock().lock().expect("env lock");
+        let temp = TempDir::new().expect("temp dir");
+        let credentials = test_agent_credentials();
+        let _home = EnvVarGuard::set_path("HOME", temp.path());
+        let _file_backend = EnvVarGuard::set_value(AGENT_SEED_FILE_ONLY_ENV, "1");
+
+        save_agent_seed(&credentials, &[0x5A; KEY_SIZE]).expect("store agent seed");
+        let loaded = load_agent_seed(&credentials).expect("load agent seed");
+
+        assert_eq!(loaded, Some([0x5A; KEY_SIZE]));
+
+        clear_agent_seed(&credentials).expect("clear agent seed");
+        assert_eq!(
+            load_agent_seed(&credentials).expect("reload agent seed"),
+            None
+        );
+    }
+
+    #[test]
+    fn agent_key_material_derives_recipient_public_key_from_private_key() {
+        let material = agent_key_material_from_seed([0x5A; KEY_SIZE]).expect("derive key material");
+        let recipient_private = X25519StaticSecret::from(material.recipient_private_key);
+        let expected_public_key = X25519PublicKey::from(&recipient_private).to_bytes();
+
+        assert_eq!(material.recipient_public_key, expected_public_key);
+    }
+
+    #[test]
+    fn build_agent_assertion_includes_unique_jti() {
+        let agent_id = Uuid::now_v7();
+        let material = agent_key_material_from_seed([0x5B; KEY_SIZE]).expect("derive key material");
+        let first =
+            build_agent_assertion(&agent_id, &material.signing_key).expect("first assertion");
+        let second =
+            build_agent_assertion(&agent_id, &material.signing_key).expect("second assertion");
+
+        let first_jti = assertion_jti(&first);
+        let second_jti = assertion_jti(&second);
+
+        assert_ne!(first_jti, second_jti);
+        Uuid::parse_str(&first_jti).expect("jti should be a UUID");
+        Uuid::parse_str(&second_jti).expect("jti should be a UUID");
+    }
+
+    fn assertion_jti(assertion: &str) -> String {
+        let payload_segment = assertion.split('.').nth(1).expect("JWT payload segment");
+        let payload = URL_SAFE_NO_PAD
+            .decode(payload_segment)
+            .expect("decode JWT payload");
+        let claims: serde_json::Value =
+            serde_json::from_slice(&payload).expect("deserialize JWT payload");
+        claims["jti"].as_str().expect("jti claim").to_string()
+    }
+
+    #[test]
+    fn auto_principal_selection_prefers_the_only_available_user_credentials() {
+        let resolved =
+            select_principal_credentials(PrincipalSelection::Auto, Some(test_credentials()), None)
+                .expect("resolve principal");
+
+        assert!(matches!(resolved, Some(PrincipalCredentials::User(_))));
+    }
+
+    #[test]
+    fn auto_principal_selection_prefers_the_only_available_agent_credentials() {
+        let resolved = select_principal_credentials(
+            PrincipalSelection::Auto,
+            None,
+            Some(test_agent_credentials()),
+        )
+        .expect("resolve principal");
+
+        assert!(matches!(resolved, Some(PrincipalCredentials::Agent(_))));
+    }
+
+    #[test]
+    fn auto_principal_selection_rejects_ambiguous_credentials() {
+        let error = select_principal_credentials(
+            PrincipalSelection::Auto,
+            Some(test_credentials()),
+            Some(test_agent_credentials()),
+        )
+        .expect_err("ambiguous principal selection should fail");
+
+        assert!(
+            matches!(error, PublicError::Validation(ref message) if message.contains("--principal user") && message.contains("--principal agent")),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_user_selection_requires_user_credentials() {
+        let error = select_principal_credentials(
+            PrincipalSelection::User,
+            None,
+            Some(test_agent_credentials()),
+        )
+        .expect_err("missing user credentials should fail");
+
+        assert!(
+            matches!(error, PublicError::Validation(ref message) if message.contains("worklist auth login")),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_agent_selection_requires_agent_credentials() {
+        let error =
+            select_principal_credentials(PrincipalSelection::Agent, Some(test_credentials()), None)
+                .expect_err("missing agent credentials should fail");
+
+        assert!(
+            matches!(error, PublicError::Validation(ref message) if message.contains("worklist agent register")),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn clear_credentials_preserves_agent_credentials() {
+        let _guard = env_lock().lock().expect("env lock");
+        let temp = TempDir::new().expect("temp dir");
+        let _home = EnvVarGuard::set_path("HOME", temp.path());
+        let user_credentials = test_credentials();
+        let agent_credentials = test_agent_credentials();
+
+        save_credentials(&user_credentials).expect("save user credentials");
+        save_agent_credentials(&agent_credentials).expect("save agent credentials");
+
+        clear_credentials().expect("clear user credentials");
+
+        assert!(
+            !credentials_path().expect("credentials path").exists(),
+            "user credentials file should be removed"
+        );
+        let reloaded_agent = load_agent_credentials()
+            .expect("reload agent credentials")
+            .expect("agent credentials should remain");
+        assert_agent_credentials_eq(&reloaded_agent, &agent_credentials);
     }
 }

@@ -14,6 +14,7 @@ publish = ["crates-io"]
 [dependencies]
 argon2.workspace = true
 base64.workspace = true
+chacha20poly1305.workspace = true
 hkdf.workspace = true
 hmac.workspace = true
 serde.workspace = true
@@ -21,5 +22,7 @@ serde_json.workspace = true
 sha2.workspace = true
 strong-box.workspace = true
 uuid.workspace = true
+x25519-dalek.workspace = true
+zeroize.workspace = true
 
 worklist-client-core = { version = "0.1.0", path = "../client-core" }

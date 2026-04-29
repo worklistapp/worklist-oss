@@ -11,16 +11,17 @@ use axum::{
     routing::{get, patch, post},
 };
 use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD_NO_PAD;
+use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
 use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use strong_box::StrongBox;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use uuid::Uuid;
 use worklist_client_api::{AuditPatchFieldRequest, AuditPatchRequest};
-use worklist_client_auth::Credentials;
+use worklist_client_auth::{AgentCredentials, Credentials, normalize_api_url};
 use worklist_client_crypto::{
     ATTACHMENT_BLOB_CONTEXT, ATTACHMENT_BLOB_CONTEXT_LABEL, ATTACHMENT_BLOB_REF_VERSION,
     ATTACHMENT_REF_CONTEXT, AttachmentBlobRef, CommentPayloadBody, FlexibleValue, SealedPayload,
@@ -1575,6 +1576,154 @@ async fn cli_logout_clears_persisted_bootstrap() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_logout_clears_agent_credentials_and_seed_when_agent_is_only_session() {
+    let fixture = TestFixture::new();
+    let state = Arc::new(Mutex::new(TestState::new(fixture.clone())));
+    let server = spawn_server(state).await;
+    let home = TempDir::new().expect("temp home");
+    let agent_credentials = seed_agent_credentials(home.path(), &fixture, &server.base_url);
+    let agent_seed_path = seed_agent_file_backed_secret(home.path(), &agent_credentials);
+
+    let logout_output = run_cli_with_agent_seed_file_backend(
+        home.path(),
+        &server.base_url,
+        &["--json", "auth", "logout"],
+        None,
+    );
+    assert!(
+        logout_output.status.success(),
+        "logout failed: {}",
+        logout_output.stderr
+    );
+
+    let logout_json: Value = parse_stdout_json(&logout_output.stdout);
+    assert_eq!(logout_json["loggedOut"], true);
+    assert!(
+        !agent_credentials_file(home.path()).exists(),
+        "agent credentials file should be removed"
+    );
+    assert!(
+        !agent_seed_path.exists(),
+        "agent seed file should be removed"
+    );
+
+    let status_output = run_cli(
+        home.path(),
+        &server.base_url,
+        &["--json", "auth", "status"],
+        None,
+    );
+    assert!(
+        status_output.status.success(),
+        "status failed: {}",
+        status_output.stderr
+    );
+    let status_json: Value = parse_stdout_json(&status_output.stdout);
+    assert_eq!(status_json["loggedIn"], false);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_logout_with_user_principal_preserves_agent_credentials_and_seed() {
+    let fixture = TestFixture::new();
+    let state = Arc::new(Mutex::new(TestState::new(fixture.clone())));
+    let server = spawn_server(state).await;
+    let home = TempDir::new().expect("temp home");
+    seed_credentials(home.path(), &fixture, &server.base_url);
+    let agent_credentials = seed_agent_credentials(home.path(), &fixture, &server.base_url);
+    let agent_seed_path = seed_agent_file_backed_secret(home.path(), &agent_credentials);
+
+    let logout_output = run_cli_with_agent_seed_file_backend(
+        home.path(),
+        &server.base_url,
+        &["--json", "--principal", "user", "auth", "logout"],
+        None,
+    );
+    assert!(
+        logout_output.status.success(),
+        "logout failed: {}",
+        logout_output.stderr
+    );
+
+    let logout_json: Value = parse_stdout_json(&logout_output.stdout);
+    assert_eq!(logout_json["loggedOut"], true);
+    assert!(
+        !user_credentials_file(home.path()).exists(),
+        "user credentials file should be removed"
+    );
+    assert!(
+        agent_credentials_file(home.path()).exists(),
+        "agent credentials file should remain"
+    );
+    assert!(agent_seed_path.exists(), "agent seed file should remain");
+
+    let status_output = run_cli(
+        home.path(),
+        &server.base_url,
+        &["--json", "--principal", "agent", "auth", "status"],
+        None,
+    );
+    assert!(
+        status_output.status.success(),
+        "agent status failed: {}",
+        status_output.stderr
+    );
+    let status_json: Value = parse_stdout_json(&status_output.stdout);
+    assert_eq!(status_json["principalType"], "agent");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_logout_with_agent_principal_preserves_user_credentials() {
+    let fixture = TestFixture::new();
+    let state = Arc::new(Mutex::new(TestState::new(fixture.clone())));
+    let server = spawn_server(state).await;
+    let home = TempDir::new().expect("temp home");
+    seed_credentials(home.path(), &fixture, &server.base_url);
+    let agent_credentials = seed_agent_credentials(home.path(), &fixture, &server.base_url);
+    let agent_seed_path = seed_agent_file_backed_secret(home.path(), &agent_credentials);
+
+    let logout_output = run_cli_with_agent_seed_file_backend(
+        home.path(),
+        &server.base_url,
+        &["--json", "--principal", "agent", "auth", "logout"],
+        None,
+    );
+    assert!(
+        logout_output.status.success(),
+        "logout failed: {}",
+        logout_output.stderr
+    );
+
+    let logout_json: Value = parse_stdout_json(&logout_output.stdout);
+    assert_eq!(logout_json["loggedOut"], true);
+    assert!(
+        user_credentials_file(home.path()).exists(),
+        "user credentials file should remain"
+    );
+    assert!(
+        !agent_credentials_file(home.path()).exists(),
+        "agent credentials file should be removed"
+    );
+    assert!(
+        !agent_seed_path.exists(),
+        "agent seed file should be removed"
+    );
+
+    let status_output = run_cli(
+        home.path(),
+        &server.base_url,
+        &["--json", "--principal", "user", "auth", "status"],
+        None,
+    );
+    assert!(
+        status_output.status.success(),
+        "user status failed: {}",
+        status_output.stderr
+    );
+    let status_json: Value = parse_stdout_json(&status_output.stdout);
+    assert_eq!(status_json["principalType"], "user");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_json_logout_revoke_warning_is_machine_readable() {
     let fixture = TestFixture::new();
     let state = Arc::new(Mutex::new(TestState::new(fixture.clone())));
@@ -1782,6 +1931,79 @@ async fn cli_status_reports_stored_session_daemon_state_when_api_url_differs() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_status_reports_agent_only_session() {
+    let fixture = TestFixture::new();
+    let state = Arc::new(Mutex::new(TestState::new(fixture.clone())));
+    let server = spawn_server(state).await;
+    let home = TempDir::new().expect("temp home");
+    let agent_credentials = seed_agent_credentials(home.path(), &fixture, &server.base_url);
+
+    let status_output = run_cli(
+        home.path(),
+        &server.base_url,
+        &["--json", "auth", "status"],
+        None,
+    );
+    assert!(
+        status_output.status.success(),
+        "status failed: {}",
+        status_output.stderr
+    );
+
+    let status_json: Value = parse_stdout_json(&status_output.stdout);
+    assert_eq!(status_json["loggedIn"], true);
+    assert_eq!(status_json["principalType"], "agent");
+    assert_eq!(status_json["apiUrl"], server.base_url);
+    assert_eq!(status_json["agentId"], json!(agent_credentials.agent_id));
+    assert_eq!(status_json["ownerUserId"], json!(fixture.owner_user_id));
+    assert_eq!(status_json["handle"], "fixture-agent");
+    assert_eq!(status_json["displayName"], "Fixture Agent");
+    assert_eq!(status_json["sessionState"], "active");
+    assert_eq!(status_json["unlockDaemon"]["active"], false);
+    assert_eq!(status_json["persistedBootstrap"]["status"], "unavailable");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_agent_register_rejects_existing_agent_for_another_api_without_overwriting() {
+    let fixture = TestFixture::new();
+    let state = Arc::new(Mutex::new(TestState::new(fixture.clone())));
+    let server = spawn_server(state).await;
+    let home = TempDir::new().expect("temp home");
+    let existing_api_url = "https://other-worklist.example.test";
+    seed_agent_credentials(home.path(), &fixture, existing_api_url);
+    let agent_credentials_path = agent_credentials_file(home.path());
+    let original_agent_credentials =
+        std::fs::read(&agent_credentials_path).expect("read seeded agent credentials");
+
+    let register_output = run_cli(
+        home.path(),
+        &server.base_url,
+        &[
+            "--json",
+            "agent",
+            "register",
+            "--proposed-handle",
+            "new-agent",
+        ],
+        None,
+    );
+
+    assert!(
+        !register_output.status.success(),
+        "agent register unexpectedly succeeded"
+    );
+    assert_json_error_contains(
+        &register_output.stderr,
+        "agent credentials already exist for https://other-worklist.example.test",
+    );
+    assert_eq!(
+        std::fs::read(&agent_credentials_path).expect("reload agent credentials"),
+        original_agent_credentials,
+        "agent register should preserve the existing global agent credentials"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_json_login_requires_email_non_interactively() {
     let home = TempDir::new().expect("temp home");
 
@@ -1867,6 +2089,208 @@ async fn cli_json_invalid_value_errors_are_machine_readable() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_principal_aware_commands_fail_closed_when_both_credential_types_exist() {
+    let fixture = TestFixture::new();
+    let state = Arc::new(Mutex::new(TestState::new(fixture.clone())));
+    let server = spawn_server(state.clone()).await;
+    let home = TempDir::new().expect("temp home");
+    seed_credentials(home.path(), &fixture, &server.base_url);
+    seed_agent_credentials(home.path(), &fixture, &server.base_url);
+
+    let ambiguous_output = run_cli(
+        home.path(),
+        &server.base_url,
+        &["--json", "lists", "--raw"],
+        None,
+    );
+    assert!(
+        !ambiguous_output.status.success(),
+        "ambiguous principal selection unexpectedly succeeded"
+    );
+    assert_json_error_contains(
+        &ambiguous_output.stderr,
+        "rerun with --principal user or --principal agent",
+    );
+
+    let user_status_output = run_cli(
+        home.path(),
+        &server.base_url,
+        &["--json", "--principal", "user", "auth", "status"],
+        None,
+    );
+    assert!(
+        user_status_output.status.success(),
+        "user status failed: {}",
+        user_status_output.stderr
+    );
+    let user_status_json: Value = parse_stdout_json(&user_status_output.stdout);
+    assert_eq!(user_status_json["principalType"], "user");
+
+    let agent_status_output = run_cli(
+        home.path(),
+        &server.base_url,
+        &["--json", "--principal", "agent", "auth", "status"],
+        None,
+    );
+    assert!(
+        agent_status_output.status.success(),
+        "agent status failed: {}",
+        agent_status_output.stderr
+    );
+    let agent_status_json: Value = parse_stdout_json(&agent_status_output.stdout);
+    assert_eq!(agent_status_json["principalType"], "agent");
+
+    let ambiguous_logout_output = run_cli(
+        home.path(),
+        &server.base_url,
+        &["--json", "auth", "logout"],
+        None,
+    );
+    assert!(
+        !ambiguous_logout_output.status.success(),
+        "ambiguous logout unexpectedly succeeded"
+    );
+    assert_json_error_contains(
+        &ambiguous_logout_output.stderr,
+        "rerun with --principal user or --principal agent",
+    );
+    assert!(
+        user_credentials_file(home.path()).exists(),
+        "ambiguous logout should preserve user credentials"
+    );
+    assert!(
+        agent_credentials_file(home.path()).exists(),
+        "ambiguous logout should preserve agent credentials"
+    );
+
+    let user_output = run_cli(
+        home.path(),
+        &server.base_url,
+        &["--json", "--principal", "user", "lists", "--raw"],
+        None,
+    );
+    assert!(
+        user_output.status.success(),
+        "explicit user principal failed: {}",
+        user_output.stderr
+    );
+    {
+        let state = state.lock().expect("state lock");
+        assert_eq!(state.last_authorization_token.as_deref(), Some("user"));
+    }
+
+    let agent_output = run_cli(
+        home.path(),
+        &server.base_url,
+        &["--json", "--principal", "agent", "lists", "--raw"],
+        None,
+    );
+    assert!(
+        agent_output.status.success(),
+        "explicit agent principal failed: {}",
+        agent_output.stderr
+    );
+    {
+        let state = state.lock().expect("state lock");
+        assert_eq!(state.last_authorization_token.as_deref(), Some("agent"));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_task_create_rejects_agent_only_credentials_before_request() {
+    let fixture = TestFixture::new();
+    let state = Arc::new(Mutex::new(TestState::new(fixture.clone())));
+    let server = spawn_server(state.clone()).await;
+    let home = TempDir::new().expect("temp home");
+    seed_agent_credentials(home.path(), &fixture, &server.base_url);
+
+    let output = run_cli(
+        home.path(),
+        &server.base_url,
+        &[
+            "--json",
+            "tasks",
+            "create",
+            "--work-list-id",
+            &fixture.work_list_id.to_string(),
+            "--input-file",
+            write_json_file(
+                home.path(),
+                "agent-task-create.json",
+                &json!({
+                    "title": "Agent task",
+                    "body": "Agent-created task body"
+                }),
+            )
+            .to_str()
+            .expect("utf8 path"),
+        ],
+        None,
+    );
+
+    assert!(
+        !output.status.success(),
+        "agent-backed task create unexpectedly succeeded"
+    );
+    assert_json_error_contains(&output.stderr, "task creation requires user credentials");
+    assert_json_error_contains(&output.stderr, "--principal user");
+    let state = state.lock().expect("state lock");
+    assert!(
+        state.created_task_body.is_none(),
+        "task create request should not reach the server"
+    );
+    assert!(
+        state.last_authorization_token.is_none(),
+        "agent token should not be used for unsupported task creation"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_comment_create_rejects_explicit_agent_principal_before_request() {
+    let fixture = TestFixture::new();
+    let state = Arc::new(Mutex::new(TestState::new(fixture.clone())));
+    let server = spawn_server(state.clone()).await;
+    let home = TempDir::new().expect("temp home");
+    seed_credentials(home.path(), &fixture, &server.base_url);
+    seed_agent_credentials(home.path(), &fixture, &server.base_url);
+
+    let output = run_cli(
+        home.path(),
+        &server.base_url,
+        &[
+            "--json",
+            "--principal",
+            "agent",
+            "comments",
+            "create",
+            "--work-list-id",
+            &fixture.work_list_id.to_string(),
+            "--task-id",
+            &fixture.task_id.to_string(),
+            "--body",
+            "Agent comment",
+        ],
+        None,
+    );
+
+    assert!(
+        !output.status.success(),
+        "agent-backed comment create unexpectedly succeeded"
+    );
+    assert_json_error_contains(&output.stderr, "comment creation requires user credentials");
+    assert_json_error_contains(&output.stderr, "--principal user");
+    let state = state.lock().expect("state lock");
+    assert!(
+        state.created_comment_body.is_none(),
+        "comment create request should not reach the server"
+    );
+    assert!(
+        state.last_authorization_token.is_none(),
+        "agent token should not be used for unsupported comment creation"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_decrypted_commands_fail_non_interactively_without_unlock_or_keychain() {
     let fixture = TestFixture::new();
     let state = Arc::new(Mutex::new(TestState::new(fixture.clone())));
@@ -1922,6 +2346,7 @@ struct TestAttachmentFixture {
 struct TestFixture {
     password: String,
     access_token: String,
+    agent_access_token: String,
     refresh_token: String,
     work_list_id: Uuid,
     task_id: Uuid,
@@ -1949,7 +2374,9 @@ struct TestFixture {
 struct TestState {
     fixture: TestFixture,
     current_access_token: String,
+    current_agent_access_token: String,
     current_refresh_token: String,
+    last_authorization_token: Option<String>,
     logout_status: StatusCode,
     refresh_request_count: usize,
     created_task_body: Option<TaskPayloadBody>,
@@ -1978,7 +2405,9 @@ impl TestState {
     fn new(fixture: TestFixture) -> Self {
         Self {
             current_access_token: fixture.access_token.clone(),
+            current_agent_access_token: fixture.agent_access_token.clone(),
             current_refresh_token: fixture.refresh_token.clone(),
+            last_authorization_token: None,
             logout_status: StatusCode::OK,
             refresh_request_count: 0,
             fixture,
@@ -2128,6 +2557,7 @@ impl TestFixture {
         Self {
             password,
             access_token: "test-access-token".to_string(),
+            agent_access_token: "agent-access-token".to_string(),
             refresh_token: "refresh-token".to_string(),
             work_list_id,
             task_id,
@@ -2978,6 +3408,30 @@ fn run_cli_with_test_keychain(
     }
 }
 
+fn run_cli_with_agent_seed_file_backend(
+    home: &std::path::Path,
+    api_url: &str,
+    args: &[&str],
+    stdin: Option<&str>,
+) -> CliOutput {
+    let mut command = Command::cargo_bin("worklist").expect("binary");
+    command.env("HOME", home);
+    command.env("WORKLIST_AGENT_SEED_FILE_ONLY", "1");
+    command.current_dir(home);
+    command.arg("--api-url").arg(api_url);
+    command.args(args);
+    if let Some(stdin) = stdin {
+        command.write_stdin(stdin.to_string());
+    }
+
+    let output = command.output().expect("run cli");
+    CliOutput {
+        status: output.status,
+        stdout: String::from_utf8(output.stdout).expect("stdout utf8"),
+        stderr: String::from_utf8(output.stderr).expect("stderr utf8"),
+    }
+}
+
 fn run_cli_in_dir(
     home: &std::path::Path,
     current_dir: &std::path::Path,
@@ -3010,6 +3464,66 @@ fn seed_credentials(home: &std::path::Path, fixture: &TestFixture, api_url: &str
         Utc::now() + Duration::hours(1),
         Utc::now() + Duration::days(1),
     );
+}
+
+fn seed_agent_credentials(
+    home: &std::path::Path,
+    fixture: &TestFixture,
+    api_url: &str,
+) -> AgentCredentials {
+    let credentials = AgentCredentials {
+        api_url: api_url.to_string(),
+        agent_id: Uuid::now_v7(),
+        owner_user_id: Some(fixture.owner_user_id),
+        handle: Some("fixture-agent".to_string()),
+        display_name: Some("Fixture Agent".to_string()),
+        access_token: Some(fixture.agent_access_token.clone()),
+        access_expires_at: Some(Utc::now() + Duration::hours(1)),
+    };
+
+    let config_dir = home.join(".worklist");
+    std::fs::create_dir_all(&config_dir).expect("create config dir");
+    let path = config_dir.join("agent.json");
+    std::fs::write(
+        path,
+        serde_json::to_vec_pretty(&credentials).expect("serialize agent creds"),
+    )
+    .expect("write agent creds");
+
+    credentials
+}
+
+fn seed_agent_file_backed_secret(
+    home: &std::path::Path,
+    credentials: &AgentCredentials,
+) -> std::path::PathBuf {
+    let path = agent_seed_file_path(home, credentials);
+    std::fs::write(&path, [0x5A; 32]).expect("write agent seed");
+    path
+}
+
+fn agent_seed_file_path(
+    home: &std::path::Path,
+    credentials: &AgentCredentials,
+) -> std::path::PathBuf {
+    let entry_name = format!(
+        "{}::{}",
+        normalize_api_url(&credentials.api_url),
+        credentials.agent_id
+    );
+    let file_name = format!(
+        "agent-seed-{}.bin",
+        URL_SAFE_NO_PAD.encode(Sha256::digest(entry_name.as_bytes()))
+    );
+    home.join(".worklist").join(file_name)
+}
+
+fn user_credentials_file(home: &std::path::Path) -> std::path::PathBuf {
+    home.join(".worklist").join("credentials.json")
+}
+
+fn agent_credentials_file(home: &std::path::Path) -> std::path::PathBuf {
+    home.join(".worklist").join("agent.json")
 }
 
 fn seed_credentials_with_expiry(
@@ -3045,11 +3559,22 @@ fn authorize(state: &Arc<Mutex<TestState>>, headers: &HeaderMap) {
         .get("authorization")
         .and_then(|value| value.to_str().ok())
         .expect("authorization header");
-    let expected = {
-        let state = state.lock().expect("state lock");
-        format!("Bearer {}", state.current_access_token)
-    };
-    assert_eq!(token, expected);
+    let mut state = state.lock().expect("state lock");
+    let expected_user = format!("Bearer {}", state.current_access_token);
+    let expected_agent = format!("Bearer {}", state.current_agent_access_token);
+
+    if token == expected_user {
+        state.last_authorization_token = Some("user".to_string());
+        return;
+    }
+    if token == expected_agent {
+        state.last_authorization_token = Some("agent".to_string());
+        return;
+    }
+
+    panic!(
+        "unexpected authorization header: {token} (expected {expected_user} or {expected_agent})"
+    );
 }
 
 fn decode_b64(value: &str) -> Vec<u8> {
