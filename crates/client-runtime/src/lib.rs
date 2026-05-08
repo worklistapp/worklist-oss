@@ -1,22 +1,18 @@
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
-mod unlock_daemon;
+use std::collections::HashMap;
+use std::io::{self, Read};
 
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use rpassword::prompt_password;
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
-use std::io::{self, Read};
-use std::path::Path;
 use uuid::Uuid;
 use worklist_client_api::{
     ApproveAgentGrantRequest, ArchiveTaskRequest, CommentResponse, CreateCommentRequest,
-    CreateTaskRequest, CurrentUserResponse, DashboardStatsResponse, DeleteCommentRequest,
-    DeleteTaskRequest, DownloadAttachmentResponse, MembershipResponse, MoveTaskRequest,
-    MyTaskResponse, PublicApiClient, TaskResponse, UnarchiveTaskRequest, UpdateCommentRequest,
-    UpdateTaskRequest, WorkListDetailResponse, WorkListResponse,
+    CreateTaskRequest, CurrentUserResponse, DashboardStatsResponse, MembershipResponse,
+    MoveTaskRequest, MyTaskResponse, PublicApiClient, TaskResponse, UnarchiveTaskRequest,
+    UpdateCommentRequest, UpdateTaskRequest, WorkListDetailResponse, WorkListResponse,
 };
 use worklist_client_auth::{
     AgentCredentials, AgentEnrollmentResponse, Credentials, PersistedDataKeyStatus,
@@ -27,183 +23,32 @@ use worklist_client_auth::{
 };
 use worklist_client_core::{PublicError, PublicResult};
 use worklist_client_crypto::{
-    AttachmentBlobRef, ChecklistItemPayload, CommentPayloadBody, FlexibleValue, SymmetricKey,
-    TaskPayloadBody, TaskPayloadRichText, build_comment_payload_envelope,
-    build_task_payload_envelope, compute_payload_proof, decode_attachment_blob_key,
-    decode_sealed_blob, decrypt_agent_work_list_key, decrypt_attachment_bytes,
-    decrypt_comment_payload, decrypt_task_payload, decrypt_text_value, decrypt_user_data_key,
-    decrypt_work_list_key, decrypt_work_list_payload, derive_payload_binding_key,
-    derive_work_list_key, encrypt_agent_work_list_key, encrypt_comment_payload,
-    encrypt_task_payload, flexible_value_to_json, plaintext_rich_text, seal_text_value,
+    CommentPayloadBody, FlexibleValue, SymmetricKey, TaskPayloadBody, TaskPayloadRichText,
+    build_comment_payload_envelope, build_task_payload_envelope, compute_payload_proof,
+    decode_attachment_blob_key, decode_sealed_blob, decrypt_agent_work_list_key,
+    decrypt_comment_payload, decrypt_task_payload, decrypt_task_title, decrypt_user_data_key,
+    decrypt_work_list_description, decrypt_work_list_key, decrypt_work_list_payload,
+    decrypt_work_list_title, derive_payload_binding_key, derive_work_list_key,
+    encrypt_agent_work_list_key, encrypt_comment_payload, encrypt_task_payload,
+    flexible_value_to_json, plaintext_rich_text, seal_task_title,
 };
 
+use crate::attachments::{
+    AttachmentReadStrategy, ResolvedTaskAttachmentDownload, build_readable_attachment,
+    download_and_decrypt_attachment, find_task_attachment, unsupported_attachment_read_error,
+};
+
+pub use models::*;
 pub use unlock_daemon::{
     SessionKey, UnlockStatus, clear_session, fetch_data_key, lock, serve, session_key, socket_path,
     unlock, unlock_status,
 };
 
+mod attachments;
+mod models;
+mod unlock_daemon;
+
 const DEFAULT_AUTO_UNLOCK_TTL_SECONDS: u64 = 8 * 60 * 60;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ReadError {
-    pub code: String,
-    pub message: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentMembership {
-    pub id: Uuid,
-    pub user_id: Uuid,
-    pub user_email: String,
-    pub user_name: String,
-    pub user_avatar_color: String,
-    pub role: String,
-    pub status: String,
-    pub expires_at: Option<DateTime<Utc>>,
-    pub joined_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentWorkListSummary {
-    pub id: Uuid,
-    pub owner_user_id: Uuid,
-    pub workspace_id: Uuid,
-    pub timezone: String,
-    pub section_snapshots: Vec<worklist_client_api::SectionSnapshotPayload>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-    pub membership: AgentMembership,
-    pub title: Option<String>,
-    pub description: Option<String>,
-    pub payload: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub read_error: Option<ReadError>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentWorkListDetail {
-    #[serde(flatten)]
-    pub work_list: AgentWorkListSummary,
-    pub members: Vec<AgentMembership>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentDelegation {
-    pub id: Uuid,
-    pub task_id: Uuid,
-    pub membership_id: Uuid,
-    pub role: String,
-    pub status: String,
-    pub note_present: bool,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentAttachment {
-    pub id: Uuid,
-    pub file_name: String,
-    pub content_type: String,
-    pub size_bytes: u64,
-    #[serde(skip_serializing, skip_deserializing, default)]
-    blob_key: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentTaskSummary {
-    pub id: Uuid,
-    pub work_list_id: Uuid,
-    pub work_list_title: Option<String>,
-    pub created_by_membership_id: Uuid,
-    pub section_id: Option<Uuid>,
-    pub priority: Option<i8>,
-    pub position: Option<String>,
-    pub due_at: Option<DateTime<Utc>>,
-    pub start_at: Option<DateTime<Utc>>,
-    pub completed_at: Option<DateTime<Utc>>,
-    pub archived_at: Option<DateTime<Utc>>,
-    pub is_completed: bool,
-    pub recurrence_id: Option<Uuid>,
-    pub recurrence_schedule: Option<String>,
-    pub recurrence_iteration: Option<i64>,
-    pub materialized_at: Option<DateTime<Utc>>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-    pub comment_count: i64,
-    pub title: Option<String>,
-    pub body_markdown: Option<String>,
-    pub body_rich_text: Option<TaskPayloadRichText>,
-    pub checklist: Option<Vec<ChecklistItemPayload>>,
-    pub attachments: Option<Vec<AgentAttachment>>,
-    pub references: Option<Vec<Value>>,
-    pub mentions: Option<Vec<String>>,
-    pub client_meta: Option<Value>,
-    pub recurrence_state: Option<Value>,
-    pub delegations: Vec<AgentDelegation>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub read_error: Option<ReadError>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentComment {
-    pub id: Uuid,
-    pub task_id: Uuid,
-    pub author_membership_id: Uuid,
-    pub body_markdown: Option<String>,
-    pub content: Option<TaskPayloadRichText>,
-    pub mentions: Option<Vec<String>>,
-    pub attachments: Option<Vec<AgentAttachment>>,
-    pub client_meta: Option<Value>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub read_error: Option<ReadError>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentTaskDetail {
-    #[serde(flatten)]
-    pub task: AgentTaskSummary,
-    pub comments: Vec<AgentComment>,
-}
-
-#[derive(Debug, Clone)]
-pub struct DownloadedAttachment {
-    pub attachment: AgentAttachment,
-    pub bytes: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ReadableAttachmentContentFormat {
-    Text,
-    Markdown,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ReadableAttachmentSourceKind {
-    PlainText,
-    DocxRendered,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ReadableAttachment {
-    pub attachment: AgentAttachment,
-    pub text: String,
-    pub content_format: ReadableAttachmentContentFormat,
-    pub source_kind: ReadableAttachmentSourceKind,
-}
 
 #[derive(Debug, Clone)]
 pub struct RuntimeClient {
@@ -255,110 +100,6 @@ struct TaskProjectionInput<'a> {
     payload_ciphertext: &'a str,
     list_key: Option<&'a SymmetricKey>,
     inherited_error: Option<ReadError>,
-}
-
-#[derive(Debug)]
-struct ResolvedTaskAttachmentDownload {
-    attachment: AgentAttachment,
-    blob_ref: AttachmentBlobRef,
-    download: DownloadAttachmentResponse,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum AttachmentReadStrategy {
-    Utf8Text,
-    DocxMarkdown,
-    Unsupported,
-}
-
-const DOCX_CONTENT_TYPE: &str =
-    "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TaskCreateInput {
-    pub title: String,
-    pub body: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TaskUpdateInput {
-    pub title: Option<String>,
-    pub body: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CommentInput {
-    pub body: String,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MoveTaskInput {
-    pub section_id: Option<Uuid>,
-    pub insert_before_task_id: Option<Uuid>,
-}
-
-impl AgentAttachment {
-    fn blob_key(&self) -> &[u8] {
-        &self.blob_key
-    }
-
-    #[must_use]
-    fn read_strategy(&self) -> AttachmentReadStrategy {
-        if content_type_is_docx(&self.content_type) {
-            return AttachmentReadStrategy::DocxMarkdown;
-        }
-
-        if content_type_is_textual(&self.content_type) {
-            return AttachmentReadStrategy::Utf8Text;
-        }
-
-        if file_extension_is_docx(&self.file_name) {
-            return AttachmentReadStrategy::DocxMarkdown;
-        }
-
-        if file_extension_is_textual(&self.file_name) {
-            return AttachmentReadStrategy::Utf8Text;
-        }
-
-        AttachmentReadStrategy::Unsupported
-    }
-
-    #[must_use]
-    fn readable_content_format(
-        &self,
-        read_strategy: AttachmentReadStrategy,
-    ) -> ReadableAttachmentContentFormat {
-        match read_strategy {
-            AttachmentReadStrategy::Utf8Text => {
-                if content_type_is_markdown(&self.content_type)
-                    || file_extension_is_markdown(&self.file_name)
-                {
-                    ReadableAttachmentContentFormat::Markdown
-                } else {
-                    ReadableAttachmentContentFormat::Text
-                }
-            }
-            AttachmentReadStrategy::DocxMarkdown => ReadableAttachmentContentFormat::Markdown,
-            AttachmentReadStrategy::Unsupported => {
-                unreachable!("unsupported attachments are rejected before render")
-            }
-        }
-    }
-}
-
-impl AttachmentReadStrategy {
-    #[must_use]
-    fn source_kind(self) -> ReadableAttachmentSourceKind {
-        match self {
-            Self::Utf8Text => ReadableAttachmentSourceKind::PlainText,
-            Self::DocxMarkdown => ReadableAttachmentSourceKind::DocxRendered,
-            Self::Unsupported => unreachable!("unsupported attachments are rejected before render"),
-        }
-    }
 }
 
 impl RuntimeClient {
@@ -768,7 +509,7 @@ impl RuntimeClient {
         };
         let envelope = build_task_payload_envelope(task_body, 1);
         let payload_ciphertext = encrypt_task_payload(&envelope, list_key)?;
-        let title_ciphertext = seal_text_value(normalized_title)?;
+        let title_ciphertext = seal_task_title(normalized_title, list_key)?;
         let payload_proof = compute_payload_proof(&payload_ciphertext.bytes, &binding_key)?;
         let title_proof = compute_payload_proof(&title_ciphertext.bytes, &binding_key)?;
 
@@ -852,7 +593,7 @@ impl RuntimeClient {
             if normalized_title.is_empty() {
                 return Err(PublicError::validation("title cannot be empty"));
             }
-            let title_ciphertext = seal_text_value(normalized_title)?;
+            let title_ciphertext = seal_task_title(normalized_title, list_key)?;
             let title_proof = compute_payload_proof(&title_ciphertext.bytes, &binding_key)?;
             request.title_ciphertext = Some(title_ciphertext.base64);
             request.title_ciphertext_proof = Some(title_proof);
@@ -1177,37 +918,35 @@ impl RuntimeClient {
         work_list: &WorkListResponse,
         key_source: Option<&PrincipalWorkListKeySource>,
     ) -> WorkListContext {
-        let fallback_title = decode_text_fallback(&work_list.title_ciphertext);
-        match key_source {
-            Some(key_source) => match resolve_work_list_key_for_principal_source(
-                key_source,
-                work_list.id,
-                &work_list.membership.work_list_key_ciphertext,
-            ) {
-                Ok(list_key) => {
-                    let payload =
-                        decode_work_list_payload_value(&list_key, &work_list.payload_ciphertext);
-                    let title = payload
-                        .as_ref()
-                        .ok()
-                        .and_then(extract_work_list_title)
-                        .or(fallback_title.clone());
-                    WorkListContext {
-                        work_list_title: title,
-                        list_key: Some(list_key),
-                        read_error: payload
-                            .err()
-                            .map(|err| make_read_error("work_list_payload", err)),
-                    }
-                }
-                Err(err) => unreadable_work_list_context(
-                    fallback_title,
-                    make_read_error("work_list_key", err),
-                ),
-            },
-            None => {
-                unreadable_work_list_context(fallback_title, missing_work_list_key_source_error())
+        let Some(key_source) = key_source else {
+            return unreadable_work_list_context(None, missing_work_list_key_source_error());
+        };
+
+        let list_key = match resolve_work_list_key_for_principal_source(
+            key_source,
+            work_list.id,
+            &work_list.membership.work_list_key_ciphertext,
+        ) {
+            Ok(list_key) => list_key,
+            Err(err) => {
+                return unreadable_work_list_context(None, make_read_error("work_list_key", err));
             }
+        };
+
+        let fallback_title =
+            decode_work_list_title_fallback(&work_list.title_ciphertext, &list_key);
+        let payload = decode_work_list_payload_value(&list_key, &work_list.payload_ciphertext);
+        let title = payload
+            .as_ref()
+            .ok()
+            .and_then(extract_work_list_title)
+            .or(fallback_title);
+        WorkListContext {
+            work_list_title: title,
+            list_key: Some(list_key),
+            read_error: payload
+                .err()
+                .map(|err| make_read_error("work_list_payload", err)),
         }
     }
 
@@ -1216,69 +955,64 @@ impl RuntimeClient {
         work_list: WorkListResponse,
         key_source: Option<&PrincipalWorkListKeySource>,
     ) -> AgentWorkListSummary {
-        let fallback_title = decode_text_fallback(&work_list.title_ciphertext);
-        let fallback_description = work_list
-            .description_ciphertext
-            .as_deref()
-            .and_then(decode_text_fallback);
         let membership = project_membership(&work_list.membership);
 
-        match key_source {
-            Some(key_source) => self.project_work_list_summary_with_key_source(
+        let Some(key_source) = key_source else {
+            return build_work_list_summary(
                 work_list,
                 membership,
-                fallback_title,
-                fallback_description,
-                key_source,
-            ),
-            None => build_work_list_summary(
-                work_list,
-                membership,
-                fallback_title,
-                fallback_description,
+                None,
+                None,
                 None,
                 Some(missing_work_list_key_source_error()),
-            ),
-        }
+            );
+        };
+
+        self.project_work_list_summary_with_key_source(work_list, membership, key_source)
     }
 
     fn project_work_list_summary_with_key_source(
         &self,
         work_list: WorkListResponse,
         membership: AgentMembership,
-        fallback_title: Option<String>,
-        fallback_description: Option<String>,
         key_source: &PrincipalWorkListKeySource,
     ) -> AgentWorkListSummary {
-        match resolve_work_list_key_for_principal_source(
+        let list_key = match resolve_work_list_key_for_principal_source(
             key_source,
             work_list.id,
             &work_list.membership.work_list_key_ciphertext,
         ) {
-            Ok(list_key) => {
-                match decode_work_list_payload_value(&list_key, &work_list.payload_ciphertext) {
-                    Ok(payload) => {
-                        let title = extract_work_list_title(&payload).or(fallback_title);
-                        let description =
-                            extract_work_list_description(&payload).or(fallback_description);
-                        build_work_list_summary(
-                            work_list,
-                            membership,
-                            title,
-                            description,
-                            Some(payload),
-                            None,
-                        )
-                    }
-                    Err(err) => build_work_list_summary(
-                        work_list,
-                        membership,
-                        fallback_title,
-                        fallback_description,
-                        None,
-                        Some(make_read_error("work_list_payload", err)),
-                    ),
-                }
+            Ok(list_key) => list_key,
+            Err(err) => {
+                return build_work_list_summary(
+                    work_list,
+                    membership,
+                    None,
+                    None,
+                    None,
+                    Some(make_read_error("work_list_key", err)),
+                );
+            }
+        };
+
+        let fallback_title =
+            decode_work_list_title_fallback(&work_list.title_ciphertext, &list_key);
+        let fallback_description = work_list
+            .description_ciphertext
+            .as_deref()
+            .and_then(|ciphertext| decode_work_list_description_fallback(ciphertext, &list_key));
+        match decode_work_list_payload_value(&list_key, &work_list.payload_ciphertext) {
+            Ok(payload) => {
+                let title = extract_work_list_title(&payload).or(fallback_title);
+                let description = extract_work_list_description(&payload).or(fallback_description);
+                build_work_list_summary(
+                    work_list,
+                    membership,
+                    title,
+                    description,
+                    Some(payload),
+                    None,
+                )
             }
             Err(err) => build_work_list_summary(
                 work_list,
@@ -1286,7 +1020,7 @@ impl RuntimeClient {
                 fallback_title,
                 fallback_description,
                 None,
-                Some(make_read_error("work_list_key", err)),
+                Some(make_read_error("work_list_payload", err)),
             ),
         }
     }
@@ -1343,10 +1077,15 @@ impl RuntimeClient {
         task: MyTaskResponse,
         context: Option<&WorkListContext>,
     ) -> AgentTaskSummary {
-        let fallback_work_list_title = decode_text_fallback(&task.work_list_title_ciphertext);
+        let fallback_work_list_title =
+            context
+                .and_then(|item| item.list_key.as_ref())
+                .and_then(|list_key| {
+                    decode_work_list_title_fallback(&task.work_list_title_ciphertext, list_key)
+                });
         let work_list_title = context
             .and_then(|item| item.work_list_title.clone())
-            .or(fallback_work_list_title.clone());
+            .or(fallback_work_list_title);
         let list_key = context.and_then(|item| item.list_key.as_ref());
         let read_error = context.and_then(|item| item.read_error.clone());
 
@@ -1484,75 +1223,6 @@ fn persisted_unlock_error(prompt_message: &str, err: PublicError) -> PublicError
     ))
 }
 
-#[derive(Debug)]
-pub struct CreateTaskArgs {
-    pub work_list_id: Uuid,
-    pub input: TaskCreateInput,
-    pub password_stdin: bool,
-}
-
-#[derive(Debug)]
-pub struct UpdateTaskArgs {
-    pub work_list_id: Uuid,
-    pub task_id: Uuid,
-    pub input: TaskUpdateInput,
-    pub password_stdin: bool,
-}
-
-#[derive(Debug)]
-pub struct MoveTaskArgs {
-    pub work_list_id: Uuid,
-    pub task_id: Uuid,
-    pub input: MoveTaskInput,
-    pub password_stdin: bool,
-}
-
-#[derive(Debug)]
-pub struct ArchiveTaskArgs {
-    pub work_list_id: Uuid,
-    pub task_id: Uuid,
-    pub password_stdin: bool,
-}
-
-#[derive(Debug)]
-pub struct UnarchiveTaskArgs {
-    pub work_list_id: Uuid,
-    pub task_id: Uuid,
-    pub password_stdin: bool,
-}
-
-#[derive(Debug)]
-pub struct DeleteTaskArgs {
-    pub work_list_id: Uuid,
-    pub task_id: Uuid,
-    pub input: DeleteTaskRequest,
-}
-
-#[derive(Debug)]
-pub struct CreateCommentArgs {
-    pub work_list_id: Uuid,
-    pub task_id: Uuid,
-    pub input: CommentInput,
-    pub password_stdin: bool,
-}
-
-#[derive(Debug)]
-pub struct UpdateCommentArgs {
-    pub work_list_id: Uuid,
-    pub task_id: Uuid,
-    pub comment_id: Uuid,
-    pub input: CommentInput,
-    pub password_stdin: bool,
-}
-
-#[derive(Debug)]
-pub struct DeleteCommentArgs {
-    pub work_list_id: Uuid,
-    pub task_id: Uuid,
-    pub comment_id: Uuid,
-    pub input: DeleteCommentRequest,
-}
-
 fn project_attachments(
     values: Option<Vec<FlexibleValue>>,
 ) -> PublicResult<Option<Vec<AgentAttachment>>> {
@@ -1659,7 +1329,8 @@ fn project_task(input: TaskProjectionInput<'_>) -> AgentTaskSummary {
         list_key,
         inherited_error,
     } = input;
-    let fallback_title = decode_text_fallback(title_ciphertext);
+    let fallback_title =
+        list_key.and_then(|list_key| decode_task_title_fallback(title_ciphertext, list_key));
     let projected_delegations = delegations.into_iter().map(project_delegation).collect();
 
     match list_key {
@@ -1914,10 +1585,29 @@ fn extract_work_list_description(payload: &Value) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn decode_text_fallback(ciphertext: &str) -> Option<String> {
+fn decode_text_fallback(
+    ciphertext: &str,
+    list_key: &SymmetricKey,
+    decrypt: fn(&SymmetricKey, &[u8]) -> PublicResult<String>,
+) -> Option<String> {
     decode_sealed_blob(ciphertext)
-        .and_then(|bytes| decrypt_text_value(&bytes))
+        .and_then(|bytes| decrypt(list_key, &bytes))
         .ok()
+}
+
+fn decode_work_list_title_fallback(ciphertext: &str, list_key: &SymmetricKey) -> Option<String> {
+    decode_text_fallback(ciphertext, list_key, decrypt_work_list_title)
+}
+
+fn decode_work_list_description_fallback(
+    ciphertext: &str,
+    list_key: &SymmetricKey,
+) -> Option<String> {
+    decode_text_fallback(ciphertext, list_key, decrypt_work_list_description)
+}
+
+fn decode_task_title_fallback(ciphertext: &str, list_key: &SymmetricKey) -> Option<String> {
+    decode_text_fallback(ciphertext, list_key, decrypt_task_title)
 }
 
 fn make_read_error(code: &str, err: PublicError) -> ReadError {
@@ -1927,343 +1617,11 @@ fn make_read_error(code: &str, err: PublicError) -> ReadError {
     }
 }
 
-fn find_task_attachment(
-    task: &AgentTaskSummary,
-    attachment_id: Uuid,
-) -> PublicResult<AgentAttachment> {
-    let attachments = match task.attachments.as_ref() {
-        Some(attachments) => attachments,
-        None if task.read_error.is_some() => {
-            return Err(read_error_to_public_error(
-                task.read_error.as_ref(),
-                "failed to read task attachments",
-            ));
-        }
-        None => {
-            return Err(PublicError::validation("task does not include attachments"));
-        }
-    };
-
-    attachments
-        .iter()
-        .find(|attachment| attachment.id == attachment_id)
-        .cloned()
-        .ok_or_else(|| PublicError::validation(format!("attachment {attachment_id} not found")))
-}
-
-async fn download_and_decrypt_attachment(
-    resolved: ResolvedTaskAttachmentDownload,
-) -> PublicResult<DownloadedAttachment> {
-    let ResolvedTaskAttachmentDownload {
-        attachment,
-        blob_ref,
-        download,
-    } = resolved;
-    let ciphertext = download_presigned_attachment(&download).await?;
-    if u64::try_from(ciphertext.len()).ok() != Some(blob_ref.ciphertext_bytes) {
-        return Err(PublicError::validation(format!(
-            "attachment '{}' download size mismatch: expected {} bytes, got {}",
-            attachment.file_name,
-            blob_ref.ciphertext_bytes,
-            ciphertext.len()
-        )));
-    }
-    let bytes =
-        decrypt_attachment_bytes(&ciphertext, &blob_ref.file_key, Some(&blob_ref.enc_context))?;
-    Ok(DownloadedAttachment { attachment, bytes })
-}
-
-async fn download_presigned_attachment(
-    download: &DownloadAttachmentResponse,
-) -> PublicResult<Vec<u8>> {
-    let client = reqwest::Client::new();
-    let mut request = client.get(&download.download_url);
-    for (name, value) in &download.download_headers {
-        request = request.header(name, value);
-    }
-
-    let response = request.send().await.map_err(|err| {
-        PublicError::unexpected(format!("failed to download attachment ciphertext: {err}"))
-    })?;
-    let status = response.status();
-    if !status.is_success() {
-        return Err(PublicError::unexpected(format!(
-            "attachment download failed with status {}",
-            status
-        )));
-    }
-
-    response
-        .bytes()
-        .await
-        .map(|bytes| bytes.to_vec())
-        .map_err(|err| {
-            PublicError::unexpected(format!("failed to read attachment ciphertext: {err}"))
-        })
-}
-
-fn build_readable_attachment(
-    attachment: AgentAttachment,
-    bytes: Vec<u8>,
-    read_strategy: AttachmentReadStrategy,
-) -> PublicResult<ReadableAttachment> {
-    let content_format = attachment.readable_content_format(read_strategy);
-    let text = match read_strategy {
-        AttachmentReadStrategy::Utf8Text => {
-            decode_attachment_utf8_text(&attachment.file_name, bytes)?
-        }
-        AttachmentReadStrategy::DocxMarkdown => {
-            render_docx_attachment_as_markdown(&attachment.file_name, &bytes)?
-        }
-        AttachmentReadStrategy::Unsupported => {
-            return Err(unsupported_attachment_render_error(&attachment.file_name));
-        }
-    };
-
-    Ok(ReadableAttachment {
-        attachment,
-        text,
-        content_format,
-        source_kind: read_strategy.source_kind(),
-    })
-}
-
-fn decode_attachment_utf8_text(file_name: &str, bytes: Vec<u8>) -> PublicResult<String> {
-    String::from_utf8(bytes).map_err(|err| {
-        PublicError::validation(format!(
-            "attachment '{}' is not valid UTF-8 text: {}",
-            file_name, err
-        ))
-    })
-}
-
-fn render_docx_attachment_as_markdown(file_name: &str, bytes: &[u8]) -> PublicResult<String> {
-    undocx::builder()
-        .skip_images()
-        .convert_bytes(bytes)
-        .map(|markdown| normalize_docx_markdown(&markdown))
-        .map_err(|err| {
-            PublicError::validation(format!(
-                "attachment '{}' could not be rendered as Markdown: {}",
-                file_name, err
-            ))
-        })
-}
-
-fn normalize_docx_markdown(markdown: &str) -> String {
-    let mut normalized = String::new();
-    let mut prose_buffer = String::new();
-    let mut in_code_fence = false;
-
-    for line in markdown.split_inclusive('\n') {
-        if line.trim_start().starts_with("```") {
-            if !prose_buffer.is_empty() {
-                normalized.push_str(&normalize_non_code_docx_markdown(&prose_buffer));
-                prose_buffer.clear();
-            }
-
-            normalized.push_str(line);
-            in_code_fence = !in_code_fence;
-            continue;
-        }
-
-        if in_code_fence {
-            normalized.push_str(line);
-        } else {
-            prose_buffer.push_str(line);
-        }
-    }
-
-    if !prose_buffer.is_empty() {
-        normalized.push_str(&normalize_non_code_docx_markdown(&prose_buffer));
-    }
-
-    normalized
-}
-
-fn normalize_non_code_docx_markdown(markdown: &str) -> String {
-    let markdown = normalize_docx_html_tables(markdown);
-    let markdown = normalize_docx_inline_tag_pair(&markdown, "strong", "**");
-    let markdown = normalize_docx_inline_tag_pair(&markdown, "em", "*");
-    let markdown = normalize_docx_inline_tag_pair(&markdown, "s", "~~");
-    normalize_docx_inline_tag_pair(&markdown, "del", "~~")
-}
-
-fn normalize_docx_inline_tag_pair(markdown: &str, tag: &str, marker: &str) -> String {
-    let open_tag = format!("<{tag}>");
-    let close_tag = format!("</{tag}>");
-    let mut normalized = String::new();
-    let mut remaining = markdown;
-
-    while let Some(tag_start) = remaining.find(&open_tag) {
-        normalized.push_str(&remaining[..tag_start]);
-
-        let inner_start = tag_start + open_tag.len();
-        let Some(close_offset) = remaining[inner_start..].find(&close_tag) else {
-            normalized.push_str(&remaining[tag_start..]);
-            return normalized;
-        };
-
-        let inner_end = inner_start + close_offset;
-        let inner = &remaining[inner_start..inner_end];
-        let trimmed_start = inner.trim_start_matches(char::is_whitespace);
-        let trimmed = inner.trim_matches(char::is_whitespace);
-        let leading_whitespace_len = inner.len() - trimmed_start.len();
-        let trailing_whitespace_len =
-            inner.len() - inner.trim_end_matches(char::is_whitespace).len();
-
-        normalized.push_str(&inner[..leading_whitespace_len]);
-
-        if !trimmed.is_empty() {
-            normalized.push_str(marker);
-            normalized.push_str(trimmed);
-            normalized.push_str(marker);
-        }
-
-        if trailing_whitespace_len > 0 {
-            normalized.push_str(&inner[inner.len() - trailing_whitespace_len..]);
-        }
-
-        remaining = &remaining[inner_end + close_tag.len()..];
-    }
-
-    normalized.push_str(remaining);
-    normalized
-}
-
-fn normalize_docx_html_tables(markdown: &str) -> String {
-    let mut normalized = String::new();
-    let mut remaining = markdown;
-
-    while let Some(table_start) = remaining.find("<table") {
-        normalized.push_str(&remaining[..table_start]);
-
-        let Some(table_end) = find_docx_html_table_end(remaining, table_start) else {
-            normalized.push_str(&remaining[table_start..]);
-            return normalized;
-        };
-
-        let table_markdown = html2md::parse_html(&remaining[table_start..table_end]);
-        normalized.push_str(table_markdown.trim_matches('\n'));
-        remaining = &remaining[table_end..];
-    }
-
-    normalized.push_str(remaining);
-    normalized
-}
-
-fn find_docx_html_table_end(markdown: &str, table_start: usize) -> Option<usize> {
-    let mut depth = 0usize;
-    let mut search_from = table_start;
-
-    while search_from < markdown.len() {
-        let next_open = markdown[search_from..]
-            .find("<table")
-            .map(|offset| search_from + offset);
-        let next_close = markdown[search_from..]
-            .find("</table>")
-            .map(|offset| search_from + offset);
-
-        match (next_open, next_close) {
-            (Some(open), Some(close)) if open < close => {
-                depth += 1;
-                search_from = open + "<table".len();
-            }
-            (_, Some(close)) => {
-                if depth == 0 {
-                    return None;
-                }
-
-                depth -= 1;
-                search_from = close + "</table>".len();
-
-                if depth == 0 {
-                    return Some(search_from);
-                }
-            }
-            _ => return None,
-        }
-    }
-
-    None
-}
-
-fn unsupported_attachment_read_error(file_name: &str) -> PublicError {
-    PublicError::validation(format!(
-        "attachment '{}' is not readable in the CLI; use download instead",
-        file_name
-    ))
-}
-
-fn unsupported_attachment_render_error(file_name: &str) -> PublicError {
-    PublicError::validation(format!(
-        "attachment '{}' is not readable in the CLI",
-        file_name
-    ))
-}
-
 fn read_error_to_public_error(read_error: Option<&ReadError>, fallback: &str) -> PublicError {
     match read_error {
         Some(read_error) => PublicError::validation(read_error.message.clone()),
         None => PublicError::validation(fallback),
     }
-}
-
-fn normalized_content_type(content_type: &str) -> String {
-    content_type
-        .split(';')
-        .next()
-        .unwrap_or(content_type)
-        .trim()
-        .to_ascii_lowercase()
-}
-
-fn file_extension(file_name: &str) -> Option<String> {
-    Path::new(file_name)
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(|extension| extension.to_ascii_lowercase())
-}
-
-fn content_type_is_textual(content_type: &str) -> bool {
-    let normalized = normalized_content_type(content_type);
-    if normalized.starts_with("text/") {
-        return true;
-    }
-
-    matches!(normalized.as_str(), "application/json" | "application/xml")
-        || normalized.ends_with("+json")
-        || normalized.ends_with("+xml")
-}
-
-fn file_extension_is_textual(file_name: &str) -> bool {
-    let Some(extension) = file_extension(file_name) else {
-        return false;
-    };
-
-    matches!(
-        extension.as_str(),
-        "txt" | "md" | "markdown" | "json" | "yaml" | "yml" | "toml" | "csv" | "log"
-    )
-}
-
-fn content_type_is_docx(content_type: &str) -> bool {
-    normalized_content_type(content_type) == DOCX_CONTENT_TYPE
-}
-
-fn file_extension_is_docx(file_name: &str) -> bool {
-    matches!(file_extension(file_name).as_deref(), Some("docx"))
-}
-
-fn content_type_is_markdown(content_type: &str) -> bool {
-    normalized_content_type(content_type) == "text/markdown"
-}
-
-fn file_extension_is_markdown(file_name: &str) -> bool {
-    matches!(
-        file_extension(file_name).as_deref(),
-        Some("md" | "markdown")
-    )
 }
 
 fn rich_text_to_markdown(rich_text: &TaskPayloadRichText) -> Option<String> {
@@ -2314,8 +1672,6 @@ fn read_required_password(
 mod tests {
     use super::*;
 
-    const TEST_DOCX_BASE64: &str = "UEsDBBQAAAAIAOp8kVzXeYTq8QAAALgBAAATAAAAW0NvbnRlbnRfVHlwZXNdLnhtbH2QzU7DMBCE730Ky9cqccoBIZSkB36OwKE8wMreJFb9J69b2rdn00KREOVozXwz62nXB+/EHjPZGDq5qhspMOhobBg7+b55ru6koALBgIsBO3lEkut+0W6OCUkwHKiTUynpXinSE3qgOiYMrAwxeyj8zKNKoLcworppmlulYygYSlXmDNkvhGgfcYCdK+LpwMr5loyOpHg4e+e6TkJKzmoorKt9ML+Kqq+SmsmThyabaMkGqa6VzOL1jh/0lSfK1qB4g1xewLNRfcRslIl65xmu/0/649o4DFbjhZ/TUo4aiXh77+qL4sGG71+06jR8/wlQSwMEFAAAAAgA6nyRXCAbhuqyAAAALgEAAAsAAABfcmVscy8ucmVsc43Puw6CMBQG4J2naM4uBQdjDIXFmLAafICmPZRGeklbL7y9HRzEODie23fyN93TzOSOIWpnGdRlBQStcFJbxeAynDZ7IDFxK/nsLDJYMELXFs0ZZ57yTZy0jyQjNjKYUvIHSqOY0PBYOo82T0YXDE+5DIp6Lq5cId1W1Y6GTwPagpAVS3rJIPSyBjIsHv/h3ThqgUcnbgZt+vHlayPLPChMDB4uSCrf7TKzQHNKuorZvgBQSwMEFAAAAAgA6nyRXDbicKixAAAADAEAABEAAAB3b3JkL2RvY3VtZW50LnhtbG2PMQ+CMBCFd35F012KDsYQKIPGuLlo4lrpKST0rmmryL+3xbixfHkv9/Lurmo+ZmBvcL4nrPk6LzgDbEn3+Kz59XJc7TjzQaFWAyHUfALPG5lVY6mpfRnAwGID+nKseReCLYXwbQdG+ZwsYJw9yBkVonVPMZLT1lEL3scFZhCbotgKo3rkMmMstt5JT0nOxsoIlxDkCVQ6qhLJJLqZdjF8OO9vLFUtxpP47Unq/4f8AlBLAQIUAxQAAAAIAOp8kVzXeYTq8QAAALgBAAATAAAAAAAAAAAAAACAAQAAAABbQ29udGVudF9UeXBlc10ueG1sUEsBAhQDFAAAAAgA6nyRXCAbhuqyAAAALgEAAAsAAAAAAAAAAAAAAIABIgEAAF9yZWxzLy5yZWxzUEsBAhQDFAAAAAgA6nyRXDbicKixAAAADAEAABEAAAAAAAAAAAAAAIAB/QEAAHdvcmQvZG9jdW1lbnQueG1sUEsFBgAAAAADAAMAuQAAAN0CAAAAAA==";
-
     #[test]
     fn rich_text_to_markdown_joins_non_empty_blocks() {
         let rich_text = TaskPayloadRichText {
@@ -2336,167 +1692,6 @@ mod tests {
         assert_eq!(
             rich_text_to_markdown(&rich_text).as_deref(),
             Some("First\n\nSecond")
-        );
-    }
-
-    #[test]
-    fn attachment_read_strategy_detects_text_docx_and_binary() {
-        let text_attachment = AgentAttachment {
-            id: Uuid::nil(),
-            file_name: "notes.md".to_string(),
-            content_type: "text/markdown".to_string(),
-            size_bytes: 0,
-            blob_key: Vec::new(),
-        };
-        let docx_attachment = AgentAttachment {
-            id: Uuid::nil(),
-            file_name: "spec.docx".to_string(),
-            content_type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                .to_string(),
-            size_bytes: 0,
-            blob_key: Vec::new(),
-        };
-        let binary_attachment = AgentAttachment {
-            id: Uuid::nil(),
-            file_name: "spec.pdf".to_string(),
-            content_type: "application/pdf".to_string(),
-            size_bytes: 0,
-            blob_key: Vec::new(),
-        };
-
-        assert_eq!(
-            text_attachment.read_strategy(),
-            AttachmentReadStrategy::Utf8Text
-        );
-        assert_eq!(
-            docx_attachment.read_strategy(),
-            AttachmentReadStrategy::DocxMarkdown
-        );
-        assert_eq!(
-            binary_attachment.read_strategy(),
-            AttachmentReadStrategy::Unsupported
-        );
-    }
-
-    #[test]
-    fn attachment_read_strategy_prefers_text_content_type_over_docx_extension() {
-        let attachment = AgentAttachment {
-            id: Uuid::nil(),
-            file_name: "notes.docx".to_string(),
-            content_type: "text/plain".to_string(),
-            size_bytes: 0,
-            blob_key: Vec::new(),
-        };
-
-        assert_eq!(attachment.read_strategy(), AttachmentReadStrategy::Utf8Text);
-    }
-
-    #[test]
-    fn markdown_text_attachment_reports_markdown_content_format() {
-        let attachment = AgentAttachment {
-            id: Uuid::nil(),
-            file_name: "notes.md".to_string(),
-            content_type: "text/markdown".to_string(),
-            size_bytes: 0,
-            blob_key: Vec::new(),
-        };
-
-        let readable = build_readable_attachment(
-            attachment,
-            b"# Heading\n\nAttachment body\n".to_vec(),
-            AttachmentReadStrategy::Utf8Text,
-        )
-        .expect("render markdown text attachment");
-
-        assert_eq!(
-            readable.content_format,
-            ReadableAttachmentContentFormat::Markdown
-        );
-        assert_eq!(
-            readable.source_kind,
-            ReadableAttachmentSourceKind::PlainText
-        );
-    }
-
-    #[test]
-    fn docx_attachment_bytes_render_to_markdown() {
-        let attachment = AgentAttachment {
-            id: Uuid::nil(),
-            file_name: "spec.docx".to_string(),
-            content_type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                .to_string(),
-            size_bytes: 0,
-            blob_key: Vec::new(),
-        };
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(TEST_DOCX_BASE64)
-            .expect("decode docx fixture");
-
-        let readable =
-            build_readable_attachment(attachment, bytes, AttachmentReadStrategy::DocxMarkdown)
-                .expect("render docx attachment");
-
-        assert_eq!(readable.text, "Heading\n\nDOCX body\n\n");
-        assert_eq!(
-            readable.content_format,
-            ReadableAttachmentContentFormat::Markdown
-        );
-        assert_eq!(
-            readable.source_kind,
-            ReadableAttachmentSourceKind::DocxRendered
-        );
-    }
-
-    #[test]
-    fn normalize_docx_markdown_converts_html_fragments_and_preserves_code_fences() {
-        let markdown = "\
-<strong>UI Implementation Spec</strong>
-
-<table>
-  <tr>
-    <td><strong>Usage</strong></td>
-    <td>Duration</td>
-  </tr>
-  <tr>
-    <td><strong>Slide panels open/close</strong></td>
-    <td>0.28s</td>
-  </tr>
-</table>
-
-<strong>prefers-reduced-motion</strong>
-
-```
-<Button variant=\"ghost\" />
-<strong>leave me alone</strong>
-```
-";
-
-        let normalized = normalize_docx_markdown(markdown);
-
-        assert!(normalized.contains("**UI Implementation Spec**"));
-        assert!(normalized.contains("**Usage**"));
-        assert!(normalized.contains("Duration"));
-        assert!(normalized.contains("**Slide panels open/close**"));
-        assert!(normalized.contains("0.28s"));
-        assert!(normalized.contains("**prefers-reduced-motion**"));
-        assert!(!normalized.contains("<table>"));
-        assert!(!normalized.contains("<td>"));
-        assert!(
-            normalized.contains(
-                "```\n<Button variant=\"ghost\" />\n<strong>leave me alone</strong>\n```"
-            )
-        );
-    }
-
-    #[test]
-    fn normalize_docx_inline_tag_pair_moves_outer_whitespace_outside_markers() {
-        let normalized = normalize_docx_markdown(
-            "<strong>⚠️  Note to engineering: </strong>Ignore legacy prototype remnants.\n",
-        );
-
-        assert_eq!(
-            normalized,
-            "**⚠️  Note to engineering:** Ignore legacy prototype remnants.\n"
         );
     }
 

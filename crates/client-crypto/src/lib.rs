@@ -1,6 +1,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
-use std::{fmt::Debug, io::Cursor};
+use std::fmt::Debug;
+use std::io::Cursor;
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use base64::Engine as _;
@@ -30,6 +31,10 @@ pub const ATTACHMENT_BLOB_CONTEXT_LABEL: &str = "worklist.attachment.blob.v1";
 pub const ATTACHMENT_BLOB_REF_VERSION: u8 = 1;
 pub const DATA_KEY_SALT_BYTES: usize = 32;
 pub const KEY_SIZE: usize = 32;
+const WORK_LIST_TITLE_CONTEXT: &[u8] = b"worklist.work_list.title.v1";
+const WORK_LIST_DESCRIPTION_CONTEXT: &[u8] = b"worklist.work_list.description.v1";
+const TASK_TITLE_CONTEXT: &[u8] = b"worklist.task.title.v1";
+const NOTE_TITLE_CONTEXT: &[u8] = b"worklist.note.title.v1";
 const HPKE_NONCE_SIZE: usize = 12;
 const HPKE_MODE_BASE: u8 = 0x00;
 const HPKE_KEM_CODEPOINT: u16 = 0x0020;
@@ -39,7 +44,7 @@ const HPKE_KEM_ID: [u8; 2] = HPKE_KEM_CODEPOINT.to_be_bytes();
 const HPKE_KDF_ID: [u8; 2] = HPKE_KDF_CODEPOINT.to_be_bytes();
 const HPKE_AEAD_ID: [u8; 2] = HPKE_AEAD_CODEPOINT.to_be_bytes();
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CryptoCapability {
     DataKeyUnwrap,
@@ -55,6 +60,26 @@ impl CryptoCapability {
             Self::WorkListKeyDecrypt => "work_list_key_decrypt",
             Self::PayloadSeal => "payload_seal",
             Self::PayloadProof => "payload_proof",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TextValueContext {
+    WorkListTitle,
+    WorkListDescription,
+    TaskTitle,
+    NoteTitle,
+}
+
+impl TextValueContext {
+    #[must_use]
+    pub const fn as_bytes(self) -> &'static [u8] {
+        match self {
+            Self::WorkListTitle => WORK_LIST_TITLE_CONTEXT,
+            Self::WorkListDescription => WORK_LIST_DESCRIPTION_CONTEXT,
+            Self::TaskTitle => TASK_TITLE_CONTEXT,
+            Self::NoteTitle => NOTE_TITLE_CONTEXT,
         }
     }
 }
@@ -749,11 +774,54 @@ struct TextValuePayload {
     value: String,
 }
 
-pub fn decrypt_text_value(payload_ciphertext: &[u8]) -> PublicResult<String> {
-    let sealed = SealedPayload::from_bytes(payload_ciphertext)?;
-    ensure_payload_version(sealed.version)?;
-    let payload: TextValuePayload = deserialize_from_cbor(&sealed.ciphertext)?;
+fn decrypt_text_value(
+    list_key: &SymmetricKey,
+    payload_ciphertext: &[u8],
+    context: TextValueContext,
+) -> PublicResult<String> {
+    let payload: TextValuePayload = decrypt_sealed_payload(
+        list_key,
+        payload_ciphertext,
+        context.as_bytes(),
+        "failed to decrypt text value",
+    )?;
     Ok(payload.value)
+}
+
+pub fn decrypt_work_list_title(
+    list_key: &SymmetricKey,
+    payload_ciphertext: &[u8],
+) -> PublicResult<String> {
+    decrypt_text_value(
+        list_key,
+        payload_ciphertext,
+        TextValueContext::WorkListTitle,
+    )
+}
+
+pub fn decrypt_work_list_description(
+    list_key: &SymmetricKey,
+    payload_ciphertext: &[u8],
+) -> PublicResult<String> {
+    decrypt_text_value(
+        list_key,
+        payload_ciphertext,
+        TextValueContext::WorkListDescription,
+    )
+}
+
+pub fn decrypt_task_title(
+    list_key: &SymmetricKey,
+    payload_ciphertext: &[u8],
+) -> PublicResult<String> {
+    decrypt_text_value(list_key, payload_ciphertext, TextValueContext::TaskTitle)
+}
+
+pub fn decrypt_note_title(
+    list_key: &SymmetricKey,
+    payload_ciphertext: &[u8],
+) -> PublicResult<String> {
+    decrypt_text_value(list_key, payload_ciphertext, TextValueContext::NoteTitle)
 }
 
 pub fn flexible_value_to_json(value: FlexibleValue) -> serde_json::Value {
@@ -1095,9 +1163,41 @@ pub fn encrypt_comment_payload(
     )
 }
 
-pub fn seal_text_value(value: &str) -> PublicResult<SealedBlobPayload> {
-    let ciphertext = serialize_to_cbor(&serde_json::json!({ "value": value }))?;
-    sealed_blob_from_payload(SealedPayload::new(ciphertext))
+fn seal_text_value(
+    value: &str,
+    list_key: &SymmetricKey,
+    context: TextValueContext,
+) -> PublicResult<SealedBlobPayload> {
+    encrypt_sealed_payload(
+        &TextValuePayload {
+            value: value.to_string(),
+        },
+        list_key,
+        context.as_bytes(),
+        "failed to seal text value",
+    )
+}
+
+pub fn seal_work_list_title(
+    value: &str,
+    list_key: &SymmetricKey,
+) -> PublicResult<SealedBlobPayload> {
+    seal_text_value(value, list_key, TextValueContext::WorkListTitle)
+}
+
+pub fn seal_work_list_description(
+    value: &str,
+    list_key: &SymmetricKey,
+) -> PublicResult<SealedBlobPayload> {
+    seal_text_value(value, list_key, TextValueContext::WorkListDescription)
+}
+
+pub fn seal_task_title(value: &str, list_key: &SymmetricKey) -> PublicResult<SealedBlobPayload> {
+    seal_text_value(value, list_key, TextValueContext::TaskTitle)
+}
+
+pub fn seal_note_title(value: &str, list_key: &SymmetricKey) -> PublicResult<SealedBlobPayload> {
+    seal_text_value(value, list_key, TextValueContext::NoteTitle)
 }
 
 pub fn compute_payload_proof(
@@ -1241,7 +1341,7 @@ fn decode_work_list_key_bytes(plaintext: &[u8]) -> PublicResult<Vec<u8>> {
 }
 
 fn try_decode_envelope(bytes: &[u8]) -> PublicResult<Option<Vec<u8>>> {
-    if let Ok(envelope) = deserialize_from_cbor::<WorkListKeyEnvelope>(bytes) {
+    if let Ok(envelope) = deserialize_complete_from_cbor::<WorkListKeyEnvelope>(bytes) {
         let bytes = match envelope.key {
             WorkListKeyField::Bytes(data) => data,
             WorkListKeyField::Text(text) => decode_membership_key_string(&text)?,
@@ -1249,11 +1349,23 @@ fn try_decode_envelope(bytes: &[u8]) -> PublicResult<Option<Vec<u8>>> {
         return Ok(Some(bytes));
     }
 
-    if let Ok(raw_bytes) = deserialize_from_cbor::<Vec<u8>>(bytes) {
+    if let Ok(raw_bytes) = deserialize_complete_from_cbor::<Vec<u8>>(bytes) {
         return Ok(Some(raw_bytes));
     }
 
     Ok(None)
+}
+
+fn deserialize_complete_from_cbor<T: DeserializeOwned>(bytes: &[u8]) -> PublicResult<T> {
+    let mut cursor = Cursor::new(bytes);
+    let decoded = strong_box::ciborium::de::from_reader(&mut cursor)
+        .map_err(|err| PublicError::crypto(format!("failed to deserialize payload: {err}")))?;
+    if cursor.position() != bytes.len() as u64 {
+        return Err(PublicError::validation(
+            "CBOR payload contains trailing bytes",
+        ));
+    }
+    Ok(decoded)
 }
 
 fn decode_membership_key_string(value: &str) -> PublicResult<Vec<u8>> {
@@ -1593,5 +1705,52 @@ mod tests {
         .expect("decrypt attachment");
 
         assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn raw_work_list_key_does_not_accept_partial_cbor_decode() {
+        let mut key = [0x42; KEY_SIZE];
+        key[0] = 0x4d;
+        let decoded = decode_work_list_key_bytes(&key).expect("decode raw key");
+
+        assert_eq!(decoded, key);
+    }
+
+    #[test]
+    fn task_title_helpers_encrypt_with_context_and_round_trip() {
+        let list_key = SymmetricKey::new([17; KEY_SIZE]);
+        let sealed = seal_task_title("Encrypted title", &list_key).expect("seal task title");
+
+        let decoded = decrypt_task_title(&list_key, &sealed.bytes).expect("decrypt task title");
+
+        assert_eq!(decoded, "Encrypted title");
+    }
+
+    #[test]
+    fn decrypt_text_value_rejects_wrong_context() {
+        let list_key = SymmetricKey::new([18; KEY_SIZE]);
+        let sealed = seal_text_value("Encrypted title", &list_key, TextValueContext::TaskTitle)
+            .expect("seal text");
+
+        let wrong_context =
+            decrypt_text_value(&list_key, &sealed.bytes, TextValueContext::WorkListTitle);
+
+        assert!(wrong_context.is_err());
+    }
+
+    #[test]
+    fn decrypt_text_value_rejects_unencrypted_text_payload() {
+        let list_key = SymmetricKey::new([19; KEY_SIZE]);
+        let plaintext_payload = serialize_to_cbor(&TextValuePayload {
+            value: "Plain server value".to_string(),
+        })
+        .expect("serialize text payload");
+        let sealed = sealed_blob_from_payload(SealedPayload::new(plaintext_payload))
+            .expect("seal text payload wrapper");
+
+        let unencrypted_text =
+            decrypt_text_value(&list_key, &sealed.bytes, TextValueContext::TaskTitle);
+
+        assert!(unencrypted_text.is_err());
     }
 }

@@ -28,9 +28,9 @@ use worklist_client_crypto::{
     StrongBoxKeyRing, SymmetricKey, TaskPayloadBody, USER_DATA_KEY_CONTEXT,
     WORK_LIST_MEMBERSHIP_CONTEXT, WORK_LIST_PAYLOAD_CONTEXT, build_comment_payload_envelope,
     build_task_payload_envelope, compute_payload_proof, decrypt_comment_payload,
-    decrypt_task_payload, derive_payload_binding_key, encrypt_comment_payload,
+    decrypt_task_payload, decrypt_task_title, derive_payload_binding_key, encrypt_comment_payload,
     encrypt_task_payload, flexible_value_to_json, json_value_to_flexible, plaintext_rich_text,
-    seal_text_value, serialize_to_cbor,
+    seal_task_title, seal_work_list_title, serialize_to_cbor,
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2530,7 +2530,7 @@ impl TestFixture {
         )
         .expect("task payload")
         .base64;
-        let task_title_ciphertext = seal_text_value("Existing task").expect("task title").base64;
+        let task_title_ciphertext = seal_task_title_base64("Existing task", &list_key);
 
         let existing_comment_body = CommentPayloadBody {
             content: plaintext_rich_text("Existing comment").expect("comment rich text"),
@@ -2761,7 +2761,7 @@ async fn get_work_list(
         "id": state.fixture.work_list_id,
         "ownerUserId": state.fixture.owner_user_id,
         "workspaceId": state.fixture.workspace_id,
-        "titleCiphertext": seal_text_value("Fixture Work List").expect("title").base64,
+        "titleCiphertext": fixture_work_list_title_ciphertext(&state.fixture.list_key),
         "descriptionCiphertext": null,
         "payloadCiphertext": work_list_payload_ciphertext(&state),
         "timezone": "UTC",
@@ -2836,7 +2836,7 @@ async fn list_my_tasks(
             {
                 "id": state.fixture.task_id,
                 "workListId": state.fixture.work_list_id,
-                "workListTitleCiphertext": seal_text_value("Fixture Work List").expect("title").base64,
+                "workListTitleCiphertext": fixture_work_list_title_ciphertext(&state.fixture.list_key),
                 "createdByMembershipId": state.fixture.membership_id,
                 "titleCiphertext": state.fixture.task_title_ciphertext,
                 "payloadCiphertext": task_payload_ciphertext(&state),
@@ -2940,6 +2940,9 @@ async fn create_task(
 
     let decrypted = decrypt_task_payload(&state.fixture.list_key, &payload_bytes)
         .expect("decrypt created task");
+    let decrypted_title = decrypt_task_title(&state.fixture.list_key, &title_bytes)
+        .expect("decrypt created task title");
+    assert_eq!(decrypted_title, decrypted.body.title);
     state.created_task_body = Some(decrypted.body.clone());
 
     let response = json!({
@@ -2992,7 +2995,7 @@ async fn update_task(
         Some(payload_proof.as_str())
     );
 
-    if let Some(title_ciphertext) = payload.title_ciphertext.as_ref() {
+    let decrypted_title = if let Some(title_ciphertext) = payload.title_ciphertext.as_ref() {
         let title_bytes = decode_b64(title_ciphertext);
         let title_proof =
             compute_payload_proof(&title_bytes, &state.fixture.binding_key).expect("title proof");
@@ -3000,10 +3003,19 @@ async fn update_task(
             payload.title_ciphertext_proof.as_deref(),
             Some(title_proof.as_str())
         );
-    }
+        Some(
+            decrypt_task_title(&state.fixture.list_key, &title_bytes)
+                .expect("decrypt updated task title"),
+        )
+    } else {
+        None
+    };
 
     let decrypted = decrypt_task_payload(&state.fixture.list_key, &payload_bytes)
         .expect("decrypt updated task");
+    if let Some(decrypted_title) = decrypted_title {
+        assert_eq!(decrypted_title, decrypted.body.title);
+    }
     state.updated_task_body = Some(decrypted.body.clone());
 
     let response = json!({
@@ -3673,12 +3685,24 @@ fn task_response_json(state: &TestState) -> serde_json::Value {
     })
 }
 
+fn fixture_work_list_title_ciphertext(list_key: &SymmetricKey) -> String {
+    seal_work_list_title("Fixture Work List", list_key)
+        .expect("seal work list title")
+        .base64
+}
+
+fn seal_task_title_base64(value: &str, list_key: &SymmetricKey) -> String {
+    seal_task_title(value, list_key)
+        .expect("seal task title")
+        .base64
+}
+
 fn work_list_summary_json(state: &TestState) -> serde_json::Value {
     json!({
         "id": state.fixture.work_list_id,
         "ownerUserId": state.fixture.owner_user_id,
         "workspaceId": state.fixture.workspace_id,
-        "titleCiphertext": seal_text_value("Fixture Work List").expect("title").base64,
+        "titleCiphertext": fixture_work_list_title_ciphertext(&state.fixture.list_key),
         "descriptionCiphertext": null,
         "payloadCiphertext": work_list_payload_ciphertext(state),
         "timezone": "UTC",
