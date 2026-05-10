@@ -156,32 +156,6 @@ pub struct AgentEnrollmentResponse {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct FinalizedAgentEnrollmentResponse {
-    pub status: String,
-    pub fingerprint: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-pub enum AgentEnrollmentStatusResponse {
-    Pending(Box<AgentEnrollmentResponse>),
-    Finalized(FinalizedAgentEnrollmentResponse),
-}
-
-impl AgentEnrollmentStatusResponse {
-    pub fn into_pending(self) -> PublicResult<AgentEnrollmentResponse> {
-        match self {
-            Self::Pending(enrollment) => Ok(*enrollment),
-            Self::Finalized(enrollment) => Err(PublicError::validation(format!(
-                "agent enrollment is already {}",
-                enrollment.status
-            ))),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct AgentTokenResponse {
     pub access_token: String,
     pub expires_in: u64,
@@ -693,7 +667,7 @@ pub async fn fetch_agent_enrollment(
     client: &reqwest::Client,
     base_url: &str,
     code: &str,
-) -> PublicResult<AgentEnrollmentStatusResponse> {
+) -> PublicResult<AgentEnrollmentResponse> {
     let response = client
         .get(api_endpoint(
             base_url,

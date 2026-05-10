@@ -5,9 +5,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use worklist_client_auth::{
-    AgentEnrollmentStatusResponse, AgentTokenResponse, PrincipalCredentials,
-    mint_agent_access_token, refresh_access_token, save_agent_credentials, save_credentials,
-    update_credentials_with_refresh,
+    AgentEnrollmentResponse, AgentTokenResponse, PrincipalCredentials, mint_agent_access_token,
+    refresh_access_token, save_agent_credentials, save_credentials, update_credentials_with_refresh,
 };
 use worklist_client_core::{PublicError, PublicResult};
 
@@ -153,7 +152,7 @@ impl PublicApiClient {
     pub async fn get_agent_enrollment(
         &mut self,
         code: &str,
-    ) -> PublicResult<AgentEnrollmentStatusResponse> {
+    ) -> PublicResult<AgentEnrollmentResponse> {
         self.get(&format!("/agents/enrollments/{code}")).await
     }
 

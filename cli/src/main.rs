@@ -1305,9 +1305,7 @@ async fn cmd_agent_approve(
         .into());
     };
     let client = reqwest::Client::new();
-    let enrollment = fetch_agent_enrollment(&client, runtime.api_url(), code)
-        .await?
-        .into_pending()?;
+    let enrollment = fetch_agent_enrollment(&client, runtime.api_url(), code).await?;
     let grants = runtime
         .build_agent_grants_for_enrollment(&enrollment, password_stdin)
         .await?;
