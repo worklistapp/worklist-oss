@@ -6,7 +6,8 @@ use uuid::Uuid;
 
 use worklist_client_auth::{
     AgentEnrollmentResponse, AgentTokenResponse, PrincipalCredentials, mint_agent_access_token,
-    refresh_access_token, save_agent_credentials, save_credentials, update_credentials_with_refresh,
+    refresh_access_token, save_agent_credentials, save_credentials,
+    update_credentials_with_refresh,
 };
 use worklist_client_core::{PublicError, PublicResult};
 
