@@ -575,6 +575,95 @@ async fn cli_task_reads_parse_current_api_shapes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_rejects_plaintext_scalar_delete_audit_patch_before_request() {
+    let fixture = TestFixture::new();
+    let state = Arc::new(Mutex::new(TestState::new(fixture.clone())));
+    let server = spawn_server(state.clone()).await;
+    let home = TempDir::new().expect("temp home");
+    seed_credentials(home.path(), &fixture, &server.base_url);
+    let plaintext_delete_input = json!({
+        "auditPatch": {
+            "fields": [
+                {
+                    "field": "CLIENT-ENC field sentinel",
+                    "changeKind": "clear",
+                    "beforeScalar": "CLIENT-ENC sentinel plaintext"
+                }
+            ],
+            "payloadCiphertext": "ciphertext",
+            "payloadCiphertextProof": "proof",
+            "payloadVersion": 1
+        }
+    });
+
+    let delete_task_output = run_cli(
+        home.path(),
+        &server.base_url,
+        &[
+            "--json",
+            "tasks",
+            "delete",
+            "--work-list-id",
+            &fixture.work_list_id.to_string(),
+            "--task-id",
+            &fixture.task_id.to_string(),
+            "--input-stdin",
+        ],
+        Some(&plaintext_delete_input.to_string()),
+    );
+
+    assert!(!delete_task_output.status.success());
+    assert!(delete_task_output.stdout.is_empty());
+    assert_json_error_contains(&delete_task_output.stderr, "plaintext scalar values");
+    assert!(
+        !delete_task_output
+            .stderr
+            .contains("CLIENT-ENC field sentinel")
+    );
+    assert!(
+        !delete_task_output
+            .stderr
+            .contains("CLIENT-ENC sentinel plaintext")
+    );
+
+    let delete_comment_output = run_cli(
+        home.path(),
+        &server.base_url,
+        &[
+            "--json",
+            "comments",
+            "delete",
+            "--work-list-id",
+            &fixture.work_list_id.to_string(),
+            "--task-id",
+            &fixture.task_id.to_string(),
+            "--comment-id",
+            &fixture.comment_id.to_string(),
+            "--input-stdin",
+        ],
+        Some(&plaintext_delete_input.to_string()),
+    );
+
+    assert!(!delete_comment_output.status.success());
+    assert!(delete_comment_output.stdout.is_empty());
+    assert_json_error_contains(&delete_comment_output.stderr, "plaintext scalar values");
+    assert!(
+        !delete_comment_output
+            .stderr
+            .contains("CLIENT-ENC field sentinel")
+    );
+    assert!(
+        !delete_comment_output
+            .stderr
+            .contains("CLIENT-ENC sentinel plaintext")
+    );
+
+    let state = state.lock().expect("state lock");
+    assert!(state.deleted_task_id.is_none());
+    assert!(state.deleted_comment_id.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_persists_rotated_refresh_tokens_after_automatic_refresh() {
     let fixture = TestFixture::new();
     let state = Arc::new(Mutex::new(TestState::new(fixture.clone())));

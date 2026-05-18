@@ -246,6 +246,7 @@ impl PublicApiClient {
         task_id: Uuid,
         payload: &DeleteTaskRequest,
     ) -> PublicResult<()> {
+        payload.validate_encrypted_boundary()?;
         self.delete_no_content_with_body(
             &format!("/work-lists/{work_list_id}/tasks/{task_id}"),
             payload,
@@ -298,6 +299,7 @@ impl PublicApiClient {
         comment_id: Uuid,
         payload: &DeleteCommentRequest,
     ) -> PublicResult<()> {
+        payload.validate_encrypted_boundary()?;
         self.delete_no_content_with_body(
             &format!("/work-lists/{work_list_id}/tasks/{task_id}/comments/{comment_id}"),
             payload,
@@ -760,11 +762,37 @@ pub struct AuditPatchRequest {
     pub payload_version: i64,
 }
 
+impl AuditPatchRequest {
+    pub fn validate_encrypted_boundary(&self) -> PublicResult<()> {
+        for field in &self.fields {
+            field.validate_encrypted_boundary()?;
+        }
+        Ok(())
+    }
+}
+
+impl AuditPatchFieldRequest {
+    fn validate_encrypted_boundary(&self) -> PublicResult<()> {
+        if self.before_scalar.is_some() || self.after_scalar.is_some() {
+            return Err(PublicError::validation(
+                "audit patch fields must use ciphertext digests, not plaintext scalar values",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeleteTaskRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audit_patch: Option<AuditPatchRequest>,
+}
+
+impl DeleteTaskRequest {
+    pub fn validate_encrypted_boundary(&self) -> PublicResult<()> {
+        validate_optional_audit_patch(self.audit_patch.as_ref())
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -788,6 +816,19 @@ pub struct UpdateCommentRequest {
 pub struct DeleteCommentRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audit_patch: Option<AuditPatchRequest>,
+}
+
+impl DeleteCommentRequest {
+    pub fn validate_encrypted_boundary(&self) -> PublicResult<()> {
+        validate_optional_audit_patch(self.audit_patch.as_ref())
+    }
+}
+
+fn validate_optional_audit_patch(audit_patch: Option<&AuditPatchRequest>) -> PublicResult<()> {
+    match audit_patch {
+        Some(audit_patch) => audit_patch.validate_encrypted_boundary(),
+        None => Ok(()),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -879,5 +920,60 @@ mod tests {
 
         assert!(debug_output.contains("[redacted]"));
         assert!(!debug_output.contains("agent-access-secret"));
+    }
+
+    #[test]
+    fn delete_audit_patch_rejects_plaintext_scalar_fields() {
+        let request = DeleteTaskRequest {
+            audit_patch: Some(AuditPatchRequest {
+                fields: vec![AuditPatchFieldRequest {
+                    field: "CLIENT-ENC field sentinel".to_string(),
+                    change_kind: "clear".to_string(),
+                    before_scalar: Some("plaintext sentinel".to_string()),
+                    after_scalar: None,
+                    before_ciphertext_digest: None,
+                    after_ciphertext_digest: None,
+                }],
+                payload_ciphertext: "ciphertext".to_string(),
+                payload_ciphertext_proof: "proof".to_string(),
+                payload_version: 1,
+            }),
+        };
+
+        let err = request
+            .validate_encrypted_boundary()
+            .expect_err("scalar audit field should be rejected");
+
+        assert!(err.to_string().contains("plaintext scalar values"));
+        assert!(!err.to_string().contains("CLIENT-ENC field sentinel"));
+    }
+
+    #[test]
+    fn delete_audit_patch_allows_ciphertext_digest_fields() {
+        let task_request = DeleteTaskRequest {
+            audit_patch: Some(AuditPatchRequest {
+                fields: vec![AuditPatchFieldRequest {
+                    field: "body".to_string(),
+                    change_kind: "clear".to_string(),
+                    before_scalar: None,
+                    after_scalar: None,
+                    before_ciphertext_digest: Some("before-digest".to_string()),
+                    after_ciphertext_digest: None,
+                }],
+                payload_ciphertext: "ciphertext".to_string(),
+                payload_ciphertext_proof: "proof".to_string(),
+                payload_version: 1,
+            }),
+        };
+        let comment_request = DeleteCommentRequest {
+            audit_patch: task_request.audit_patch.clone(),
+        };
+
+        task_request
+            .validate_encrypted_boundary()
+            .expect("ciphertext-only task audit patch should pass");
+        comment_request
+            .validate_encrypted_boundary()
+            .expect("ciphertext-only comment audit patch should pass");
     }
 }
