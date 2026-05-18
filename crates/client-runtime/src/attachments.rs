@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::time::Duration as StdDuration;
 
 use uuid::Uuid;
 use worklist_client_api::DownloadAttachmentResponse;
@@ -26,6 +27,7 @@ pub(super) enum AttachmentReadStrategy {
 
 const DOCX_CONTENT_TYPE: &str =
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+const ATTACHMENT_DOWNLOAD_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 
 impl AgentAttachment {
     pub(super) fn blob_key(&self) -> &[u8] {
@@ -175,9 +177,13 @@ async fn download_presigned_attachment(
         request = request.header(name, value);
     }
 
-    let response = request.send().await.map_err(|err| {
-        PublicError::unexpected(format!("failed to download attachment ciphertext: {err}"))
-    })?;
+    let response = request
+        .timeout(ATTACHMENT_DOWNLOAD_TIMEOUT)
+        .send()
+        .await
+        .map_err(|err| {
+            PublicError::unexpected(format!("failed to download attachment ciphertext: {err}"))
+        })?;
     let status = response.status();
     if !status.is_success() {
         return Err(PublicError::unexpected(format!(

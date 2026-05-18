@@ -1,23 +1,35 @@
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
+use std::{fmt, time::Duration as StdDuration};
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use worklist_client_auth::{
-    AgentEnrollmentResponse, AgentTokenResponse, PrincipalCredentials, mint_agent_access_token,
-    refresh_access_token, save_agent_credentials, save_credentials,
-    update_credentials_with_refresh,
-};
 use worklist_client_core::{PublicError, PublicResult};
 
 pub type SealedBlob = String;
 
-#[derive(Debug, Clone)]
+const API_HTTP_TIMEOUT: StdDuration = StdDuration::from_secs(30);
+
+#[derive(Clone)]
 pub struct PublicApiClient {
     client: reqwest::Client,
     base_url: String,
-    credentials: Option<PrincipalCredentials>,
+    bearer_token: Option<String>,
+}
+
+impl fmt::Debug for PublicApiClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PublicApiClient")
+            .field("client", &self.client)
+            .field("base_url", &self.base_url)
+            .field(
+                "bearer_token",
+                &self.bearer_token.as_ref().map(|_| "[redacted]"),
+            )
+            .finish()
+    }
 }
 
 impl PublicApiClient {
@@ -25,18 +37,15 @@ impl PublicApiClient {
         Self {
             client: reqwest::Client::new(),
             base_url: normalize_base_url(base_url.into()),
-            credentials: None,
+            bearer_token: None,
         }
     }
 
-    pub fn with_credentials(
-        base_url: impl Into<String>,
-        credentials: PrincipalCredentials,
-    ) -> Self {
+    pub fn with_bearer_token(base_url: impl Into<String>, bearer_token: impl Into<String>) -> Self {
         Self {
             client: reqwest::Client::new(),
             base_url: normalize_base_url(base_url.into()),
-            credentials: Some(credentials),
+            bearer_token: Some(bearer_token.into()),
         }
     }
 
@@ -45,58 +54,30 @@ impl PublicApiClient {
     }
 
     pub fn has_credentials(&self) -> bool {
-        self.credentials.is_some()
+        self.bearer_token.is_some()
     }
 
-    async fn get_access_token(&mut self) -> PublicResult<String> {
-        let credentials = self
-            .credentials
-            .as_mut()
-            .ok_or_else(|| PublicError::validation("not logged in"))?;
-
-        match credentials {
-            PrincipalCredentials::User(credentials) => {
-                if credentials.access_expires_within(60) {
-                    if credentials.is_refresh_expired() {
-                        return Err(PublicError::validation(
-                            "session expired, please login again",
-                        ));
-                    }
-
-                    let refresh_response = refresh_access_token(
-                        &self.client,
-                        &self.base_url,
-                        &credentials.refresh_token,
-                    )
-                    .await?;
-                    update_credentials_with_refresh(credentials, refresh_response);
-                    save_credentials(credentials)?;
-                }
-
-                Ok(credentials.access_token.clone())
-            }
-            PrincipalCredentials::Agent(credentials) => {
-                if credentials.access_expires_within(60) {
-                    let response: AgentTokenResponse =
-                        mint_agent_access_token(&self.client, credentials).await?;
-                    credentials.access_token = Some(response.access_token);
-                    credentials.access_expires_at =
-                        Some(Utc::now() + chrono::Duration::seconds(response.expires_in as i64));
-                    credentials.owner_user_id = Some(response.owner_user_id);
-                    save_agent_credentials(credentials)?;
-                }
-
-                credentials
-                    .access_token
-                    .clone()
-                    .ok_or_else(|| PublicError::validation("agent access token missing"))
-            }
-        }
+    fn access_token(&self) -> PublicResult<&str> {
+        self.bearer_token
+            .as_deref()
+            .ok_or_else(|| PublicError::validation("not logged in"))
     }
 
     async fn get<T: for<'de> Deserialize<'de>>(&mut self, path: &str) -> PublicResult<T> {
         let url = format!("{}{}", self.base_url, path);
         self.send(self.client.get(url), path).await
+    }
+
+    async fn post_public<T: for<'de> Deserialize<'de>, B: Serialize>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> PublicResult<T> {
+        let url = format!("{}{}", self.base_url, path);
+        let response = self
+            .send_request(self.client.post(url).json(body), path)
+            .await?;
+        handle_response(response, path).await
     }
 
     pub async fn get_me(&mut self) -> PublicResult<CurrentUserResponse> {
@@ -154,7 +135,13 @@ impl PublicApiClient {
         &mut self,
         code: &str,
     ) -> PublicResult<AgentEnrollmentResponse> {
-        self.get(&format!("/agents/enrollments/{code}")).await
+        self.post_public(
+            "/agents/enrollments/lookup",
+            &LookupAgentEnrollmentRequest {
+                code: code.to_string(),
+            },
+        )
+        .await
     }
 
     pub async fn list_agents(&mut self) -> PublicResult<Vec<AgentSummaryResponse>> {
@@ -163,11 +150,9 @@ impl PublicApiClient {
 
     pub async fn approve_agent_enrollment(
         &mut self,
-        code: &str,
         payload: &ApproveAgentEnrollmentRequest,
     ) -> PublicResult<AgentSummaryResponse> {
-        self.post(&format!("/agents/enrollments/{code}/approve"), payload)
-            .await
+        self.post("/agents/enrollments/approve", payload).await
     }
 
     pub async fn revoke_agent(&mut self, agent_id: Uuid) -> PublicResult<AgentSummaryResponse> {
@@ -358,12 +343,9 @@ impl PublicApiClient {
         request: reqwest::RequestBuilder,
         path: &str,
     ) -> PublicResult<T> {
-        let token = self.get_access_token().await?;
-        let response = self
-            .authorized(request, &token)
-            .send()
-            .await
-            .map_err(|err| map_reqwest_error(err, path))?;
+        let token = self.access_token()?;
+        let request = self.authorized(request, token);
+        let response = self.send_request(request, path).await?;
 
         handle_response(response, path).await
     }
@@ -373,14 +355,23 @@ impl PublicApiClient {
         request: reqwest::RequestBuilder,
         path: &str,
     ) -> PublicResult<()> {
-        let token = self.get_access_token().await?;
-        let response = self
-            .authorized(request, &token)
-            .send()
-            .await
-            .map_err(|err| map_reqwest_error(err, path))?;
+        let token = self.access_token()?;
+        let request = self.authorized(request, token);
+        let response = self.send_request(request, path).await?;
 
         handle_empty_response(response, path).await
+    }
+
+    async fn send_request(
+        &self,
+        request: reqwest::RequestBuilder,
+        path: &str,
+    ) -> PublicResult<reqwest::Response> {
+        request
+            .timeout(API_HTTP_TIMEOUT)
+            .send()
+            .await
+            .map_err(|err| map_reqwest_error(err, path))
     }
 
     fn authorized(
@@ -396,6 +387,40 @@ impl PublicApiClient {
 pub struct PublicTaskRef {
     pub id: Uuid,
     pub work_list_id: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentEnrollmentResponse {
+    pub agent_id: Uuid,
+    pub owner_user_id: Option<Uuid>,
+    pub status: String,
+    pub approved: bool,
+    pub auth_public_key: String,
+    pub recipient_public_key: String,
+    pub enrollment_code: Option<String>,
+    pub enrollment_expires_at: Option<DateTime<Utc>>,
+    pub handle: Option<String>,
+    pub proposed_handle: Option<String>,
+    pub display_name: Option<String>,
+    pub scope_mode: String,
+    pub fingerprint: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentTokenResponse {
+    pub access_token: String,
+    pub expires_in: u64,
+    pub token_type: String,
+    pub agent_id: Uuid,
+    pub owner_user_id: Uuid,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LookupAgentEnrollmentRequest {
+    pub code: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -472,14 +497,28 @@ pub struct ApproveAgentGrantRequest {
     pub key_ciphertext: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApproveAgentEnrollmentRequest {
+    pub code: String,
     pub handle: String,
     pub display_name: String,
     pub scope_mode: String,
     pub fingerprint: String,
     pub grants: Vec<ApproveAgentGrantRequest>,
+}
+
+impl fmt::Debug for ApproveAgentEnrollmentRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ApproveAgentEnrollmentRequest")
+            .field("code", &"[redacted]")
+            .field("handle", &self.handle)
+            .field("display_name", &self.display_name)
+            .field("scope_mode", &self.scope_mode)
+            .field("fingerprint", &self.fingerprint)
+            .field("grants", &self.grants)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

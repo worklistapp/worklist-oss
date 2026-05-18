@@ -18,5 +18,4 @@ serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
 
-worklist-client-auth = { version = "0.1.0", path = "../client-auth" }
 worklist-client-core = { version = "0.1.0", path = "../client-core" }

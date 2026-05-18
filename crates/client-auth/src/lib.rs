@@ -3,6 +3,7 @@
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
+use std::time::Duration as StdDuration;
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use base64::Engine as _;
@@ -24,12 +25,15 @@ use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSec
 
 use worklist_client_core::{PublicError, PublicResult};
 
+pub use worklist_client_api::{AgentEnrollmentResponse, AgentTokenResponse};
+
 const OPAQUE_SERVER_ID: &[u8] = b"worklist.api";
 const DATA_KEY_KEYCHAIN_SERVICE: &str = "worklist.data-key";
 const AGENT_SEED_KEYCHAIN_SERVICE: &str = "worklist.agent-seed";
 const TEST_KEYCHAIN_DIR_ENV: &str = "WORKLIST_TEST_KEYCHAIN_DIR";
 const AGENT_SEED_FILE_ONLY_ENV: &str = "WORKLIST_AGENT_SEED_FILE_ONLY";
 const KEY_SIZE: usize = 32;
+const AUTH_HTTP_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -136,34 +140,6 @@ impl PrincipalSelection {
     }
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentEnrollmentResponse {
-    pub agent_id: Uuid,
-    pub owner_user_id: Option<Uuid>,
-    pub status: String,
-    pub approved: bool,
-    pub auth_public_key: String,
-    pub recipient_public_key: String,
-    pub enrollment_code: Option<String>,
-    pub enrollment_expires_at: Option<DateTime<Utc>>,
-    pub handle: Option<String>,
-    pub proposed_handle: Option<String>,
-    pub display_name: Option<String>,
-    pub scope_mode: String,
-    pub fingerprint: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentTokenResponse {
-    pub access_token: String,
-    pub expires_in: u64,
-    pub token_type: String,
-    pub agent_id: Uuid,
-    pub owner_user_id: Uuid,
-}
-
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum PersistedDataKeyStatus {
     Available,
@@ -252,6 +228,12 @@ struct CreateAgentEnrollmentRequest {
     auth_public_key: String,
     recipient_public_key: String,
     proposed_handle: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LookupAgentEnrollmentRequest {
+    code: String,
 }
 
 #[derive(Serialize)]
@@ -545,15 +527,14 @@ pub async fn login(
     let login_finish_url = api_endpoint(base_url, "/auth/opaque/login/finish");
     let (opaque_state, client_login_state) = opaque_login_start(password)?;
 
-    let start_response = client
-        .post(login_start_url)
-        .json(&LoginStartRequest {
+    let start_response = send_auth_request(
+        client.post(login_start_url).json(&LoginStartRequest {
             email: email.to_string(),
             client_login_state,
-        })
-        .send()
-        .await
-        .map_err(|err| map_reqwest_error(err, "login start"))?;
+        }),
+        "login start",
+    )
+    .await?;
     let start_result: LoginStartResponse =
         parse_json_response(start_response, "login start response").await?;
 
@@ -564,15 +545,14 @@ pub async fn login(
         &start_result.server_login_state,
     )?;
 
-    let finish_response = client
-        .post(login_finish_url)
-        .json(&LoginFinishRequest {
+    let finish_response = send_auth_request(
+        client.post(login_finish_url).json(&LoginFinishRequest {
             session_token: start_result.session_token,
             client_finish_message,
-        })
-        .send()
-        .await
-        .map_err(|err| map_reqwest_error(err, "login finish"))?;
+        }),
+        "login finish",
+    )
+    .await?;
 
     parse_json_response(finish_response, "auth response").await
 }
@@ -582,14 +562,15 @@ pub async fn refresh_access_token(
     base_url: &str,
     refresh_token: &str,
 ) -> PublicResult<RefreshResponse> {
-    let response = client
-        .post(api_endpoint(base_url, "/auth/refresh"))
-        .json(&RefreshRequest {
-            refresh_token: refresh_token.to_string(),
-        })
-        .send()
-        .await
-        .map_err(|err| map_reqwest_error(err, "token refresh"))?;
+    let response = send_auth_request(
+        client
+            .post(api_endpoint(base_url, "/auth/refresh"))
+            .json(&RefreshRequest {
+                refresh_token: refresh_token.to_string(),
+            }),
+        "token refresh",
+    )
+    .await?;
 
     parse_json_response(response, "refresh response").await
 }
@@ -599,15 +580,16 @@ pub async fn logout(
     base_url: &str,
     refresh_token: &str,
 ) -> PublicResult<Option<String>> {
-    let status = client
-        .post(api_endpoint(base_url, "/auth/logout"))
-        .json(&RefreshRequest {
-            refresh_token: refresh_token.to_string(),
-        })
-        .send()
-        .await
-        .map_err(|err| map_reqwest_error(err, "logout"))?
-        .status();
+    let status = send_auth_request(
+        client
+            .post(api_endpoint(base_url, "/auth/logout"))
+            .json(&RefreshRequest {
+                refresh_token: refresh_token.to_string(),
+            }),
+        "logout",
+    )
+    .await?
+    .status();
 
     Ok((!status.is_success()).then(|| format!("server logout returned status {status}")))
 }
@@ -650,16 +632,17 @@ pub async fn register_agent(
     key_material: &AgentKeyMaterial,
     proposed_handle: Option<String>,
 ) -> PublicResult<AgentEnrollmentResponse> {
-    let response = client
-        .post(api_endpoint(base_url, "/agents/enrollments"))
-        .json(&CreateAgentEnrollmentRequest {
-            auth_public_key: encode_bytes(&key_material.auth_public_key),
-            recipient_public_key: encode_bytes(&key_material.recipient_public_key),
-            proposed_handle,
-        })
-        .send()
-        .await
-        .map_err(|err| map_reqwest_error(err, "agent enrollment"))?;
+    let response = send_auth_request(
+        client
+            .post(api_endpoint(base_url, "/agents/enrollments"))
+            .json(&CreateAgentEnrollmentRequest {
+                auth_public_key: encode_bytes(&key_material.auth_public_key),
+                recipient_public_key: encode_bytes(&key_material.recipient_public_key),
+                proposed_handle,
+            }),
+        "agent enrollment",
+    )
+    .await?;
     parse_json_response(response, "agent enrollment response").await
 }
 
@@ -668,14 +651,15 @@ pub async fn fetch_agent_enrollment(
     base_url: &str,
     code: &str,
 ) -> PublicResult<AgentEnrollmentResponse> {
-    let response = client
-        .get(api_endpoint(
-            base_url,
-            &format!("/agents/enrollments/{code}"),
-        ))
-        .send()
-        .await
-        .map_err(|err| map_reqwest_error(err, "agent enrollment lookup"))?;
+    let response = send_auth_request(
+        client
+            .post(api_endpoint(base_url, "/agents/enrollments/lookup"))
+            .json(&LookupAgentEnrollmentRequest {
+                code: code.to_string(),
+            }),
+        "agent enrollment lookup",
+    )
+    .await?;
     parse_json_response(response, "agent enrollment response").await
 }
 
@@ -687,12 +671,13 @@ pub async fn mint_agent_access_token(
         .ok_or_else(|| PublicError::validation("agent seed missing from local secure storage"))?;
     let key_material = agent_key_material_from_seed(seed)?;
     let assertion = build_agent_assertion(&credentials.agent_id, &key_material.signing_key)?;
-    let response = client
-        .post(api_endpoint(&credentials.api_url, "/auth/agents/token"))
-        .json(&AgentTokenRequestBody { assertion })
-        .send()
-        .await
-        .map_err(|err| map_reqwest_error(err, "agent token mint"))?;
+    let response = send_auth_request(
+        client
+            .post(api_endpoint(&credentials.api_url, "/auth/agents/token"))
+            .json(&AgentTokenRequestBody { assertion }),
+        "agent token mint",
+    )
+    .await?;
     parse_json_response(response, "agent token response").await
 }
 
@@ -830,10 +815,7 @@ pub fn save_agent_seed(credentials: &AgentCredentials, seed: &[u8; KEY_SIZE]) ->
 
     let entry = agent_seed_keyring_entry(credentials)?;
     match entry.set_secret(seed) {
-        Ok(()) => {
-            let _ = clear_agent_seed_file(credentials);
-            Ok(())
-        }
+        Ok(()) => clear_agent_seed_file(credentials),
         Err(err) if should_fallback_from_keyring(&err) => {
             save_agent_seed_to_file(credentials, seed)
         }
@@ -1081,6 +1063,17 @@ fn decode_bytes(value: &str) -> PublicResult<Vec<u8>> {
         .or_else(|_| URL_SAFE_NO_PAD.decode(trimmed))
         .or_else(|_| URL_SAFE.decode(trimmed))
         .map_err(|err| PublicError::validation(format!("invalid base64: {err}")))
+}
+
+async fn send_auth_request(
+    request: reqwest::RequestBuilder,
+    context: &'static str,
+) -> PublicResult<reqwest::Response> {
+    request
+        .timeout(AUTH_HTTP_TIMEOUT)
+        .send()
+        .await
+        .map_err(|err| map_reqwest_error(err, context))
 }
 
 fn map_reqwest_error(err: reqwest::Error, context: &str) -> PublicError {

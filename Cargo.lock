@@ -4023,7 +4023,6 @@ dependencies = [
  "serde",
  "serde_json",
  "uuid",
- "worklist-client-auth",
  "worklist-client-core",
 ]
 
@@ -4047,6 +4046,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "uuid",
+ "worklist-client-api",
  "worklist-client-core",
  "x25519-dalek",
 ]

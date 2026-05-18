@@ -2,40 +2,48 @@
 
 use std::collections::HashMap;
 use std::io::{self, Read};
+use std::time::Duration as StdDuration;
 
 use base64::Engine as _;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use rpassword::prompt_password;
-use serde_json::Value;
 use uuid::Uuid;
 use worklist_client_api::{
-    ApproveAgentGrantRequest, ArchiveTaskRequest, CommentResponse, CreateCommentRequest,
-    CreateTaskRequest, CurrentUserResponse, DashboardStatsResponse, MembershipResponse,
+    AgentEnrollmentResponse, ApproveAgentGrantRequest, ArchiveTaskRequest, CommentResponse,
+    CreateCommentRequest, CreateTaskRequest, CurrentUserResponse, DashboardStatsResponse,
     MoveTaskRequest, MyTaskResponse, PublicApiClient, TaskResponse, UnarchiveTaskRequest,
     UpdateCommentRequest, UpdateTaskRequest, WorkListDetailResponse, WorkListResponse,
 };
 use worklist_client_auth::{
-    AgentCredentials, AgentEnrollmentResponse, Credentials, PersistedDataKeyStatus,
-    PrincipalCredentials, PrincipalSelection, agent_key_material_from_seed,
+    AgentCredentials, Credentials, PersistedDataKeyStatus, PrincipalCredentials,
+    PrincipalSelection, agent_key_material_from_seed,
     clear_persisted_data_key as clear_persisted_data_key_secret, load_agent_seed, load_credentials,
     load_credentials_for_url, load_persisted_data_key, load_principal_credentials_for_url,
-    normalize_api_url, persisted_data_key_status, save_persisted_data_key,
+    mint_agent_access_token, normalize_api_url, persisted_data_key_status, refresh_access_token,
+    save_agent_credentials, save_credentials, save_persisted_data_key,
+    update_credentials_with_refresh,
 };
 use worklist_client_core::{PublicError, PublicResult};
 use worklist_client_crypto::{
-    CommentPayloadBody, FlexibleValue, SymmetricKey, TaskPayloadBody, TaskPayloadRichText,
-    build_comment_payload_envelope, build_task_payload_envelope, compute_payload_proof,
-    decode_attachment_blob_key, decode_sealed_blob, decrypt_agent_work_list_key,
-    decrypt_comment_payload, decrypt_task_payload, decrypt_task_title, decrypt_user_data_key,
-    decrypt_work_list_description, decrypt_work_list_key, decrypt_work_list_payload,
-    decrypt_work_list_title, derive_payload_binding_key, derive_work_list_key,
-    encrypt_agent_work_list_key, encrypt_comment_payload, encrypt_task_payload,
-    flexible_value_to_json, plaintext_rich_text, seal_task_title,
+    CommentPayloadBody, SymmetricKey, TaskPayloadBody, build_comment_payload_envelope,
+    build_task_payload_envelope, compute_payload_proof, decode_attachment_blob_key,
+    decode_sealed_blob, decrypt_comment_payload, decrypt_task_payload, decrypt_user_data_key,
+    derive_payload_binding_key, encrypt_agent_work_list_key, encrypt_comment_payload,
+    encrypt_task_payload, flexible_value_to_json, plaintext_rich_text, seal_task_title,
 };
 
 use crate::attachments::{
     AttachmentReadStrategy, ResolvedTaskAttachmentDownload, build_readable_attachment,
     download_and_decrypt_attachment, find_task_attachment, unsupported_attachment_read_error,
+};
+use crate::projections::{
+    PrincipalWorkListKeySource, TaskProjectionInput, TaskProjectionMetadata, WorkListContext,
+    build_work_list_summary, decode_work_list_description_fallback, decode_work_list_payload_value,
+    decode_work_list_title_fallback, extract_work_list_description, extract_work_list_title,
+    make_read_error, missing_work_list_key_source_error, project_attachments, project_membership,
+    project_task, read_error_to_public_error, resolve_list_key,
+    resolve_work_list_key_for_principal_source, rich_text_to_markdown,
+    unreadable_work_list_context,
 };
 
 pub use models::*;
@@ -46,60 +54,16 @@ pub use unlock_daemon::{
 
 mod attachments;
 mod models;
+mod projections;
 mod unlock_daemon;
 
 const DEFAULT_AUTO_UNLOCK_TTL_SECONDS: u64 = 8 * 60 * 60;
+const AUTH_HTTP_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 
 #[derive(Debug, Clone)]
 pub struct RuntimeClient {
     api_url: String,
     principal_selection: PrincipalSelection,
-}
-
-#[derive(Debug, Clone)]
-struct WorkListContext {
-    work_list_title: Option<String>,
-    list_key: Option<SymmetricKey>,
-    read_error: Option<ReadError>,
-}
-
-#[derive(Debug, Clone)]
-enum PrincipalWorkListKeySource {
-    UserDataKey(SymmetricKey),
-    AgentRecipientPrivateKey([u8; 32]),
-}
-
-#[derive(Debug)]
-struct TaskProjectionMetadata {
-    id: Uuid,
-    work_list_id: Uuid,
-    work_list_title: Option<String>,
-    created_by_membership_id: Uuid,
-    section_id: Option<Uuid>,
-    priority: Option<i8>,
-    position: Option<String>,
-    due_at: Option<DateTime<Utc>>,
-    start_at: Option<DateTime<Utc>>,
-    completed_at: Option<DateTime<Utc>>,
-    archived_at: Option<DateTime<Utc>>,
-    is_completed: bool,
-    recurrence_id: Option<Uuid>,
-    recurrence_schedule: Option<String>,
-    recurrence_iteration: Option<i64>,
-    materialized_at: Option<DateTime<Utc>>,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
-    comment_count: i64,
-}
-
-#[derive(Debug)]
-struct TaskProjectionInput<'a> {
-    metadata: TaskProjectionMetadata,
-    delegations: Vec<worklist_client_api::DelegationResponse>,
-    title_ciphertext: &'a str,
-    payload_ciphertext: &'a str,
-    list_key: Option<&'a SymmetricKey>,
-    inherited_error: Option<ReadError>,
 }
 
 impl RuntimeClient {
@@ -145,19 +109,24 @@ impl RuntimeClient {
         )
     }
 
-    pub fn authenticated_api_client(&self) -> PublicResult<PublicApiClient> {
-        let credentials = self.require_principal_credentials()?;
-        match &credentials {
-            PrincipalCredentials::User(user) if user.is_refresh_expired() => {
-                Err(PublicError::validation(
-                    "session expired - run 'worklist auth login' to authenticate",
-                ))
-            }
-            _ => Ok(PublicApiClient::with_credentials(
-                &self.api_url,
-                credentials,
-            )),
-        }
+    pub async fn authenticated_api_client(&self) -> PublicResult<PublicApiClient> {
+        let access_token = self.fresh_principal_access_token().await?;
+        Ok(PublicApiClient::with_bearer_token(
+            &self.api_url,
+            access_token,
+        ))
+    }
+
+    pub async fn authenticated_owner_api_client(&self) -> PublicResult<PublicApiClient> {
+        let mut credentials = load_credentials_for_url(&self.api_url)?.ok_or_else(|| {
+            PublicError::validation("owner credentials required - run 'worklist auth login' first")
+        })?;
+        self.refresh_user_credentials_if_needed(&mut credentials)
+            .await?;
+        Ok(PublicApiClient::with_bearer_token(
+            &self.api_url,
+            credentials.access_token,
+        ))
     }
 
     fn require_user_principal_credentials(&self, operation: &str) -> PublicResult<Credentials> {
@@ -174,13 +143,68 @@ impl RuntimeClient {
         }
     }
 
+    async fn fresh_principal_access_token(&self) -> PublicResult<String> {
+        match self.require_principal_credentials()? {
+            PrincipalCredentials::User(mut credentials) => {
+                self.refresh_user_credentials_if_needed(&mut credentials)
+                    .await?;
+                Ok(credentials.access_token)
+            }
+            PrincipalCredentials::Agent(mut credentials) => {
+                self.refresh_agent_credentials_if_needed(&mut credentials)
+                    .await?;
+                credentials
+                    .access_token
+                    .ok_or_else(|| PublicError::validation("agent access token missing"))
+            }
+        }
+    }
+
+    async fn refresh_user_credentials_if_needed(
+        &self,
+        credentials: &mut Credentials,
+    ) -> PublicResult<()> {
+        if !credentials.access_expires_within(60) {
+            return Ok(());
+        }
+        if credentials.is_refresh_expired() {
+            return Err(PublicError::validation(
+                "session expired - run 'worklist auth login' to authenticate",
+            ));
+        }
+
+        let client = auth_http_client()?;
+        let refresh_response =
+            refresh_access_token(&client, &self.api_url, &credentials.refresh_token).await?;
+        update_credentials_with_refresh(credentials, refresh_response);
+        save_credentials(credentials)
+    }
+
+    async fn refresh_agent_credentials_if_needed(
+        &self,
+        credentials: &mut AgentCredentials,
+    ) -> PublicResult<()> {
+        if !credentials.access_expires_within(60) {
+            return Ok(());
+        }
+
+        let client = auth_http_client()?;
+        let response = mint_agent_access_token(&client, credentials).await?;
+        let expires_in = i64::try_from(response.expires_in)
+            .map_err(|_| PublicError::unexpected("agent access ttl overflow"))?;
+        credentials.access_token = Some(response.access_token);
+        credentials.access_expires_at = Some(Utc::now() + chrono::Duration::seconds(expires_in));
+        credentials.owner_user_id = Some(response.owner_user_id);
+        save_agent_credentials(credentials)
+    }
+
     pub async fn get_me(&self) -> PublicResult<CurrentUserResponse> {
-        let mut client = self.authenticated_api_client()?;
+        let mut client = self.authenticated_api_client().await?;
         client.get_me().await
     }
 
     pub async fn get_stats(&self) -> PublicResult<DashboardStatsResponse> {
-        let mut client = self.authenticated_api_client()?;
+        let mut client = self.authenticated_api_client().await?;
         client.get_dashboard_stats().await
     }
 
@@ -247,7 +271,7 @@ impl RuntimeClient {
         enrollment: &AgentEnrollmentResponse,
         password_stdin: bool,
     ) -> PublicResult<Vec<ApproveAgentGrantRequest>> {
-        let credentials = self.require_logged_in_credentials()?;
+        let mut credentials = self.require_logged_in_credentials()?;
         let data_key = self.load_data_key(
             &credentials,
             password_stdin,
@@ -258,10 +282,10 @@ impl RuntimeClient {
             .map_err(|err| {
                 PublicError::validation(format!("invalid recipient public key: {err}"))
             })?;
-        let mut client = PublicApiClient::with_credentials(
-            &self.api_url,
-            PrincipalCredentials::User(credentials),
-        );
+        self.refresh_user_credentials_if_needed(&mut credentials)
+            .await?;
+        let mut client =
+            PublicApiClient::with_bearer_token(&self.api_url, credentials.access_token);
         let work_lists = client.list_work_lists().await?;
         let mut grants = Vec::new();
         for work_list in work_lists
@@ -291,7 +315,7 @@ impl RuntimeClient {
             password_stdin,
             "Password required to decrypt work lists.",
         )?;
-        let mut client = self.authenticated_api_client()?;
+        let mut client = self.authenticated_api_client().await?;
         let lists = client.list_work_lists().await?;
         Ok(lists
             .into_iter()
@@ -308,7 +332,7 @@ impl RuntimeClient {
             password_stdin,
             "Password required to decrypt work list data.",
         )?;
-        let mut client = self.authenticated_api_client()?;
+        let mut client = self.authenticated_api_client().await?;
         let detail = client.get_work_list(work_list_id).await?;
         Ok(self.project_work_list_detail(detail, Some(&key_source)))
     }
@@ -324,7 +348,7 @@ impl RuntimeClient {
             password_stdin,
             "Password required to decrypt task data.",
         )?;
-        let mut client = self.authenticated_api_client()?;
+        let mut client = self.authenticated_api_client().await?;
 
         if all || work_list_id.is_none() {
             let work_lists = client.list_work_lists().await?;
@@ -663,7 +687,7 @@ impl RuntimeClient {
     }
 
     pub async fn delete_task(&self, args: DeleteTaskArgs) -> PublicResult<()> {
-        let mut client = self.authenticated_api_client()?;
+        let mut client = self.authenticated_api_client().await?;
         client
             .delete_task(args.work_list_id, args.task_id, &args.input)
             .await
@@ -767,7 +791,7 @@ impl RuntimeClient {
     }
 
     pub async fn delete_comment(&self, args: DeleteCommentArgs) -> PublicResult<()> {
-        let mut client = self.authenticated_api_client()?;
+        let mut client = self.authenticated_api_client().await?;
         client
             .delete_comment(
                 args.work_list_id,
@@ -786,7 +810,7 @@ impl RuntimeClient {
     ) -> PublicResult<(PublicApiClient, WorkListContext)> {
         let key_source =
             self.load_principal_work_list_key_source(password_stdin, prompt_message)?;
-        let mut client = self.authenticated_api_client()?;
+        let mut client = self.authenticated_api_client().await?;
         let work_list = client.get_work_list(work_list_id).await?;
         let context = self.context_from_work_list_detail(&work_list, Some(&key_source));
         Ok((client, context))
@@ -799,16 +823,16 @@ impl RuntimeClient {
         prompt_message: &str,
         operation: &str,
     ) -> PublicResult<(PublicApiClient, WorkListContext)> {
-        let credentials = self.require_user_principal_credentials(operation)?;
+        let mut credentials = self.require_user_principal_credentials(operation)?;
         let key_source = PrincipalWorkListKeySource::UserDataKey(self.load_data_key(
             &credentials,
             password_stdin,
             prompt_message,
         )?);
-        let mut client = PublicApiClient::with_credentials(
-            &self.api_url,
-            PrincipalCredentials::User(credentials),
-        );
+        self.refresh_user_credentials_if_needed(&mut credentials)
+            .await?;
+        let mut client =
+            PublicApiClient::with_bearer_token(&self.api_url, credentials.access_token);
         let work_list = client.get_work_list(work_list_id).await?;
         let context = self.context_from_work_list_detail(&work_list, Some(&key_source));
         Ok((client, context))
@@ -1223,416 +1247,11 @@ fn persisted_unlock_error(prompt_message: &str, err: PublicError) -> PublicError
     ))
 }
 
-fn project_attachments(
-    values: Option<Vec<FlexibleValue>>,
-) -> PublicResult<Option<Vec<AgentAttachment>>> {
-    values
-        .map(|values| values.into_iter().map(project_attachment).collect())
-        .transpose()
-}
-
-fn project_attachment(value: FlexibleValue) -> PublicResult<AgentAttachment> {
-    let FlexibleValue::Map(entries) = value else {
-        return Err(PublicError::validation("attachment must be an object"));
-    };
-
-    let mut id = None;
-    let mut file_name = None;
-    let mut content_type = None;
-    let mut size_bytes = None;
-    let mut blob_key = None;
-
-    for (key, value) in entries {
-        match flexible_key_to_string(key).as_str() {
-            "id" => id = Some(value),
-            "file_name" => file_name = Some(value),
-            "content_type" => content_type = Some(value),
-            "size_bytes" => size_bytes = Some(value),
-            "blob_key" => blob_key = Some(value),
-            _ => {}
-        }
-    }
-
-    Ok(AgentAttachment {
-        id: parse_attachment_uuid(id, "attachment.id")?,
-        file_name: parse_attachment_text(file_name, "attachment.file_name")?,
-        content_type: parse_attachment_text(content_type, "attachment.content_type")?,
-        size_bytes: parse_attachment_u64(size_bytes, "attachment.size_bytes")?,
-        blob_key: parse_attachment_bytes(blob_key, "attachment.blob_key")?,
-    })
-}
-
-fn parse_attachment_uuid(value: Option<FlexibleValue>, field: &str) -> PublicResult<Uuid> {
-    match value {
-        Some(FlexibleValue::Text(value)) => Uuid::parse_str(&value).map_err(|err| {
-            PublicError::validation(format!("{field} must be a UUID string: {err}"))
-        }),
-        Some(FlexibleValue::Bytes(value)) if value.len() == 16 => Uuid::from_slice(&value)
-            .map_err(|err| PublicError::validation(format!("{field} must be a UUID: {err}"))),
-        Some(_) => Err(PublicError::validation(format!(
-            "{field} must be a UUID string or 16-byte UUID"
-        ))),
-        None => Err(PublicError::validation(format!("{field} is required"))),
-    }
-}
-
-fn parse_attachment_text(value: Option<FlexibleValue>, field: &str) -> PublicResult<String> {
-    match value {
-        Some(FlexibleValue::Text(value)) if !value.trim().is_empty() => Ok(value),
-        Some(FlexibleValue::Text(_)) => {
-            Err(PublicError::validation(format!("{field} cannot be empty")))
-        }
-        Some(_) => Err(PublicError::validation(format!("{field} must be text"))),
-        None => Err(PublicError::validation(format!("{field} is required"))),
-    }
-}
-
-fn parse_attachment_u64(value: Option<FlexibleValue>, field: &str) -> PublicResult<u64> {
-    let Some(value) = value else {
-        return Err(PublicError::validation(format!("{field} is required")));
-    };
-
-    match value {
-        FlexibleValue::Integer(value) => u64::try_from(i128::from(value)).map_err(|_| {
-            PublicError::validation(format!("{field} must be a non-negative integer"))
-        }),
-        _ => Err(PublicError::validation(format!(
-            "{field} must be a non-negative integer"
-        ))),
-    }
-}
-
-fn parse_attachment_bytes(value: Option<FlexibleValue>, field: &str) -> PublicResult<Vec<u8>> {
-    match value {
-        Some(FlexibleValue::Bytes(value)) if !value.is_empty() => Ok(value),
-        Some(FlexibleValue::Bytes(_)) => {
-            Err(PublicError::validation(format!("{field} cannot be empty")))
-        }
-        Some(_) => Err(PublicError::validation(format!("{field} must be bytes"))),
-        None => Err(PublicError::validation(format!("{field} is required"))),
-    }
-}
-
-fn flexible_key_to_string(value: FlexibleValue) -> String {
-    match value {
-        FlexibleValue::Text(value) => value,
-        other => flexible_value_to_json(other).to_string(),
-    }
-}
-
-fn project_task(input: TaskProjectionInput<'_>) -> AgentTaskSummary {
-    let TaskProjectionInput {
-        metadata,
-        delegations,
-        title_ciphertext,
-        payload_ciphertext,
-        list_key,
-        inherited_error,
-    } = input;
-    let fallback_title =
-        list_key.and_then(|list_key| decode_task_title_fallback(title_ciphertext, list_key));
-    let projected_delegations = delegations.into_iter().map(project_delegation).collect();
-
-    match list_key {
-        Some(list_key) => match decode_sealed_blob(payload_ciphertext)
-            .and_then(|bytes| decrypt_task_payload(list_key, &bytes))
-        {
-            Ok(payload) => {
-                let TaskPayloadBody {
-                    title,
-                    rich_text,
-                    checklist,
-                    attachments,
-                    references,
-                    mentions,
-                    client_meta,
-                    recurrence_state,
-                } = payload.body;
-                let (attachments, read_error) = match project_attachments(attachments) {
-                    Ok(attachments) => (attachments, None),
-                    Err(err) => (None, Some(make_read_error("task_attachments", err))),
-                };
-
-                AgentTaskSummary {
-                    id: metadata.id,
-                    work_list_id: metadata.work_list_id,
-                    work_list_title: metadata.work_list_title,
-                    created_by_membership_id: metadata.created_by_membership_id,
-                    section_id: metadata.section_id,
-                    priority: metadata.priority,
-                    position: metadata.position,
-                    due_at: metadata.due_at,
-                    start_at: metadata.start_at,
-                    completed_at: metadata.completed_at,
-                    archived_at: metadata.archived_at,
-                    is_completed: metadata.is_completed,
-                    recurrence_id: metadata.recurrence_id,
-                    recurrence_schedule: metadata.recurrence_schedule,
-                    recurrence_iteration: metadata.recurrence_iteration,
-                    materialized_at: metadata.materialized_at,
-                    created_at: metadata.created_at,
-                    updated_at: metadata.updated_at,
-                    comment_count: metadata.comment_count,
-                    title: Some(title).or(fallback_title),
-                    body_markdown: rich_text.as_ref().and_then(rich_text_to_markdown),
-                    body_rich_text: rich_text,
-                    checklist,
-                    attachments,
-                    references: references
-                        .map(|values| values.into_iter().map(flexible_value_to_json).collect()),
-                    mentions,
-                    client_meta: client_meta.map(flexible_value_to_json),
-                    recurrence_state: recurrence_state.map(flexible_value_to_json),
-                    delegations: projected_delegations,
-                    read_error,
-                }
-            }
-            Err(err) => AgentTaskSummary {
-                id: metadata.id,
-                work_list_id: metadata.work_list_id,
-                work_list_title: metadata.work_list_title,
-                created_by_membership_id: metadata.created_by_membership_id,
-                section_id: metadata.section_id,
-                priority: metadata.priority,
-                position: metadata.position,
-                due_at: metadata.due_at,
-                start_at: metadata.start_at,
-                completed_at: metadata.completed_at,
-                archived_at: metadata.archived_at,
-                is_completed: metadata.is_completed,
-                recurrence_id: metadata.recurrence_id,
-                recurrence_schedule: metadata.recurrence_schedule,
-                recurrence_iteration: metadata.recurrence_iteration,
-                materialized_at: metadata.materialized_at,
-                created_at: metadata.created_at,
-                updated_at: metadata.updated_at,
-                comment_count: metadata.comment_count,
-                title: fallback_title,
-                body_markdown: None,
-                body_rich_text: None,
-                checklist: None,
-                attachments: None,
-                references: None,
-                mentions: None,
-                client_meta: None,
-                recurrence_state: None,
-                delegations: projected_delegations,
-                read_error: Some(make_read_error("task_payload", err)),
-            },
-        },
-        None => AgentTaskSummary {
-            id: metadata.id,
-            work_list_id: metadata.work_list_id,
-            work_list_title: metadata.work_list_title,
-            created_by_membership_id: metadata.created_by_membership_id,
-            section_id: metadata.section_id,
-            priority: metadata.priority,
-            position: metadata.position,
-            due_at: metadata.due_at,
-            start_at: metadata.start_at,
-            completed_at: metadata.completed_at,
-            archived_at: metadata.archived_at,
-            is_completed: metadata.is_completed,
-            recurrence_id: metadata.recurrence_id,
-            recurrence_schedule: metadata.recurrence_schedule,
-            recurrence_iteration: metadata.recurrence_iteration,
-            materialized_at: metadata.materialized_at,
-            created_at: metadata.created_at,
-            updated_at: metadata.updated_at,
-            comment_count: metadata.comment_count,
-            title: fallback_title,
-            body_markdown: None,
-            body_rich_text: None,
-            checklist: None,
-            attachments: None,
-            references: None,
-            mentions: None,
-            client_meta: None,
-            recurrence_state: None,
-            delegations: projected_delegations,
-            read_error: Some(inherited_error.unwrap_or(ReadError {
-                code: "work_list_key_missing".to_string(),
-                message: "could not resolve work list key for task decryption".to_string(),
-            })),
-        },
-    }
-}
-
-fn project_membership(membership: &MembershipResponse) -> AgentMembership {
-    AgentMembership {
-        id: membership.id,
-        user_id: membership.user_id,
-        user_email: membership.user_email.clone(),
-        user_name: membership.user_name.clone(),
-        user_avatar_color: membership.user_avatar_color.clone(),
-        role: membership.role.clone(),
-        status: membership.status.clone(),
-        expires_at: membership.expires_at,
-        joined_at: membership.joined_at,
-    }
-}
-
-fn project_delegation(delegation: worklist_client_api::DelegationResponse) -> AgentDelegation {
-    AgentDelegation {
-        id: delegation.id,
-        task_id: delegation.task_id,
-        membership_id: delegation.membership_id,
-        role: delegation.role,
-        status: delegation.status,
-        note_present: delegation.note_ciphertext.is_some(),
-        created_at: delegation.created_at,
-        updated_at: delegation.updated_at,
-    }
-}
-
-fn unreadable_work_list_context(
-    work_list_title: Option<String>,
-    read_error: ReadError,
-) -> WorkListContext {
-    WorkListContext {
-        work_list_title,
-        list_key: None,
-        read_error: Some(read_error),
-    }
-}
-
-fn build_work_list_summary(
-    work_list: WorkListResponse,
-    membership: AgentMembership,
-    title: Option<String>,
-    description: Option<String>,
-    payload: Option<Value>,
-    read_error: Option<ReadError>,
-) -> AgentWorkListSummary {
-    AgentWorkListSummary {
-        id: work_list.id,
-        owner_user_id: work_list.owner_user_id,
-        workspace_id: work_list.workspace_id,
-        timezone: work_list.timezone,
-        section_snapshots: work_list.section_snapshots,
-        created_at: work_list.created_at,
-        updated_at: work_list.updated_at,
-        membership,
-        title,
-        description,
-        payload,
-        read_error,
-    }
-}
-
-fn missing_work_list_key_source_error() -> ReadError {
-    ReadError {
-        code: "work_list_key_source_missing".to_string(),
-        message: "could not load work list key material for decryption".to_string(),
-    }
-}
-
-fn resolve_work_list_key_for_principal_source(
-    key_source: &PrincipalWorkListKeySource,
-    work_list_id: Uuid,
-    membership_ciphertext: &str,
-) -> PublicResult<SymmetricKey> {
-    match key_source {
-        PrincipalWorkListKeySource::UserDataKey(data_key) => {
-            resolve_list_key(data_key, work_list_id, membership_ciphertext)
-        }
-        PrincipalWorkListKeySource::AgentRecipientPrivateKey(recipient_private_key) => {
-            if membership_ciphertext.trim().is_empty() {
-                return Err(PublicError::validation("agent work list grant missing"));
-            }
-
-            let work_list_key_bytes = decode_sealed_blob(membership_ciphertext)?;
-            decrypt_agent_work_list_key(recipient_private_key, &work_list_id, &work_list_key_bytes)
-        }
-    }
-}
-
-fn resolve_list_key(
-    data_key: &SymmetricKey,
-    work_list_id: Uuid,
-    membership_ciphertext: &str,
-) -> PublicResult<SymmetricKey> {
-    if membership_ciphertext.trim().is_empty() {
-        return derive_work_list_key(data_key, &work_list_id);
-    }
-
-    let work_list_key_bytes = decode_sealed_blob(membership_ciphertext)?;
-    decrypt_work_list_key(data_key, &work_list_key_bytes)
-}
-
-fn decode_work_list_payload_value(
-    list_key: &SymmetricKey,
-    payload_ciphertext: &str,
-) -> PublicResult<Value> {
-    let payload_bytes = decode_sealed_blob(payload_ciphertext)?;
-    let payload: FlexibleValue = decrypt_work_list_payload(list_key, &payload_bytes)?;
-    Ok(flexible_value_to_json(payload))
-}
-
-fn extract_work_list_title(payload: &Value) -> Option<String> {
-    payload
-        .get("body")
-        .and_then(|body| body.get("title"))
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-}
-
-fn extract_work_list_description(payload: &Value) -> Option<String> {
-    payload
-        .get("body")
-        .and_then(|body| body.get("description"))
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-}
-
-fn decode_text_fallback(
-    ciphertext: &str,
-    list_key: &SymmetricKey,
-    decrypt: fn(&SymmetricKey, &[u8]) -> PublicResult<String>,
-) -> Option<String> {
-    decode_sealed_blob(ciphertext)
-        .and_then(|bytes| decrypt(list_key, &bytes))
-        .ok()
-}
-
-fn decode_work_list_title_fallback(ciphertext: &str, list_key: &SymmetricKey) -> Option<String> {
-    decode_text_fallback(ciphertext, list_key, decrypt_work_list_title)
-}
-
-fn decode_work_list_description_fallback(
-    ciphertext: &str,
-    list_key: &SymmetricKey,
-) -> Option<String> {
-    decode_text_fallback(ciphertext, list_key, decrypt_work_list_description)
-}
-
-fn decode_task_title_fallback(ciphertext: &str, list_key: &SymmetricKey) -> Option<String> {
-    decode_text_fallback(ciphertext, list_key, decrypt_task_title)
-}
-
-fn make_read_error(code: &str, err: PublicError) -> ReadError {
-    ReadError {
-        code: code.to_string(),
-        message: err.to_string(),
-    }
-}
-
-fn read_error_to_public_error(read_error: Option<&ReadError>, fallback: &str) -> PublicError {
-    match read_error {
-        Some(read_error) => PublicError::validation(read_error.message.clone()),
-        None => PublicError::validation(fallback),
-    }
-}
-
-fn rich_text_to_markdown(rich_text: &TaskPayloadRichText) -> Option<String> {
-    let text = rich_text
-        .blocks
-        .iter()
-        .map(|block| block.text.trim())
-        .filter(|text| !text.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    if text.is_empty() { None } else { Some(text) }
+fn auth_http_client() -> PublicResult<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(AUTH_HTTP_TIMEOUT)
+        .build()
+        .map_err(|err| PublicError::unexpected(format!("failed to build auth HTTP client: {err}")))
 }
 
 fn read_password(label: &str) -> PublicResult<String> {
@@ -1666,73 +1285,4 @@ fn read_required_password(
     }
 
     Ok(password)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn rich_text_to_markdown_joins_non_empty_blocks() {
-        let rich_text = TaskPayloadRichText {
-            format: "markdown".to_string(),
-            version: 1,
-            blocks: vec![
-                worklist_client_crypto::RichTextBlock {
-                    block_type: "paragraph".to_string(),
-                    text: "First".to_string(),
-                },
-                worklist_client_crypto::RichTextBlock {
-                    block_type: "paragraph".to_string(),
-                    text: "Second".to_string(),
-                },
-            ],
-        };
-
-        assert_eq!(
-            rich_text_to_markdown(&rich_text).as_deref(),
-            Some("First\n\nSecond")
-        );
-    }
-
-    #[test]
-    fn user_key_source_resolves_owner_work_list_key() {
-        let data_key = SymmetricKey::new([0x11; 32]);
-        let work_list_id = Uuid::now_v7();
-        let expected = derive_work_list_key(&data_key, &work_list_id).expect("derive list key");
-
-        let resolved = resolve_work_list_key_for_principal_source(
-            &PrincipalWorkListKeySource::UserDataKey(data_key),
-            work_list_id,
-            "",
-        )
-        .expect("resolve owner list key");
-
-        assert_eq!(resolved, expected);
-    }
-
-    #[test]
-    fn agent_key_source_decrypts_agent_work_list_grant() {
-        let work_list_id = Uuid::now_v7();
-        let list_key = SymmetricKey::new([0x22; 32]);
-        let key_material =
-            agent_key_material_from_seed([0x33; 32]).expect("derive agent key material");
-        let grant = encrypt_agent_work_list_key(
-            &key_material.recipient_public_key,
-            &work_list_id,
-            &list_key,
-        )
-        .expect("encrypt agent grant");
-
-        let resolved = resolve_work_list_key_for_principal_source(
-            &PrincipalWorkListKeySource::AgentRecipientPrivateKey(
-                key_material.recipient_private_key,
-            ),
-            work_list_id,
-            &grant.base64,
-        )
-        .expect("resolve agent work list key");
-
-        assert_eq!(resolved, list_key);
-    }
 }

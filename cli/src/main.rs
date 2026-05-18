@@ -13,8 +13,8 @@ use serde_json::json;
 use uuid::Uuid;
 use worklist_client_api::{
     AgentSummaryResponse, ApproveAgentEnrollmentRequest, CurrentUserResponse,
-    DashboardStatsResponse, DeleteCommentRequest, DeleteTaskRequest, PublicApiClient,
-    TaskDetailResponse, TaskResponse, WorkListDetailResponse, WorkListResponse,
+    DashboardStatsResponse, DeleteCommentRequest, DeleteTaskRequest, TaskDetailResponse,
+    TaskResponse, WorkListDetailResponse, WorkListResponse,
 };
 use worklist_client_auth::{
     AgentCredentials, Credentials, PersistedDataKeyStatus, PrincipalCredentials,
@@ -1298,32 +1298,21 @@ async fn cmd_agent_approve(
     password_stdin: bool,
 ) -> CliResult<()> {
     require_password_stdin_for_json_command(format, password_stdin, "agent approve")?;
-    let Some(credentials) = load_credentials_for_url(runtime.api_url())? else {
-        return Err(PublicError::validation(
-            "owner credentials required - run 'worklist auth login' first",
-        )
-        .into());
-    };
     let client = reqwest::Client::new();
     let enrollment = fetch_agent_enrollment(&client, runtime.api_url(), code).await?;
     let grants = runtime
         .build_agent_grants_for_enrollment(&enrollment, password_stdin)
         .await?;
-    let mut api = PublicApiClient::with_credentials(
-        runtime.api_url(),
-        PrincipalCredentials::User(credentials),
-    );
+    let mut api = runtime.authenticated_owner_api_client().await?;
     let approved = api
-        .approve_agent_enrollment(
-            code,
-            &ApproveAgentEnrollmentRequest {
-                handle,
-                display_name,
-                scope_mode: "inherit_owner".to_string(),
-                fingerprint: enrollment.fingerprint,
-                grants,
-            },
-        )
+        .approve_agent_enrollment(&ApproveAgentEnrollmentRequest {
+            code: code.to_string(),
+            handle,
+            display_name,
+            scope_mode: "inherit_owner".to_string(),
+            fingerprint: enrollment.fingerprint,
+            grants,
+        })
         .await?;
     print_agent_summaries(
         format,
@@ -1333,16 +1322,7 @@ async fn cmd_agent_approve(
 }
 
 async fn cmd_agent_list(format: OutputFormat, runtime: &RuntimeClient) -> CliResult<()> {
-    let Some(credentials) = load_credentials_for_url(runtime.api_url())? else {
-        return Err(PublicError::validation(
-            "owner credentials required - run 'worklist auth login' first",
-        )
-        .into());
-    };
-    let mut api = PublicApiClient::with_credentials(
-        runtime.api_url(),
-        PrincipalCredentials::User(credentials),
-    );
+    let mut api = runtime.authenticated_owner_api_client().await?;
     let agents = api.list_agents().await?;
     print_agent_summaries(format, &agents, "serializing agent list should succeed")
 }
@@ -1352,16 +1332,7 @@ async fn cmd_agent_revoke(
     runtime: &RuntimeClient,
     selector: &str,
 ) -> CliResult<()> {
-    let Some(credentials) = load_credentials_for_url(runtime.api_url())? else {
-        return Err(PublicError::validation(
-            "owner credentials required - run 'worklist auth login' first",
-        )
-        .into());
-    };
-    let mut api = PublicApiClient::with_credentials(
-        runtime.api_url(),
-        PrincipalCredentials::User(credentials),
-    );
+    let mut api = runtime.authenticated_owner_api_client().await?;
     let agents = api.list_agents().await?;
     let agent = agents
         .iter()
@@ -1782,7 +1753,7 @@ async fn cmd_lists(
     raw: bool,
 ) -> CliResult<()> {
     if raw {
-        let mut client = runtime.authenticated_api_client()?;
+        let mut client = runtime.authenticated_api_client().await?;
         let lists = client.list_work_lists().await?;
         if lists.is_empty() {
             println!("No work lists found.");
@@ -1809,7 +1780,7 @@ async fn cmd_lists_get(
     raw: bool,
 ) -> CliResult<()> {
     if raw {
-        let mut client = runtime.authenticated_api_client()?;
+        let mut client = runtime.authenticated_api_client().await?;
         let detail = client.get_work_list(work_list_id).await?;
         print_raw_work_list_detail(&detail, format)?;
         return Ok(());
@@ -1834,7 +1805,7 @@ async fn cmd_tasks(
             raw,
         } => {
             if raw {
-                let mut client = runtime.authenticated_api_client()?;
+                let mut client = runtime.authenticated_api_client().await?;
                 if all || work_list_id.is_none() {
                     let response = client.get_my_tasks(Some(100), None).await?;
                     let tasks: Vec<_> = if include_completed {
@@ -1894,7 +1865,7 @@ async fn cmd_tasks(
             raw,
         } => {
             if raw {
-                let mut client = runtime.authenticated_api_client()?;
+                let mut client = runtime.authenticated_api_client().await?;
                 let detail = client.get_task(work_list_id, task_id).await?;
                 print_raw_task_detail(&detail, format)?;
                 return Ok(());
