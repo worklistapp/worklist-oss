@@ -1,5 +1,6 @@
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
+use std::fmt;
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
@@ -51,6 +52,8 @@ impl UnlockMode {
     }
 }
 
+const REDACTED_SECRET_FIELD: &str = "[redacted]";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthSession {
     pub user_id: Uuid,
@@ -59,7 +62,7 @@ pub struct AuthSession {
     pub refresh_expires_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Credentials {
     pub api_url: String,
     pub access_token: String,
@@ -69,6 +72,21 @@ pub struct Credentials {
     pub user_id: Uuid,
     pub email: String,
     pub data_key_ciphertext: String,
+}
+
+impl fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Credentials")
+            .field("api_url", &self.api_url)
+            .field("access_token", &REDACTED_SECRET_FIELD)
+            .field("refresh_token", &REDACTED_SECRET_FIELD)
+            .field("access_expires_at", &self.access_expires_at)
+            .field("refresh_expires_at", &self.refresh_expires_at)
+            .field("user_id", &self.user_id)
+            .field("email", &self.email)
+            .field("data_key_ciphertext", &REDACTED_SECRET_FIELD)
+            .finish()
+    }
 }
 
 impl Credentials {
@@ -85,7 +103,7 @@ impl Credentials {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct AgentCredentials {
     pub api_url: String,
     pub agent_id: Uuid,
@@ -94,6 +112,23 @@ pub struct AgentCredentials {
     pub display_name: Option<String>,
     pub access_token: Option<String>,
     pub access_expires_at: Option<DateTime<Utc>>,
+}
+
+impl fmt::Debug for AgentCredentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AgentCredentials")
+            .field("api_url", &self.api_url)
+            .field("agent_id", &self.agent_id)
+            .field("owner_user_id", &self.owner_user_id)
+            .field("handle", &self.handle)
+            .field("display_name", &self.display_name)
+            .field(
+                "access_token",
+                &self.access_token.as_ref().map(|_| REDACTED_SECRET_FIELD),
+            )
+            .field("access_expires_at", &self.access_expires_at)
+            .finish()
+    }
 }
 
 impl AgentCredentials {
@@ -105,11 +140,20 @@ impl AgentCredentials {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "principal_type", rename_all = "snake_case")]
 pub enum PrincipalCredentials {
     User(Credentials),
     Agent(AgentCredentials),
+}
+
+impl fmt::Debug for PrincipalCredentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::User(credentials) => f.debug_tuple("User").field(credentials).finish(),
+            Self::Agent(credentials) => f.debug_tuple("Agent").field(credentials).finish(),
+        }
+    }
 }
 
 impl PrincipalCredentials {
@@ -154,7 +198,9 @@ impl PersistedDataKeyStatus {
     }
 }
 
-#[derive(Debug, Deserialize)]
+/// Internal wire DTO; public for compatibility only.
+#[doc(hidden)]
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoginStartResponse {
     pub server_login_state: String,
@@ -162,7 +208,17 @@ pub struct LoginStartResponse {
     pub expires_in: u64,
 }
 
-#[derive(Debug, Deserialize)]
+impl fmt::Debug for LoginStartResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LoginStartResponse")
+            .field("server_login_state", &REDACTED_SECRET_FIELD)
+            .field("session_token", &REDACTED_SECRET_FIELD)
+            .field("expires_in", &self.expires_in)
+            .finish()
+    }
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthResponse {
     pub access_token: String,
@@ -172,6 +228,20 @@ pub struct AuthResponse {
     pub token_type: String,
     pub user: UserResponse,
     pub data_key_ciphertext: String,
+}
+
+impl fmt::Debug for AuthResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AuthResponse")
+            .field("access_token", &REDACTED_SECRET_FIELD)
+            .field("refresh_token", &REDACTED_SECRET_FIELD)
+            .field("expires_in", &self.expires_in)
+            .field("refresh_expires_in", &self.refresh_expires_in)
+            .field("token_type", &self.token_type)
+            .field("user", &self.user)
+            .field("data_key_ciphertext", &REDACTED_SECRET_FIELD)
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -186,7 +256,7 @@ pub struct UserResponse {
     pub email_verified: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RefreshResponse {
     pub access_token: String,
@@ -196,6 +266,20 @@ pub struct RefreshResponse {
     pub token_type: String,
 }
 
+impl fmt::Debug for RefreshResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RefreshResponse")
+            .field("access_token", &REDACTED_SECRET_FIELD)
+            .field("refresh_token", &REDACTED_SECRET_FIELD)
+            .field("expires_in", &self.expires_in)
+            .field("refresh_expires_in", &self.refresh_expires_in)
+            .field("token_type", &self.token_type)
+            .finish()
+    }
+}
+
+/// Internal wire DTO; public for compatibility only.
+#[doc(hidden)]
 #[derive(Debug, Deserialize)]
 pub struct ApiError {
     pub error: String,
@@ -1233,6 +1317,58 @@ mod tests {
                 .access_expires_at
                 .map(|value| value.timestamp_micros())
         );
+    }
+
+    #[test]
+    fn credentials_debug_output_redacts_tokens() {
+        let credentials = test_credentials();
+        let agent_credentials = test_agent_credentials();
+        let principal_credentials = PrincipalCredentials::Agent(agent_credentials);
+        let auth_response = AuthResponse {
+            access_token: "auth-access-secret".to_string(),
+            refresh_token: "auth-refresh-secret".to_string(),
+            expires_in: 900,
+            refresh_expires_in: 3600,
+            token_type: "Bearer".to_string(),
+            user: UserResponse {
+                id: Uuid::now_v7(),
+                email: "debug@example.com".to_string(),
+                name: "Debug User".to_string(),
+                timezone: "UTC".to_string(),
+                avatar_color: "blue".to_string(),
+                theme_preference: "system".to_string(),
+                email_verified: true,
+            },
+            data_key_ciphertext: "data-key-ciphertext".to_string(),
+        };
+        let refresh_response = RefreshResponse {
+            access_token: "refresh-access-secret".to_string(),
+            refresh_token: "refresh-token-secret".to_string(),
+            expires_in: 900,
+            refresh_expires_in: 3600,
+            token_type: "Bearer".to_string(),
+        };
+        let login_start_response = LoginStartResponse {
+            server_login_state: "server-state".to_string(),
+            session_token: "login-session-secret".to_string(),
+            expires_in: 120,
+        };
+
+        let debug_output = format!(
+            "{credentials:?} {principal_credentials:?} {auth_response:?} {refresh_response:?} {login_start_response:?}"
+        );
+
+        assert!(debug_output.contains(REDACTED_SECRET_FIELD));
+        assert!(!debug_output.contains("agent-access"));
+        assert!(!debug_output.contains("\"access\""));
+        assert!(!debug_output.contains("\"refresh\""));
+        assert!(!debug_output.contains("auth-access-secret"));
+        assert!(!debug_output.contains("auth-refresh-secret"));
+        assert!(!debug_output.contains("refresh-access-secret"));
+        assert!(!debug_output.contains("refresh-token-secret"));
+        assert!(!debug_output.contains("server-state"));
+        assert!(!debug_output.contains("login-session-secret"));
+        assert!(!debug_output.contains("data-key-ciphertext"));
     }
 
     #[test]

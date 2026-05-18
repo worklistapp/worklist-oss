@@ -407,7 +407,7 @@ pub struct AgentEnrollmentResponse {
     pub fingerprint: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentTokenResponse {
     pub access_token: String,
@@ -415,6 +415,18 @@ pub struct AgentTokenResponse {
     pub token_type: String,
     pub agent_id: Uuid,
     pub owner_user_id: Uuid,
+}
+
+impl fmt::Debug for AgentTokenResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AgentTokenResponse")
+            .field("access_token", &"[redacted]")
+            .field("expires_in", &self.expires_in)
+            .field("token_type", &self.token_type)
+            .field("agent_id", &self.agent_id)
+            .field("owner_user_id", &self.owner_user_id)
+            .finish()
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -846,5 +858,26 @@ fn map_api_error(status: u16, body: &str, path: &str) -> PublicError {
         403 => PublicError::validation("access denied"),
         404 => PublicError::validation(format!("not found: {path}")),
         _ => PublicError::unexpected(format!("API error ({status}) for {path}: {body}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_token_response_debug_redacts_access_token() {
+        let response = AgentTokenResponse {
+            access_token: "agent-access-secret".to_string(),
+            expires_in: 900,
+            token_type: "Bearer".to_string(),
+            agent_id: Uuid::now_v7(),
+            owner_user_id: Uuid::now_v7(),
+        };
+
+        let debug_output = format!("{response:?}");
+
+        assert!(debug_output.contains("[redacted]"));
+        assert!(!debug_output.contains("agent-access-secret"));
     }
 }
