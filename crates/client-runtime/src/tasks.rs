@@ -20,8 +20,8 @@ use crate::models::{
     DownloadedAttachment, MoveTaskArgs, ReadableAttachment, UnarchiveTaskArgs, UpdateTaskArgs,
 };
 use crate::projections::{
-    PrincipalWorkListKeySource, TaskProjectionInput, TaskProjectionMetadata, WorkListContext,
-    decode_work_list_title_fallback, project_task, read_error_to_public_error,
+    TaskProjectionInput, TaskProjectionMetadata, WorkListContext, decode_work_list_title_fallback,
+    project_task, read_error_to_public_error,
 };
 
 impl RuntimeClient {
@@ -157,11 +157,10 @@ impl RuntimeClient {
 
     pub async fn create_task(&self, args: CreateTaskArgs) -> PublicResult<AgentTaskSummary> {
         let (mut client, context) = self
-            .load_user_work_list_context(
+            .load_work_list_context(
                 args.work_list_id,
                 args.password_stdin,
                 "Password required to create encrypted task payloads.",
-                "task creation",
             )
             .await?;
         let list_key = self.require_work_list_key(&context)?;
@@ -353,28 +352,6 @@ impl RuntimeClient {
         let key_source =
             self.load_principal_work_list_key_source(password_stdin, prompt_message)?;
         let mut client = self.authenticated_api_client().await?;
-        let work_list = client.get_work_list(work_list_id).await?;
-        let context = self.context_from_work_list_detail(&work_list, Some(&key_source));
-        Ok((client, context))
-    }
-
-    pub(crate) async fn load_user_work_list_context(
-        &self,
-        work_list_id: Uuid,
-        password_stdin: bool,
-        prompt_message: &str,
-        operation: &str,
-    ) -> PublicResult<(PublicApiClient, WorkListContext)> {
-        let mut credentials = self.require_user_principal_credentials(operation)?;
-        let key_source = PrincipalWorkListKeySource::UserDataKey(self.load_data_key(
-            &credentials,
-            password_stdin,
-            prompt_message,
-        )?);
-        self.refresh_user_credentials_if_needed(&mut credentials)
-            .await?;
-        let mut client =
-            PublicApiClient::with_bearer_token(&self.api_url, credentials.access_token);
         let work_list = client.get_work_list(work_list_id).await?;
         let context = self.context_from_work_list_detail(&work_list, Some(&key_source));
         Ok((client, context))

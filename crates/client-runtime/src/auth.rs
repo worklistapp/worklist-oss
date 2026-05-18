@@ -56,23 +56,6 @@ impl RuntimeClient {
         client.get_dashboard_stats().await
     }
 
-    pub(crate) fn require_user_principal_credentials(
-        &self,
-        operation: &str,
-    ) -> PublicResult<Credentials> {
-        match self.require_principal_credentials()? {
-            PrincipalCredentials::User(credentials) if credentials.is_refresh_expired() => {
-                Err(PublicError::validation(
-                    "session expired - run 'worklist auth login' to authenticate",
-                ))
-            }
-            PrincipalCredentials::User(credentials) => Ok(credentials),
-            PrincipalCredentials::Agent(_) => Err(PublicError::validation(format!(
-                "{operation} requires user credentials; rerun with --principal user until agent-authored content is supported"
-            ))),
-        }
-    }
-
     async fn fresh_principal_access_token(&self) -> PublicResult<String> {
         match self.require_principal_credentials()? {
             PrincipalCredentials::User(mut credentials) => {

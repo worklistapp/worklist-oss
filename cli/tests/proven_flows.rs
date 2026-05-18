@@ -21,17 +21,23 @@ use tempfile::TempDir;
 use tokio::net::TcpListener;
 use uuid::Uuid;
 use worklist_client_api::{AuditPatchFieldRequest, AuditPatchRequest};
-use worklist_client_auth::{AgentCredentials, Credentials, normalize_api_url};
+use worklist_client_auth::{
+    AgentCredentials, Credentials, agent_key_material_from_seed, normalize_api_url,
+};
 use worklist_client_crypto::{
     ATTACHMENT_BLOB_CONTEXT, ATTACHMENT_BLOB_CONTEXT_LABEL, ATTACHMENT_BLOB_REF_VERSION,
     ATTACHMENT_REF_CONTEXT, AttachmentBlobRef, CommentPayloadBody, FlexibleValue, SealedPayload,
     StrongBoxKeyRing, SymmetricKey, TaskPayloadBody, USER_DATA_KEY_CONTEXT,
     WORK_LIST_MEMBERSHIP_CONTEXT, WORK_LIST_PAYLOAD_CONTEXT, build_comment_payload_envelope,
     build_task_payload_envelope, compute_payload_proof, decrypt_comment_payload,
-    decrypt_task_payload, decrypt_task_title, derive_payload_binding_key, encrypt_comment_payload,
-    encrypt_task_payload, flexible_value_to_json, json_value_to_flexible, plaintext_rich_text,
-    seal_task_title, seal_work_list_title, serialize_to_cbor,
+    decrypt_task_payload, decrypt_task_title, derive_payload_binding_key,
+    encrypt_agent_work_list_key, encrypt_comment_payload, encrypt_task_payload,
+    flexible_value_to_json, json_value_to_flexible, plaintext_rich_text, seal_task_title,
+    seal_work_list_title, serialize_to_cbor,
 };
+
+const AUTHORIZED_USER_TOKEN_LABEL: &str = "user";
+const AUTHORIZED_AGENT_TOKEN_LABEL: &str = "agent";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_proven_flows_round_trip_through_mock_api() {
@@ -2201,6 +2207,21 @@ async fn cli_principal_aware_commands_fail_closed_when_both_credential_types_exi
         "rerun with --principal user or --principal agent",
     );
 
+    let ambiguous_status_output = run_cli(
+        home.path(),
+        &server.base_url,
+        &["--json", "auth", "status"],
+        None,
+    );
+    assert!(
+        !ambiguous_status_output.status.success(),
+        "ambiguous auth status unexpectedly succeeded"
+    );
+    assert_json_error_contains(
+        &ambiguous_status_output.stderr,
+        "rerun with --principal user or --principal agent",
+    );
+
     let user_status_output = run_cli(
         home.path(),
         &server.base_url,
@@ -2265,7 +2286,10 @@ async fn cli_principal_aware_commands_fail_closed_when_both_credential_types_exi
     );
     {
         let state = state.lock().expect("state lock");
-        assert_eq!(state.last_authorization_token.as_deref(), Some("user"));
+        assert_eq!(
+            state.last_authorization_token.as_deref(),
+            Some(AUTHORIZED_USER_TOKEN_LABEL)
+        );
     }
 
     let agent_output = run_cli(
@@ -2281,19 +2305,74 @@ async fn cli_principal_aware_commands_fail_closed_when_both_credential_types_exi
     );
     {
         let state = state.lock().expect("state lock");
-        assert_eq!(state.last_authorization_token.as_deref(), Some("agent"));
+        assert_eq!(
+            state.last_authorization_token.as_deref(),
+            Some(AUTHORIZED_AGENT_TOKEN_LABEL)
+        );
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cli_task_create_rejects_agent_only_credentials_before_request() {
+async fn cli_auth_status_auto_uses_principal_matching_current_api() {
+    let fixture = TestFixture::new();
+    let state = Arc::new(Mutex::new(TestState::new(fixture.clone())));
+    let server = spawn_server(state).await;
+    let home = TempDir::new().expect("temp home");
+    seed_credentials(home.path(), &fixture, "https://other-worklist.example.test");
+    seed_agent_credentials(home.path(), &fixture, &server.base_url);
+
+    let status_output = run_cli(
+        home.path(),
+        &server.base_url,
+        &["--json", "auth", "status"],
+        None,
+    );
+    assert!(
+        status_output.status.success(),
+        "status failed: {}",
+        status_output.stderr
+    );
+    let status_json: Value = parse_stdout_json(&status_output.stdout);
+    assert_eq!(status_json["principalType"], "agent");
+    assert_eq!(status_json["apiUrl"], server.base_url);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_auth_status_auto_fails_closed_when_no_principal_matches_current_api() {
+    let fixture = TestFixture::new();
+    let state = Arc::new(Mutex::new(TestState::new(fixture.clone())));
+    let server = spawn_server(state).await;
+    let home = TempDir::new().expect("temp home");
+    seed_credentials(home.path(), &fixture, "https://user-worklist.example.test");
+    seed_agent_credentials(home.path(), &fixture, "https://agent-worklist.example.test");
+
+    let status_output = run_cli(
+        home.path(),
+        &server.base_url,
+        &["--json", "auth", "status"],
+        None,
+    );
+    assert!(
+        !status_output.status.success(),
+        "ambiguous status unexpectedly succeeded"
+    );
+    assert_json_error_contains(
+        &status_output.stderr,
+        "no user or agent credentials are saved for",
+    );
+    assert_json_error_contains(&status_output.stderr, &server.base_url);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_task_create_accepts_agent_only_credentials() {
     let fixture = TestFixture::new();
     let state = Arc::new(Mutex::new(TestState::new(fixture.clone())));
     let server = spawn_server(state.clone()).await;
     let home = TempDir::new().expect("temp home");
-    seed_agent_credentials(home.path(), &fixture, &server.base_url);
+    let agent_credentials = seed_agent_credentials(home.path(), &fixture, &server.base_url);
+    seed_agent_file_backed_secret(home.path(), &agent_credentials);
 
-    let output = run_cli(
+    let output = run_cli_with_agent_seed_file_backend(
         home.path(),
         &server.base_url,
         &[
@@ -2318,32 +2397,46 @@ async fn cli_task_create_rejects_agent_only_credentials_before_request() {
     );
 
     assert!(
-        !output.status.success(),
-        "agent-backed task create unexpectedly succeeded"
+        output.status.success(),
+        "agent-backed task create failed: {}",
+        output.stderr
     );
-    assert_json_error_contains(&output.stderr, "task creation requires user credentials");
-    assert_json_error_contains(&output.stderr, "--principal user");
+    let created: Value = parse_stdout_json(&output.stdout);
+    assert_eq!(created["title"], "Agent task");
+    assert_eq!(created["bodyMarkdown"], "Agent-created task body");
+
     let state = state.lock().expect("state lock");
-    assert!(
-        state.created_task_body.is_none(),
-        "task create request should not reach the server"
+    let created_task = state
+        .created_task_body
+        .as_ref()
+        .expect("agent-created task body recorded");
+    assert_eq!(created_task.title, "Agent task");
+    assert_eq!(
+        created_task
+            .rich_text
+            .as_ref()
+            .expect("created task rich text")
+            .blocks[0]
+            .text,
+        "Agent-created task body"
     );
-    assert!(
-        state.last_authorization_token.is_none(),
-        "agent token should not be used for unsupported task creation"
+    assert_eq!(
+        state.last_authorization_token.as_deref(),
+        Some(AUTHORIZED_AGENT_TOKEN_LABEL)
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cli_comment_create_rejects_explicit_agent_principal_before_request() {
+async fn cli_comment_create_accepts_explicit_agent_principal() {
     let fixture = TestFixture::new();
     let state = Arc::new(Mutex::new(TestState::new(fixture.clone())));
     let server = spawn_server(state.clone()).await;
     let home = TempDir::new().expect("temp home");
     seed_credentials(home.path(), &fixture, &server.base_url);
-    seed_agent_credentials(home.path(), &fixture, &server.base_url);
+    let agent_credentials = seed_agent_credentials(home.path(), &fixture, &server.base_url);
+    seed_agent_file_backed_secret(home.path(), &agent_credentials);
 
-    let output = run_cli(
+    let output = run_cli_with_agent_seed_file_backend(
         home.path(),
         &server.base_url,
         &[
@@ -2363,19 +2456,22 @@ async fn cli_comment_create_rejects_explicit_agent_principal_before_request() {
     );
 
     assert!(
-        !output.status.success(),
-        "agent-backed comment create unexpectedly succeeded"
+        output.status.success(),
+        "agent-backed comment create failed: {}",
+        output.stderr
     );
-    assert_json_error_contains(&output.stderr, "comment creation requires user credentials");
-    assert_json_error_contains(&output.stderr, "--principal user");
+    let created: Value = parse_stdout_json(&output.stdout);
+    assert_eq!(created["bodyMarkdown"], "Agent comment");
+
     let state = state.lock().expect("state lock");
-    assert!(
-        state.created_comment_body.is_none(),
-        "comment create request should not reach the server"
-    );
-    assert!(
-        state.last_authorization_token.is_none(),
-        "agent token should not be used for unsupported comment creation"
+    let created_comment = state
+        .created_comment_body
+        .as_ref()
+        .expect("agent-created comment body recorded");
+    assert_eq!(created_comment.content.blocks[0].text, "Agent comment");
+    assert_eq!(
+        state.last_authorization_token.as_deref(),
+        Some(AUTHORIZED_AGENT_TOKEN_LABEL)
     );
 }
 
@@ -2448,6 +2544,7 @@ struct TestFixture {
     binding_key: SymmetricKey,
     data_key_ciphertext: String,
     work_list_key_ciphertext: String,
+    agent_work_list_key_ciphertext: String,
     work_list_payload_ciphertext: String,
     task_title_ciphertext: String,
     task_payload_ciphertext: String,
@@ -2544,6 +2641,15 @@ impl TestFixture {
             encode_data_key_ciphertext(&password, &salt, &data_key).expect("data key ciphertext");
         let work_list_key_ciphertext =
             encode_membership_key_ciphertext(&data_key, &list_key).expect("membership key");
+        let agent_key_material =
+            agent_key_material_from_seed([0x5A; 32]).expect("agent key material");
+        let agent_work_list_key_ciphertext = encrypt_agent_work_list_key(
+            &agent_key_material.recipient_public_key,
+            &work_list_id,
+            &list_key,
+        )
+        .expect("agent work list key")
+        .base64;
         let work_list_payload_ciphertext =
             encode_work_list_payload_ciphertext(&list_key).expect("work list payload");
         let text_attachment = make_attachment_fixture(
@@ -2659,6 +2765,7 @@ impl TestFixture {
             binding_key,
             data_key_ciphertext,
             work_list_key_ciphertext,
+            agent_work_list_key_ciphertext,
             work_list_payload_ciphertext,
             task_title_ciphertext,
             task_payload_ciphertext,
@@ -3665,11 +3772,11 @@ fn authorize(state: &Arc<Mutex<TestState>>, headers: &HeaderMap) {
     let expected_agent = format!("Bearer {}", state.current_agent_access_token);
 
     if token == expected_user {
-        state.last_authorization_token = Some("user".to_string());
+        state.last_authorization_token = Some(AUTHORIZED_USER_TOKEN_LABEL.to_string());
         return;
     }
     if token == expected_agent {
-        state.last_authorization_token = Some("agent".to_string());
+        state.last_authorization_token = Some(AUTHORIZED_AGENT_TOKEN_LABEL.to_string());
         return;
     }
 
@@ -3803,6 +3910,13 @@ fn work_list_summary_json(state: &TestState) -> serde_json::Value {
 }
 
 fn membership_json(state: &TestState) -> serde_json::Value {
+    let work_list_key_ciphertext =
+        if state.last_authorization_token.as_deref() == Some(AUTHORIZED_AGENT_TOKEN_LABEL) {
+            &state.fixture.agent_work_list_key_ciphertext
+        } else {
+            &state.fixture.work_list_key_ciphertext
+        };
+
     json!({
         "id": state.fixture.membership_id,
         "userId": state.fixture.owner_user_id,
@@ -3811,7 +3925,7 @@ fn membership_json(state: &TestState) -> serde_json::Value {
         "userAvatarColor": "#111111",
         "role": "owner",
         "status": "active",
-        "workListKeyCiphertext": state.fixture.work_list_key_ciphertext,
+        "workListKeyCiphertext": work_list_key_ciphertext,
         "recipientCiphertext": null,
         "invitePackageCiphertext": null,
         "saltMember": null,

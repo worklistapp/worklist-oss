@@ -1395,8 +1395,38 @@ fn load_auth_status(
     let current_api_url = normalize_api_url(api_url);
     let user_credentials = load_credentials()?;
     let agent_credentials = load_agent_credentials()?;
+    let user_matches_current_api = user_credentials
+        .as_ref()
+        .is_some_and(|credentials| credentials.api_url == current_api_url);
+    let agent_matches_current_api = agent_credentials
+        .as_ref()
+        .is_some_and(|credentials| credentials.api_url == current_api_url);
 
     match (principal_selection, user_credentials, agent_credentials) {
+        (PrincipalSelection::Auto, Some(credentials), Some(_))
+            if user_matches_current_api && !agent_matches_current_api =>
+        {
+            logged_in_auth_status(credentials, &current_api_url)
+        }
+        (PrincipalSelection::Auto, Some(_), Some(credentials))
+            if agent_matches_current_api && !user_matches_current_api =>
+        {
+            logged_in_agent_auth_status(credentials, &current_api_url)
+        }
+        (PrincipalSelection::Auto, Some(user), Some(agent)) => {
+            if user_matches_current_api || agent_matches_current_api {
+                return Err(PublicError::validation(
+                    "both user and agent credentials exist; rerun with --principal user or --principal agent",
+                )
+                .into());
+            }
+
+            Err(PublicError::validation(format!(
+                "no user or agent credentials are saved for {current_api_url}; saved user credentials target {}, saved agent credentials target {}",
+                user.api_url, agent.api_url
+            ))
+            .into())
+        }
         (PrincipalSelection::Auto, Some(credentials), _)
         | (PrincipalSelection::User, Some(credentials), _) => {
             logged_in_auth_status(credentials, &current_api_url)

@@ -37,11 +37,10 @@ impl RuntimeClient {
 
     pub async fn create_comment(&self, args: CreateCommentArgs) -> PublicResult<AgentComment> {
         let (mut client, context) = self
-            .load_user_work_list_context(
+            .load_work_list_context(
                 args.work_list_id,
                 args.password_stdin,
                 "Password required to create encrypted comments.",
-                "comment creation",
             )
             .await?;
         let list_key = self.require_work_list_key(&context)?;
@@ -177,6 +176,9 @@ impl RuntimeClient {
             id: comment.id,
             task_id: comment.task_id,
             author_membership_id: comment.author_membership_id,
+            author_agent_id: comment.author_agent_id,
+            author_agent_handle: comment.author_agent_handle,
+            author_agent_display_name: comment.author_agent_display_name,
             body_markdown: rich_text_to_markdown(&content),
             content: Some(content),
             mentions,
@@ -194,6 +196,9 @@ fn unreadable_comment(comment: CommentResponse, read_error: ReadError) -> AgentC
         id: comment.id,
         task_id: comment.task_id,
         author_membership_id: comment.author_membership_id,
+        author_agent_id: comment.author_agent_id,
+        author_agent_handle: comment.author_agent_handle,
+        author_agent_display_name: comment.author_agent_display_name,
         body_markdown: None,
         content: None,
         mentions: None,

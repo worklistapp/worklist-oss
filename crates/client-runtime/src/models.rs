@@ -118,6 +118,12 @@ pub struct AgentComment {
     pub id: Uuid,
     pub task_id: Uuid,
     pub author_membership_id: Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author_agent_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author_agent_handle: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author_agent_display_name: Option<String>,
     pub body_markdown: Option<String>,
     pub content: Option<TaskPayloadRichText>,
     pub mentions: Option<Vec<String>>,
