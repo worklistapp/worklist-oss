@@ -5,9 +5,9 @@ use worklist_client_api::{DelegationResponse, MembershipResponse, WorkListRespon
 use worklist_client_core::{PublicError, PublicResult};
 use worklist_client_crypto::{
     FlexibleValue, SymmetricKey, TaskPayloadBody, TaskPayloadRichText, decode_sealed_blob,
-    decrypt_agent_work_list_key, decrypt_task_payload, decrypt_task_title,
-    decrypt_work_list_description, decrypt_work_list_key, decrypt_work_list_payload,
-    decrypt_work_list_title, derive_work_list_key, flexible_value_to_json,
+    decrypt_agent_work_list_key, decrypt_task_payload, decrypt_task_title_for_id,
+    decrypt_work_list_description_for_id, decrypt_work_list_key, decrypt_work_list_payload,
+    decrypt_work_list_title_for_id, derive_work_list_key, flexible_value_to_json,
 };
 
 use crate::{
@@ -167,8 +167,8 @@ pub(crate) fn project_task(input: TaskProjectionInput<'_>) -> AgentTaskSummary {
         list_key,
         inherited_error,
     } = input;
-    let fallback_title =
-        list_key.and_then(|list_key| decode_task_title_fallback(title_ciphertext, list_key));
+    let fallback_title = list_key
+        .and_then(|list_key| decode_task_title_fallback(title_ciphertext, list_key, metadata.id));
     let projected_delegations = delegations.into_iter().map(project_delegation).collect();
 
     match list_key {
@@ -426,32 +426,49 @@ pub(crate) fn extract_work_list_description(payload: &Value) -> Option<String> {
 fn decode_text_fallback(
     ciphertext: &str,
     list_key: &SymmetricKey,
-    decrypt: fn(&SymmetricKey, &[u8]) -> PublicResult<String>,
+    entity_id: Uuid,
+    decrypt: fn(&SymmetricKey, &[u8], Uuid) -> PublicResult<String>,
 ) -> Option<String> {
     // Fallback text fields preserve older clients' display behavior. Payload decode
     // errors remain the authoritative read diagnostic, so fallback failures only
     // remove the optional display fallback.
     decode_sealed_blob(ciphertext)
-        .and_then(|bytes| decrypt(list_key, &bytes))
+        .and_then(|bytes| decrypt(list_key, &bytes, entity_id))
         .ok()
 }
 
 pub(crate) fn decode_work_list_title_fallback(
     ciphertext: &str,
     list_key: &SymmetricKey,
+    work_list_id: Uuid,
 ) -> Option<String> {
-    decode_text_fallback(ciphertext, list_key, decrypt_work_list_title)
+    decode_text_fallback(
+        ciphertext,
+        list_key,
+        work_list_id,
+        decrypt_work_list_title_for_id,
+    )
 }
 
 pub(crate) fn decode_work_list_description_fallback(
     ciphertext: &str,
     list_key: &SymmetricKey,
+    work_list_id: Uuid,
 ) -> Option<String> {
-    decode_text_fallback(ciphertext, list_key, decrypt_work_list_description)
+    decode_text_fallback(
+        ciphertext,
+        list_key,
+        work_list_id,
+        decrypt_work_list_description_for_id,
+    )
 }
 
-fn decode_task_title_fallback(ciphertext: &str, list_key: &SymmetricKey) -> Option<String> {
-    decode_text_fallback(ciphertext, list_key, decrypt_task_title)
+fn decode_task_title_fallback(
+    ciphertext: &str,
+    list_key: &SymmetricKey,
+    task_id: Uuid,
+) -> Option<String> {
+    decode_text_fallback(ciphertext, list_key, task_id, decrypt_task_title_for_id)
 }
 
 pub(crate) fn make_read_error(code: &str, err: PublicError) -> ReadError {

@@ -4049,6 +4049,7 @@ dependencies = [
  "worklist-client-api",
  "worklist-client-core",
  "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]

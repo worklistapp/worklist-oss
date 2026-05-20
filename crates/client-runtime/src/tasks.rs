@@ -7,7 +7,7 @@ use worklist_client_core::{PublicError, PublicResult};
 use worklist_client_crypto::{
     SymmetricKey, TaskPayloadBody, build_task_payload_envelope, compute_payload_proof,
     decode_attachment_blob_key, decode_sealed_blob, decrypt_task_payload,
-    derive_payload_binding_key, encrypt_task_payload, plaintext_rich_text, seal_task_title,
+    derive_payload_binding_key, encrypt_task_payload, plaintext_rich_text, seal_task_title_for_id,
 };
 
 use crate::RuntimeClient;
@@ -183,7 +183,8 @@ impl RuntimeClient {
         };
         let envelope = build_task_payload_envelope(task_body, 1);
         let payload_ciphertext = encrypt_task_payload(&envelope, list_key)?;
-        let title_ciphertext = seal_task_title(normalized_title, list_key)?;
+        let task_id = Uuid::now_v7();
+        let title_ciphertext = seal_task_title_for_id(normalized_title, list_key, task_id)?;
         let payload_proof = compute_payload_proof(&payload_ciphertext.bytes, &binding_key)?;
         let title_proof = compute_payload_proof(&title_ciphertext.bytes, &binding_key)?;
 
@@ -191,6 +192,7 @@ impl RuntimeClient {
             .create_task(
                 args.work_list_id,
                 &CreateTaskRequest {
+                    task_id: Some(task_id),
                     title_ciphertext: title_ciphertext.base64,
                     title_ciphertext_proof: title_proof,
                     payload_ciphertext: payload_ciphertext.base64,
@@ -267,7 +269,8 @@ impl RuntimeClient {
             if normalized_title.is_empty() {
                 return Err(PublicError::validation("title cannot be empty"));
             }
-            let title_ciphertext = seal_task_title(normalized_title, list_key)?;
+            let title_ciphertext =
+                seal_task_title_for_id(normalized_title, list_key, args.task_id)?;
             let title_proof = compute_payload_proof(&title_ciphertext.bytes, &binding_key)?;
             request.title_ciphertext = Some(title_ciphertext.base64);
             request.title_ciphertext_proof = Some(title_proof);
@@ -413,7 +416,11 @@ impl RuntimeClient {
             context
                 .and_then(|item| item.list_key.as_ref())
                 .and_then(|list_key| {
-                    decode_work_list_title_fallback(&task.work_list_title_ciphertext, list_key)
+                    decode_work_list_title_fallback(
+                        &task.work_list_title_ciphertext,
+                        list_key,
+                        task.work_list_id,
+                    )
                 });
         let work_list_title = context
             .and_then(|item| item.work_list_title.clone())

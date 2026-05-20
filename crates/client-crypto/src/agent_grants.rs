@@ -15,7 +15,7 @@ use zeroize::Zeroize;
 use worklist_client_core::{PublicError, PublicResult};
 
 use crate::{
-    KEY_SIZE, SealedBlobPayload, SymmetricKey, deserialize_from_cbor, serialize_to_cbor,
+    KEY_SIZE, SealedBlobPayload, SymmetricKey, deserialize_complete_from_cbor, serialize_to_cbor,
     symmetric_key_from_bytes,
 };
 
@@ -125,7 +125,7 @@ pub fn decrypt_agent_work_list_key(
         ));
     }
 
-    let envelope: HpkeEnvelope = deserialize_from_cbor(ciphertext)?;
+    let envelope: HpkeEnvelope = deserialize_complete_from_cbor(ciphertext)?;
     if envelope.version != 1 {
         return Err(PublicError::validation("unsupported agent grant version"));
     }
@@ -488,6 +488,7 @@ fn hpke_open(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::deserialize_from_cbor;
 
     #[test]
     fn encrypt_agent_work_list_key_round_trips() {
@@ -548,6 +549,25 @@ mod tests {
             .expect_err("private key length should be validated first");
 
         assert_validation_error(err, "agent recipient private key must be 32 bytes");
+    }
+
+    #[test]
+    fn decrypt_agent_work_list_key_rejects_trailing_cbor_bytes() {
+        let work_list_id = uuid::Uuid::now_v7();
+        let recipient_private = X25519StaticSecret::random();
+        let recipient_public = X25519PublicKey::from(&recipient_private);
+        let list_key = SymmetricKey::new([0x42; KEY_SIZE]);
+        let mut ciphertext =
+            encrypt_agent_work_list_key(recipient_public.as_bytes(), &work_list_id, &list_key)
+                .expect("encrypt agent grant")
+                .bytes;
+        ciphertext.push(0);
+
+        let err =
+            decrypt_agent_work_list_key(&recipient_private.to_bytes(), &work_list_id, &ciphertext)
+                .expect_err("trailing CBOR data should be rejected");
+
+        assert_validation_error(err, "CBOR payload contains trailing bytes");
     }
 
     #[test]

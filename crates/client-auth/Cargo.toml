@@ -28,6 +28,7 @@ serde_json.workspace = true
 sha2.workspace = true
 uuid.workspace = true
 x25519-dalek.workspace = true
+zeroize.workspace = true
 
 worklist-client-api = { version = "0.1.0", path = "../client-api" }
 worklist-client-core = { version = "0.1.0", path = "../client-core" }

@@ -89,7 +89,7 @@ impl RuntimeClient {
         };
 
         let fallback_title =
-            decode_work_list_title_fallback(&work_list.title_ciphertext, &list_key);
+            decode_work_list_title_fallback(&work_list.title_ciphertext, &list_key, work_list.id);
         let (title, read_error) =
             match decode_work_list_payload_value(&list_key, &work_list.payload_ciphertext) {
                 Ok(payload) => (extract_work_list_title(&payload).or(fallback_title), None),
@@ -151,11 +151,14 @@ impl RuntimeClient {
         };
 
         let fallback_title =
-            decode_work_list_title_fallback(&work_list.title_ciphertext, &list_key);
-        let fallback_description = work_list
-            .description_ciphertext
-            .as_deref()
-            .and_then(|ciphertext| decode_work_list_description_fallback(ciphertext, &list_key));
+            decode_work_list_title_fallback(&work_list.title_ciphertext, &list_key, work_list.id);
+        let fallback_description =
+            work_list
+                .description_ciphertext
+                .as_deref()
+                .and_then(|ciphertext| {
+                    decode_work_list_description_fallback(ciphertext, &list_key, work_list.id)
+                });
         match decode_work_list_payload_value(&list_key, &work_list.payload_ciphertext) {
             Ok(payload) => {
                 let title = extract_work_list_title(&payload).or(fallback_title);

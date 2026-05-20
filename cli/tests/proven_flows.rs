@@ -30,7 +30,7 @@ use worklist_client_crypto::{
     StrongBoxKeyRing, SymmetricKey, TaskPayloadBody, USER_DATA_KEY_CONTEXT,
     WORK_LIST_MEMBERSHIP_CONTEXT, WORK_LIST_PAYLOAD_CONTEXT, build_comment_payload_envelope,
     build_task_payload_envelope, compute_payload_proof, decrypt_comment_payload,
-    decrypt_task_payload, decrypt_task_title, derive_payload_binding_key,
+    decrypt_task_payload, decrypt_task_title_for_id, derive_payload_binding_key,
     encrypt_agent_work_list_key, encrypt_comment_payload, encrypt_task_payload,
     flexible_value_to_json, json_value_to_flexible, plaintext_rich_text, seal_task_title,
     seal_work_list_title, serialize_to_cbor,
@@ -1410,6 +1410,35 @@ async fn cli_rejects_input_stdin_with_password_stdin() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_agent_approve_rejects_code_stdin_with_password_stdin() {
+    let home = TempDir::new().expect("temp home");
+    let output = run_cli(
+        home.path(),
+        "https://worklist.app",
+        &[
+            "--json",
+            "agent",
+            "approve",
+            "--code-stdin",
+            "--handle",
+            "agent",
+            "--display-name",
+            "Agent",
+            "--password-stdin",
+        ],
+        Some("enrollment-code\npassword"),
+    );
+
+    assert!(!output.status.success(), "command unexpectedly succeeded");
+    assert!(
+        output.stdout.is_empty(),
+        "unexpected stdout: {}",
+        output.stdout
+    );
+    assert_json_error_contains(&output.stderr, "cannot be used with");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_unlock_daemon_enables_later_decrypt_without_password_flag() {
     let fixture = TestFixture::new();
     let state = Arc::new(Mutex::new(TestState::new(fixture.clone())));
@@ -2783,6 +2812,7 @@ impl TestFixture {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CreateTaskRequestBody {
+    task_id: Option<Uuid>,
     title_ciphertext: String,
     title_ciphertext_proof: String,
     payload_ciphertext: String,
@@ -3134,15 +3164,16 @@ async fn create_task(
         compute_payload_proof(&payload_bytes, &state.fixture.binding_key).expect("payload proof");
     assert_eq!(payload_proof, payload.payload_ciphertext_proof);
 
+    let task_id = payload.task_id.expect("client-generated task id present");
     let decrypted = decrypt_task_payload(&state.fixture.list_key, &payload_bytes)
         .expect("decrypt created task");
-    let decrypted_title = decrypt_task_title(&state.fixture.list_key, &title_bytes)
+    let decrypted_title = decrypt_task_title_for_id(&state.fixture.list_key, &title_bytes, task_id)
         .expect("decrypt created task title");
     assert_eq!(decrypted_title, decrypted.body.title);
     state.created_task_body = Some(decrypted.body.clone());
 
     let response = json!({
-        "id": Uuid::now_v7(),
+        "id": task_id,
         "workListId": state.fixture.work_list_id,
         "createdByMembershipId": state.fixture.membership_id,
         "titleCiphertext": payload.title_ciphertext,
@@ -3200,7 +3231,7 @@ async fn update_task(
             Some(title_proof.as_str())
         );
         Some(
-            decrypt_task_title(&state.fixture.list_key, &title_bytes)
+            decrypt_task_title_for_id(&state.fixture.list_key, &title_bytes, task_id)
                 .expect("decrypt updated task title"),
         )
     } else {

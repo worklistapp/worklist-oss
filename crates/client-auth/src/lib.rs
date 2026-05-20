@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
 use uuid::Uuid;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
+use zeroize::Zeroize;
 
 use worklist_client_core::{PublicError, PublicResult};
 
@@ -686,6 +687,13 @@ pub struct AgentKeyMaterial {
     pub recipient_public_key: [u8; KEY_SIZE],
 }
 
+impl Drop for AgentKeyMaterial {
+    fn drop(&mut self) {
+        self.seed.zeroize();
+        self.recipient_private_key.zeroize();
+    }
+}
+
 pub fn generate_agent_key_material() -> PublicResult<AgentKeyMaterial> {
     let mut seed = [0u8; KEY_SIZE];
     getrandom_fill(&mut seed)?;
@@ -693,21 +701,24 @@ pub fn generate_agent_key_material() -> PublicResult<AgentKeyMaterial> {
 }
 
 pub fn agent_key_material_from_seed(seed: [u8; KEY_SIZE]) -> PublicResult<AgentKeyMaterial> {
-    let auth_seed = hkdf_expand_label(&seed, b"worklist.agent.auth")?;
-    let recipient_seed = hkdf_expand_label(&seed, b"worklist.agent.recipient")?;
+    let mut auth_seed = hkdf_expand_label(&seed, b"worklist.agent.auth")?;
+    let mut recipient_seed = hkdf_expand_label(&seed, b"worklist.agent.recipient")?;
     let signing_key = SigningKey::from_bytes(&auth_seed);
     let auth_public_key = signing_key.verifying_key().to_bytes();
     let recipient_private_key = recipient_seed;
     let recipient_private = X25519StaticSecret::from(recipient_private_key);
     let recipient_public_key = X25519PublicKey::from(&recipient_private).to_bytes();
 
-    Ok(AgentKeyMaterial {
+    let key_material = AgentKeyMaterial {
         seed,
         signing_key,
         auth_public_key,
         recipient_private_key,
         recipient_public_key,
-    })
+    };
+    auth_seed.zeroize();
+    recipient_seed.zeroize();
+    Ok(key_material)
 }
 
 pub async fn register_agent(

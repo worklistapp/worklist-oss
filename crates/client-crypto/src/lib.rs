@@ -13,6 +13,7 @@ use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::Sha256;
 use strong_box::{Key as StrongBoxKey, StaticStrongBox, StrongBox};
+use uuid::Uuid;
 use zeroize::Zeroize;
 
 use worklist_client_core::{PublicError, PublicResult};
@@ -75,6 +76,18 @@ impl TextValueContext {
             Self::NoteTitle => NOTE_TITLE_CONTEXT,
         }
     }
+
+    fn for_entity(self, entity_id: Uuid) -> Vec<u8> {
+        entity_bound_context(self.as_bytes(), entity_id)
+    }
+}
+
+fn entity_bound_context(base_context: &[u8], entity_id: Uuid) -> Vec<u8> {
+    let mut context = Vec::with_capacity(base_context.len() + 1 + 36);
+    context.extend_from_slice(base_context);
+    context.push(b':');
+    context.extend_from_slice(entity_id.to_string().as_bytes());
+    context
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -431,10 +444,31 @@ fn decrypt_text_value(
     payload_ciphertext: &[u8],
     context: TextValueContext,
 ) -> PublicResult<String> {
+    decrypt_text_value_with_context(list_key, payload_ciphertext, context.as_bytes())
+}
+
+fn decrypt_text_value_for_entity(
+    list_key: &SymmetricKey,
+    payload_ciphertext: &[u8],
+    context: TextValueContext,
+    entity_id: Uuid,
+) -> PublicResult<String> {
+    let entity_context = context.for_entity(entity_id);
+    // Older stored text fields used only the base context. Keep reads tolerant
+    // while those fields are rewritten to entity-bound contexts.
+    decrypt_text_value_with_context(list_key, payload_ciphertext, &entity_context)
+        .or_else(|_| decrypt_text_value(list_key, payload_ciphertext, context))
+}
+
+fn decrypt_text_value_with_context(
+    list_key: &SymmetricKey,
+    payload_ciphertext: &[u8],
+    context: &[u8],
+) -> PublicResult<String> {
     let payload: TextValuePayload = decrypt_sealed_payload(
         list_key,
         payload_ciphertext,
-        context.as_bytes(),
+        context,
         "failed to decrypt text value",
     )?;
     Ok(payload.value)
@@ -451,6 +485,19 @@ pub fn decrypt_work_list_title(
     )
 }
 
+pub fn decrypt_work_list_title_for_id(
+    list_key: &SymmetricKey,
+    payload_ciphertext: &[u8],
+    work_list_id: Uuid,
+) -> PublicResult<String> {
+    decrypt_text_value_for_entity(
+        list_key,
+        payload_ciphertext,
+        TextValueContext::WorkListTitle,
+        work_list_id,
+    )
+}
+
 pub fn decrypt_work_list_description(
     list_key: &SymmetricKey,
     payload_ciphertext: &[u8],
@@ -462,6 +509,19 @@ pub fn decrypt_work_list_description(
     )
 }
 
+pub fn decrypt_work_list_description_for_id(
+    list_key: &SymmetricKey,
+    payload_ciphertext: &[u8],
+    work_list_id: Uuid,
+) -> PublicResult<String> {
+    decrypt_text_value_for_entity(
+        list_key,
+        payload_ciphertext,
+        TextValueContext::WorkListDescription,
+        work_list_id,
+    )
+}
+
 pub fn decrypt_task_title(
     list_key: &SymmetricKey,
     payload_ciphertext: &[u8],
@@ -469,11 +529,37 @@ pub fn decrypt_task_title(
     decrypt_text_value(list_key, payload_ciphertext, TextValueContext::TaskTitle)
 }
 
+pub fn decrypt_task_title_for_id(
+    list_key: &SymmetricKey,
+    payload_ciphertext: &[u8],
+    task_id: Uuid,
+) -> PublicResult<String> {
+    decrypt_text_value_for_entity(
+        list_key,
+        payload_ciphertext,
+        TextValueContext::TaskTitle,
+        task_id,
+    )
+}
+
 pub fn decrypt_note_title(
     list_key: &SymmetricKey,
     payload_ciphertext: &[u8],
 ) -> PublicResult<String> {
     decrypt_text_value(list_key, payload_ciphertext, TextValueContext::NoteTitle)
+}
+
+pub fn decrypt_note_title_for_id(
+    list_key: &SymmetricKey,
+    payload_ciphertext: &[u8],
+    note_id: Uuid,
+) -> PublicResult<String> {
+    decrypt_text_value_for_entity(
+        list_key,
+        payload_ciphertext,
+        TextValueContext::NoteTitle,
+        note_id,
+    )
 }
 
 pub fn flexible_value_to_json(value: FlexibleValue) -> serde_json::Value {
@@ -820,12 +906,30 @@ fn seal_text_value(
     list_key: &SymmetricKey,
     context: TextValueContext,
 ) -> PublicResult<SealedBlobPayload> {
+    seal_text_value_with_context(value, list_key, context.as_bytes())
+}
+
+fn seal_text_value_for_entity(
+    value: &str,
+    list_key: &SymmetricKey,
+    context: TextValueContext,
+    entity_id: Uuid,
+) -> PublicResult<SealedBlobPayload> {
+    let entity_context = context.for_entity(entity_id);
+    seal_text_value_with_context(value, list_key, &entity_context)
+}
+
+fn seal_text_value_with_context(
+    value: &str,
+    list_key: &SymmetricKey,
+    context: &[u8],
+) -> PublicResult<SealedBlobPayload> {
     encrypt_sealed_payload(
         &TextValuePayload {
             value: value.to_string(),
         },
         list_key,
-        context.as_bytes(),
+        context,
         "failed to seal text value",
     )
 }
@@ -837,6 +941,19 @@ pub fn seal_work_list_title(
     seal_text_value(value, list_key, TextValueContext::WorkListTitle)
 }
 
+pub fn seal_work_list_title_for_id(
+    value: &str,
+    list_key: &SymmetricKey,
+    work_list_id: Uuid,
+) -> PublicResult<SealedBlobPayload> {
+    seal_text_value_for_entity(
+        value,
+        list_key,
+        TextValueContext::WorkListTitle,
+        work_list_id,
+    )
+}
+
 pub fn seal_work_list_description(
     value: &str,
     list_key: &SymmetricKey,
@@ -844,12 +961,41 @@ pub fn seal_work_list_description(
     seal_text_value(value, list_key, TextValueContext::WorkListDescription)
 }
 
+pub fn seal_work_list_description_for_id(
+    value: &str,
+    list_key: &SymmetricKey,
+    work_list_id: Uuid,
+) -> PublicResult<SealedBlobPayload> {
+    seal_text_value_for_entity(
+        value,
+        list_key,
+        TextValueContext::WorkListDescription,
+        work_list_id,
+    )
+}
+
 pub fn seal_task_title(value: &str, list_key: &SymmetricKey) -> PublicResult<SealedBlobPayload> {
     seal_text_value(value, list_key, TextValueContext::TaskTitle)
 }
 
+pub fn seal_task_title_for_id(
+    value: &str,
+    list_key: &SymmetricKey,
+    task_id: Uuid,
+) -> PublicResult<SealedBlobPayload> {
+    seal_text_value_for_entity(value, list_key, TextValueContext::TaskTitle, task_id)
+}
+
 pub fn seal_note_title(value: &str, list_key: &SymmetricKey) -> PublicResult<SealedBlobPayload> {
     seal_text_value(value, list_key, TextValueContext::NoteTitle)
+}
+
+pub fn seal_note_title_for_id(
+    value: &str,
+    list_key: &SymmetricKey,
+    note_id: Uuid,
+) -> PublicResult<SealedBlobPayload> {
+    seal_text_value_for_entity(value, list_key, TextValueContext::NoteTitle, note_id)
 }
 
 pub fn compute_payload_proof(
@@ -1008,7 +1154,7 @@ fn try_decode_envelope(bytes: &[u8]) -> PublicResult<Option<Vec<u8>>> {
     Ok(None)
 }
 
-fn deserialize_complete_from_cbor<T: DeserializeOwned>(bytes: &[u8]) -> PublicResult<T> {
+pub(crate) fn deserialize_complete_from_cbor<T: DeserializeOwned>(bytes: &[u8]) -> PublicResult<T> {
     let mut cursor = Cursor::new(bytes);
     let decoded = strong_box::ciborium::de::from_reader(&mut cursor)
         .map_err(|err| PublicError::crypto(format!("failed to deserialize payload: {err}")))?;

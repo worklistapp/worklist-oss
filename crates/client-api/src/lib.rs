@@ -688,6 +688,8 @@ pub struct DownloadAttachmentResponse {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateTaskRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<Uuid>,
     pub title_ciphertext: String,
     pub title_ciphertext_proof: String,
     pub payload_ciphertext: String,
