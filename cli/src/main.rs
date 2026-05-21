@@ -6,12 +6,6 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
-use self::output::{
-    print_comment_json, print_comments, print_delete_result, print_raw_my_tasks,
-    print_raw_task_detail, print_raw_tasks, print_raw_work_list_detail, print_raw_work_lists,
-    print_readable_attachment, print_stats, print_task_detail, print_tasks, print_user,
-    print_work_list_detail, print_work_lists,
-};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::json;
@@ -35,6 +29,13 @@ use worklist_client_runtime::{
     DeleteTaskArgs, MoveTaskArgs, MoveTaskInput, RuntimeClient, SessionKey, TaskCreateInput,
     TaskUpdateInput, UnarchiveTaskArgs, UnlockStatus, UpdateCommentArgs, UpdateTaskArgs,
     clear_session, lock, serve, session_key, unlock_status,
+};
+
+use self::output::{
+    print_comment_json, print_comments, print_delete_result, print_raw_my_tasks,
+    print_raw_task_detail, print_raw_tasks, print_raw_work_list_detail, print_raw_work_lists,
+    print_readable_attachment, print_stats, print_task_detail, print_tasks, print_user,
+    print_work_list_detail, print_work_lists,
 };
 
 mod output;
@@ -108,20 +109,12 @@ impl CliError {
     }
 }
 
-fn write_stdout(args: fmt::Arguments<'_>) -> CliResult<()> {
+fn print_stdout(args: fmt::Arguments<'_>) -> CliResult<()> {
     write_to_stream(io::stdout().lock(), args, "print to", "stdout", true)
 }
 
-fn write_stdout_line(args: fmt::Arguments<'_>) -> CliResult<()> {
-    write_line_to_stream(io::stdout().lock(), args, "print to", "stdout", true)
-}
-
-fn print_stdout(args: fmt::Arguments<'_>) -> CliResult<()> {
-    write_stdout(args)
-}
-
 fn println_stdout(args: fmt::Arguments<'_>) -> CliResult<()> {
-    write_stdout_line(args)
+    write_line_to_stream(io::stdout().lock(), args, "print to", "stdout", true)
 }
 
 fn write_stderr_line(args: fmt::Arguments<'_>) -> CliResult<()> {
