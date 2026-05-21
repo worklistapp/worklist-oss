@@ -2,11 +2,16 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::fs;
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
+use self::output::{
+    print_comment_json, print_comments, print_delete_result, print_raw_my_tasks,
+    print_raw_task_detail, print_raw_tasks, print_raw_work_list_detail, print_raw_work_lists,
+    print_readable_attachment, print_stats, print_task_detail, print_tasks, print_user,
+    print_work_list_detail, print_work_lists,
+};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::json;
@@ -32,32 +37,7 @@ use worklist_client_runtime::{
     clear_session, lock, serve, session_key, unlock_status,
 };
 
-macro_rules! print {
-    () => {
-        $crate::write_stdout(format_args!(""))?
-    };
-    ($($arg:tt)*) => {
-        $crate::write_stdout(format_args!($($arg)*))?
-    };
-}
-
-macro_rules! println {
-    () => {
-        $crate::write_stdout_line(format_args!(""))?
-    };
-    ($($arg:tt)*) => {
-        $crate::write_stdout_line(format_args!($($arg)*))?
-    };
-}
-
 mod output;
-
-use output::{
-    print_comment_json, print_comments, print_delete_result, print_raw_my_tasks,
-    print_raw_task_detail, print_raw_tasks, print_raw_work_list_detail, print_raw_work_lists,
-    print_readable_attachment, print_stats, print_task_detail, print_tasks, print_user,
-    print_work_list_detail, print_work_lists,
-};
 
 type CliResult<T> = Result<T, CliError>;
 
@@ -136,6 +116,14 @@ fn write_stdout_line(args: fmt::Arguments<'_>) -> CliResult<()> {
     write_line_to_stream(io::stdout().lock(), args, "print to", "stdout", true)
 }
 
+fn print_stdout(args: fmt::Arguments<'_>) -> CliResult<()> {
+    write_stdout(args)
+}
+
+fn println_stdout(args: fmt::Arguments<'_>) -> CliResult<()> {
+    write_stdout_line(args)
+}
+
 fn write_stderr_line(args: fmt::Arguments<'_>) -> CliResult<()> {
     write_line_to_stream(io::stderr().lock(), args, "print to", "stderr", false)
 }
@@ -191,7 +179,7 @@ fn map_stream_error(
 
 fn print_pretty_json<T: Serialize + ?Sized>(value: &T, context: &str) -> CliResult<()> {
     let output = serde_json::to_string_pretty(value).expect(context);
-    println!("{output}");
+    println_stdout(format_args!("{output}"))?;
     Ok(())
 }
 
@@ -999,7 +987,7 @@ async fn cmd_login(
 
     let password = read_required_password(password_stdin, None)?;
     if format == OutputFormat::Table {
-        println!("Authenticating...");
+        println_stdout(format_args!("Authenticating..."))?;
     }
     let client = reqwest::Client::new();
     let auth_response = login(&client, api_url, &email, &password).await?;
@@ -1176,7 +1164,7 @@ fn print_simple_result<T: Serialize + ?Sized>(
     match format {
         OutputFormat::Json => print_pretty_json(payload, context),
         OutputFormat::Table => {
-            println!("{table_message}");
+            println_stdout(format_args!("{table_message}"))?;
             Ok(())
         }
     }
@@ -1219,10 +1207,16 @@ fn print_login_result(format: OutputFormat, result: &LoginResult, api_url: &str)
         OutputFormat::Json => print_pretty_json(result, "serializing login result should succeed"),
         OutputFormat::Table => {
             if result.already_logged_in {
-                println!("Already logged in as {} ({api_url})", result.email);
+                println_stdout(format_args!(
+                    "Already logged in as {} ({api_url})",
+                    result.email
+                ))?;
             } else {
-                println!("Logged in as {}", result.email);
-                println!("Credentials saved to {}", result.credentials_path);
+                println_stdout(format_args!("Logged in as {}", result.email))?;
+                println_stdout(format_args!(
+                    "Credentials saved to {}",
+                    result.credentials_path
+                ))?;
             }
             Ok(())
         }
@@ -1270,13 +1264,19 @@ async fn cmd_agent_register(
             print_pretty_json(&result, "serializing agent register result should succeed")
         }
         OutputFormat::Table => {
-            println!(
+            println_stdout(format_args!(
                 "Enrollment code: {}",
                 enrollment.enrollment_code.unwrap_or_else(|| "-".into())
-            );
-            println!("Public-key fingerprint: {}", result.fingerprint);
-            println!("Agent ID: {}", result.agent_id);
-            println!("Agent credentials saved to {}", result.credentials_path);
+            ))?;
+            println_stdout(format_args!(
+                "Public-key fingerprint: {}",
+                result.fingerprint
+            ))?;
+            println_stdout(format_args!("Agent ID: {}", result.agent_id))?;
+            println_stdout(format_args!(
+                "Agent credentials saved to {}",
+                result.credentials_path
+            ))?;
             Ok(())
         }
     }
@@ -1433,11 +1433,11 @@ fn print_agent_summaries(
         OutputFormat::Json => print_pretty_json(agents, context),
         OutputFormat::Table => {
             if agents.is_empty() {
-                println!("No agents found.");
+                println_stdout(format_args!("No agents found."))?;
                 return Ok(());
             }
             for agent in agents {
-                println!(
+                println_stdout(format_args!(
                     "{}  {}  {}  grants={}  last_seen={}",
                     agent.handle.as_deref().unwrap_or("-"),
                     agent.display_name.as_deref().unwrap_or("-"),
@@ -1447,7 +1447,7 @@ fn print_agent_summaries(
                         .last_seen_at
                         .map(|value| value.format("%Y-%m-%d %H:%M:%S UTC").to_string())
                         .unwrap_or_else(|| "-".into())
-                );
+                ))?;
             }
             Ok(())
         }
@@ -1668,57 +1668,65 @@ fn unavailable_persisted_bootstrap_status() -> PersistedBootstrapStatus {
 fn print_logged_in_auth_status(status: &LoggedInStatusResult) -> CliResult<()> {
     match status.principal_type {
         "user" => {
-            println!(
+            println_stdout(format_args!(
                 "Logged in as: {}",
                 status.email.as_deref().unwrap_or("unknown user")
-            );
-            println!("API URL: {}", status.api_url);
-            println!("User ID: {}", status.user_id.unwrap_or_default());
-            println!(
+            ))?;
+            println_stdout(format_args!("API URL: {}", status.api_url))?;
+            println_stdout(format_args!(
+                "User ID: {}",
+                status.user_id.unwrap_or_default()
+            ))?;
+            println_stdout(format_args!(
                 "Access token expires: {}",
                 status
                     .access_token_expires_display
                     .as_deref()
                     .unwrap_or("-")
-            );
-            println!(
+            ))?;
+            println_stdout(format_args!(
                 "Refresh token expires: {}",
                 status
                     .refresh_token_expires_display
                     .as_deref()
                     .unwrap_or("-")
-            );
+            ))?;
         }
         "agent" => {
-            println!(
+            println_stdout(format_args!(
                 "Logged in as agent: {}",
                 format_agent_identity(status)
                     .as_deref()
                     .unwrap_or("unknown agent")
-            );
-            println!("API URL: {}", status.api_url);
-            println!("Agent ID: {}", status.agent_id.unwrap_or_default());
+            ))?;
+            println_stdout(format_args!("API URL: {}", status.api_url))?;
+            println_stdout(format_args!(
+                "Agent ID: {}",
+                status.agent_id.unwrap_or_default()
+            ))?;
             if let Some(owner_user_id) = status.owner_user_id {
-                println!("Owner User ID: {}", owner_user_id);
+                println_stdout(format_args!("Owner User ID: {}", owner_user_id))?;
             }
             if let Some(expires_at) = status.access_token_expires_display.as_deref() {
-                println!("Access token expires: {expires_at}");
+                println_stdout(format_args!("Access token expires: {expires_at}"))?;
             }
         }
         _ => {
-            println!("Logged in.");
-            println!("API URL: {}", status.api_url);
+            println_stdout(format_args!("Logged in."))?;
+            println_stdout(format_args!("API URL: {}", status.api_url))?;
         }
     }
 
     if let Some(mismatch) = status.api_url_mismatch.as_ref() {
-        println!("\nNote: Stored credentials are for a different API URL.");
-        println!("Stored: {}", mismatch.stored_api_url);
-        println!("Current: {}", mismatch.current_api_url);
+        println_stdout(format_args!(
+            "\nNote: Stored credentials are for a different API URL."
+        ))?;
+        println_stdout(format_args!("Stored: {}", mismatch.stored_api_url))?;
+        println_stdout(format_args!("Current: {}", mismatch.current_api_url))?;
     }
 
     if let Some(notice) = session_state_notice(status.session_state) {
-        println!("\n{notice}");
+        println_stdout(format_args!("\n{notice}"))?;
     }
 
     print_unlock_daemon_status(&status.unlock_daemon, "\n")?;
@@ -1726,13 +1734,15 @@ fn print_logged_in_auth_status(status: &LoggedInStatusResult) -> CliResult<()> {
 }
 
 fn print_logged_out_auth_status(status: &LoggedOutStatusResult) -> CliResult<()> {
-    println!("Not logged in.");
-    println!(
+    println_stdout(format_args!("Not logged in."))?;
+    println_stdout(format_args!(
         "Credentials would be stored at: {}",
         status.credentials_path
-    );
-    println!("Unlock daemon: inactive for current target");
-    println!("Persisted bootstrap: unavailable for current target");
+    ))?;
+    println_stdout(format_args!("Unlock daemon: inactive for current target"))?;
+    println_stdout(format_args!(
+        "Persisted bootstrap: unavailable for current target"
+    ))?;
     Ok(())
 }
 
@@ -1741,22 +1751,23 @@ fn print_unlock_daemon_status(
     line_prefix: &str,
 ) -> CliResult<()> {
     match (status.active, status.expires_at_unix) {
-        (true, Some(expires_at_unix)) => {
-            println!(
-                "{line_prefix}Unlock daemon: active until unix {}",
-                expires_at_unix
-            )
-        }
-        (true, None) => println!("{line_prefix}Unlock daemon: active"),
-        (false, _) => println!("{line_prefix}Unlock daemon: inactive"),
+        (true, Some(expires_at_unix)) => println_stdout(format_args!(
+            "{line_prefix}Unlock daemon: active until unix {}",
+            expires_at_unix
+        ))?,
+        (true, None) => println_stdout(format_args!("{line_prefix}Unlock daemon: active"))?,
+        (false, _) => println_stdout(format_args!("{line_prefix}Unlock daemon: inactive"))?,
     }
     Ok(())
 }
 
 fn print_persisted_bootstrap_status(status: &PersistedBootstrapStatus) -> CliResult<()> {
     match status.message.as_deref() {
-        Some(message) => println!("Persisted bootstrap: {} ({message})", status.status),
-        None => println!("Persisted bootstrap: {}", status.status),
+        Some(message) => println_stdout(format_args!(
+            "Persisted bootstrap: {} ({message})",
+            status.status
+        ))?,
+        None => println_stdout(format_args!("Persisted bootstrap: {}", status.status))?,
     }
     Ok(())
 }
@@ -1848,7 +1859,7 @@ async fn cmd_lists(
         let mut client = runtime.authenticated_api_client().await?;
         let lists = client.list_work_lists().await?;
         if lists.is_empty() {
-            println!("No work lists found.");
+            println_stdout(format_args!("No work lists found."))?;
             return Ok(());
         }
         print_raw_work_lists(&lists, format, verbose)?;
@@ -1857,7 +1868,7 @@ async fn cmd_lists(
 
     let lists = runtime.list_work_lists(password_stdin).await?;
     if lists.is_empty() {
-        println!("No work lists found.");
+        println_stdout(format_args!("No work lists found."))?;
         return Ok(());
     }
     print_work_lists(&lists, format, verbose)?;
@@ -1910,7 +1921,7 @@ async fn cmd_tasks(
                             .collect()
                     };
                     if tasks.is_empty() {
-                        println!("No tasks found.");
+                        println_stdout(format_args!("No tasks found."))?;
                         return Ok(());
                     }
                     print_raw_my_tasks(&tasks, format)?;
@@ -1929,7 +1940,7 @@ async fn cmd_tasks(
                         .collect()
                 };
                 if tasks.is_empty() {
-                    println!("No tasks found in this work list.");
+                    println_stdout(format_args!("No tasks found in this work list."))?;
                     return Ok(());
                 }
                 print_raw_tasks(&tasks, format)?;
@@ -1941,9 +1952,9 @@ async fn cmd_tasks(
                 .await?;
             if tasks.is_empty() {
                 if all || work_list_id.is_none() {
-                    println!("No tasks found.");
+                    println_stdout(format_args!("No tasks found."))?;
                 } else {
-                    println!("No tasks found in this work list.");
+                    println_stdout(format_args!("No tasks found in this work list."))?;
                 }
                 return Ok(());
             }
@@ -2144,7 +2155,7 @@ async fn cmd_comments_list(
                 print_pretty_json(&comments, "serializing comments should succeed")?;
             }
             OutputFormat::Table => {
-                println!("No comments found.");
+                println_stdout(format_args!("No comments found."))?;
             }
         }
         return Ok(());
@@ -2341,7 +2352,7 @@ fn parse_json_input<T: DeserializeOwned>(contents: &str, source: &str) -> Public
 }
 
 fn prompt(label: &str) -> CliResult<String> {
-    print!("{label}");
+    print_stdout(format_args!("{label}"))?;
     flush_stdout()?;
 
     let mut input = String::new();
@@ -2365,7 +2376,7 @@ fn read_required_password(password_stdin: bool, prompt_message: Option<&str>) ->
         read_password_from_stdin()?
     } else {
         if let Some(prompt_message) = prompt_message {
-            println!("{prompt_message}");
+            println_stdout(format_args!("{prompt_message}"))?;
         }
         rpassword::prompt_password("Password: ")
             .map_err(|err| PublicError::unexpected(format!("failed to read password: {err}")))?
@@ -2456,7 +2467,10 @@ fn print_download_result(
             "serializing download result should succeed",
         )?,
         OutputFormat::Table => {
-            println!("Saved attachment to {}", output_path.display());
+            println_stdout(format_args!(
+                "Saved attachment to {}",
+                output_path.display()
+            ))?;
         }
     }
     Ok(())
