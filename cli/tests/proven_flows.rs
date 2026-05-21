@@ -2673,7 +2673,7 @@ impl TestFixture {
         let agent_key_material =
             agent_key_material_from_seed([0x5A; 32]).expect("agent key material");
         let agent_work_list_key_ciphertext = encrypt_agent_work_list_key(
-            &agent_key_material.recipient_public_key,
+            agent_key_material.recipient_public_key(),
             &work_list_id,
             &list_key,
         )

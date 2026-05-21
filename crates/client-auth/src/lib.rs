@@ -10,34 +10,34 @@ use argon2::{Algorithm, Argon2, Params, Version};
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
-use ed25519_dalek::{Signer, SigningKey};
 use generic_array::{ArrayLength, GenericArray};
-use hkdf::Hkdf;
 use opaque_ke::{
     CipherSuite, ClientLogin, ClientLoginFinishParameters, ClientLoginStartResult,
     CredentialResponse, Identifiers, Ristretto255, errors::InternalError,
     key_exchange::tripledh::TripleDh, ksf::Ksf,
 };
-use rand_core::{OsRng, RngCore};
+use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
 use uuid::Uuid;
-use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
-use zeroize::Zeroize;
 
 use worklist_client_core::{PublicError, PublicResult};
 
+mod agent_keys;
+
+pub use agent_keys::{
+    AgentKeyMaterial, agent_key_material_from_seed, build_agent_token_mint_assertion,
+    fetch_agent_enrollment, generate_agent_key_material, mint_agent_access_token, register_agent,
+};
 pub use worklist_client_api::{AgentEnrollmentResponse, AgentTokenResponse};
 
 const OPAQUE_SERVER_ID: &[u8] = b"worklist.api";
-const AGENT_ASSERTION_PURPOSE_TOKEN_MINT: &str = "token_mint";
-#[cfg(test)]
-const AGENT_ASSERTION_PURPOSE_CANCEL_ENROLLMENT: &str = "cancel_enrollment";
+pub(crate) const AGENT_ASSERTION_PURPOSE_TOKEN_MINT: &str = "token_mint";
 const DATA_KEY_KEYCHAIN_SERVICE: &str = "worklist.data-key";
 const AGENT_SEED_KEYCHAIN_SERVICE: &str = "worklist.agent-seed";
 const TEST_KEYCHAIN_DIR_ENV: &str = "WORKLIST_TEST_KEYCHAIN_DIR";
 const AGENT_SEED_FILE_ONLY_ENV: &str = "WORKLIST_AGENT_SEED_FILE_ONLY";
-const KEY_SIZE: usize = 32;
+pub(crate) const KEY_SIZE: usize = 32;
 const AUTH_HTTP_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 const REDACTED_SECRET_FIELD: &str = "[redacted]";
 
@@ -135,12 +135,65 @@ impl fmt::Debug for AgentCredentials {
 }
 
 impl AgentCredentials {
+    pub fn state(&self) -> PublicResult<AgentCredentialState<'_>> {
+        match (
+            self.owner_user_id,
+            self.access_token.as_deref(),
+            self.access_expires_at,
+        ) {
+            (Some(owner_user_id), Some(access_token), Some(access_expires_at)) => {
+                Ok(AgentCredentialState::Active {
+                    owner_user_id,
+                    access_token,
+                    access_expires_at,
+                })
+            }
+            (None, Some(_), Some(_)) => Err(PublicError::validation(
+                "agent credentials have an access token but no owner user id",
+            )),
+            (_, Some(_), None) | (_, None, Some(_)) => Err(PublicError::validation(
+                "agent credentials have a partial access token state",
+            )),
+            (owner_user_id, None, None) => Ok(AgentCredentialState::Registered { owner_user_id }),
+        }
+    }
+
     pub fn access_expires_within(&self, seconds: i64) -> bool {
         match self.access_expires_at {
             Some(expires_at) => Utc::now() + chrono::Duration::seconds(seconds) >= expires_at,
             None => true,
         }
     }
+
+    pub fn needs_access_token_within(&self, seconds: i64) -> PublicResult<bool> {
+        match self.state()? {
+            AgentCredentialState::Active {
+                access_expires_at, ..
+            } => Ok(Utc::now() + chrono::Duration::seconds(seconds) >= access_expires_at),
+            AgentCredentialState::Registered { .. } => Ok(true),
+        }
+    }
+
+    pub fn active_access_token(&self) -> PublicResult<&str> {
+        match self.state()? {
+            AgentCredentialState::Active { access_token, .. } => Ok(access_token),
+            AgentCredentialState::Registered { .. } => {
+                Err(PublicError::validation("agent access token missing"))
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum AgentCredentialState<'a> {
+    Registered {
+        owner_user_id: Option<Uuid>,
+    },
+    Active {
+        owner_user_id: Uuid,
+        access_token: &'a str,
+        access_expires_at: DateTime<Utc>,
+    },
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -309,26 +362,6 @@ struct RefreshRequest {
     refresh_token: String,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CreateAgentEnrollmentRequest {
-    auth_public_key: String,
-    recipient_public_key: String,
-    proposed_handle: Option<String>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct LookupAgentEnrollmentRequest {
-    code: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct AgentTokenRequestBody {
-    assertion: String,
-}
-
 pub struct ClientKsf {
     argon: Argon2<'static>,
 }
@@ -386,9 +419,11 @@ pub fn normalize_api_url(api_url: &str) -> String {
         .unwrap_or_else(|_| api_url.trim().trim_end_matches('/').to_string())
 }
 
-fn canonicalize_api_url(api_url: &str) -> PublicResult<String> {
+pub(crate) fn canonicalize_api_url(api_url: &str) -> PublicResult<String> {
     let mut url = reqwest::Url::parse(api_url.trim()).map_err(|err| {
-        PublicError::validation(format!("API URL must be an absolute HTTP(S) base URL: {err}"))
+        PublicError::validation(format!(
+            "API URL must be an absolute HTTP(S) base URL: {err}"
+        ))
     })?;
     if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
         return Err(PublicError::validation(
@@ -401,7 +436,9 @@ fn canonicalize_api_url(api_url: &str) -> PublicResult<String> {
         ));
     }
     if url.username() != "" || url.password().is_some() {
-        return Err(PublicError::validation("API URL must not include credentials"));
+        return Err(PublicError::validation(
+            "API URL must not include credentials",
+        ));
     }
     if matches!(
         (url.scheme(), url.port()),
@@ -718,134 +755,6 @@ pub async fn logout(
     Ok((!status.is_success()).then(|| format!("server logout returned status {status}")))
 }
 
-pub struct AgentKeyMaterial {
-    pub seed: [u8; KEY_SIZE],
-    pub signing_key: SigningKey,
-    pub auth_public_key: [u8; KEY_SIZE],
-    pub recipient_private_key: [u8; KEY_SIZE],
-    pub recipient_public_key: [u8; KEY_SIZE],
-}
-
-impl Drop for AgentKeyMaterial {
-    fn drop(&mut self) {
-        self.seed.zeroize();
-        self.recipient_private_key.zeroize();
-    }
-}
-
-pub fn generate_agent_key_material() -> PublicResult<AgentKeyMaterial> {
-    let mut seed = [0u8; KEY_SIZE];
-    getrandom_fill(&mut seed)?;
-    agent_key_material_from_seed(seed)
-}
-
-pub fn agent_key_material_from_seed(seed: [u8; KEY_SIZE]) -> PublicResult<AgentKeyMaterial> {
-    let mut auth_seed = hkdf_expand_label(&seed, b"worklist.agent.auth")?;
-    let mut recipient_seed = hkdf_expand_label(&seed, b"worklist.agent.recipient")?;
-    let signing_key = SigningKey::from_bytes(&auth_seed);
-    let auth_public_key = signing_key.verifying_key().to_bytes();
-    let recipient_private_key = recipient_seed;
-    let recipient_private = X25519StaticSecret::from(recipient_private_key);
-    let recipient_public_key = X25519PublicKey::from(&recipient_private).to_bytes();
-
-    let key_material = AgentKeyMaterial {
-        seed,
-        signing_key,
-        auth_public_key,
-        recipient_private_key,
-        recipient_public_key,
-    };
-    auth_seed.zeroize();
-    recipient_seed.zeroize();
-    Ok(key_material)
-}
-
-pub async fn register_agent(
-    client: &reqwest::Client,
-    base_url: &str,
-    key_material: &AgentKeyMaterial,
-    proposed_handle: Option<String>,
-) -> PublicResult<AgentEnrollmentResponse> {
-    let response = send_auth_request(
-        client
-            .post(api_endpoint(base_url, "/agents/enrollments"))
-            .json(&CreateAgentEnrollmentRequest {
-                auth_public_key: encode_bytes(&key_material.auth_public_key),
-                recipient_public_key: encode_bytes(&key_material.recipient_public_key),
-                proposed_handle,
-            }),
-        "agent enrollment",
-    )
-    .await?;
-    parse_json_response(response, "agent enrollment response").await
-}
-
-pub async fn fetch_agent_enrollment(
-    client: &reqwest::Client,
-    base_url: &str,
-    code: &str,
-) -> PublicResult<AgentEnrollmentResponse> {
-    let response = send_auth_request(
-        client
-            .post(api_endpoint(base_url, "/agents/enrollments/lookup"))
-            .json(&LookupAgentEnrollmentRequest {
-                code: code.to_string(),
-            }),
-        "agent enrollment lookup",
-    )
-    .await?;
-    parse_json_response(response, "agent enrollment response").await
-}
-
-pub async fn mint_agent_access_token(
-    client: &reqwest::Client,
-    credentials: &AgentCredentials,
-) -> PublicResult<AgentTokenResponse> {
-    let seed = load_agent_seed(credentials)?
-        .ok_or_else(|| PublicError::validation("agent seed missing from local secure storage"))?;
-    let key_material = agent_key_material_from_seed(seed)?;
-    let assertion = build_agent_token_mint_assertion(
-        &credentials.agent_id,
-        &key_material.signing_key,
-        &canonicalize_api_url(&credentials.api_url)?,
-    )?;
-    let response = send_auth_request(
-        client
-            .post(api_endpoint(&credentials.api_url, "/auth/agents/token"))
-            .json(&AgentTokenRequestBody { assertion }),
-        "agent token mint",
-    )
-    .await?;
-    parse_json_response(response, "agent token response").await
-}
-
-pub fn build_agent_token_mint_assertion(
-    agent_id: &Uuid,
-    signing_key: &SigningKey,
-    audience: &str,
-) -> PublicResult<String> {
-    build_agent_assertion(
-        agent_id,
-        signing_key,
-        audience,
-        AGENT_ASSERTION_PURPOSE_TOKEN_MINT,
-    )
-}
-
-#[cfg(test)]
-fn build_agent_cancel_enrollment_assertion(
-    agent_id: &Uuid,
-    signing_key: &SigningKey,
-    audience: &str,
-) -> PublicResult<String> {
-    build_agent_assertion(
-        agent_id,
-        signing_key,
-        audience,
-        AGENT_ASSERTION_PURPOSE_CANCEL_ENROLLMENT,
-    )
-}
-
 pub fn auth_response_to_credentials(api_url: &str, response: AuthResponse) -> Credentials {
     let now = Utc::now();
     Credentials {
@@ -875,60 +784,13 @@ fn expires_at_from(now: DateTime<Utc>, expires_in_seconds: u64) -> DateTime<Utc>
     now + chrono::Duration::seconds(expires_in_seconds as i64)
 }
 
-fn api_endpoint(base_url: &str, path: &str) -> String {
+pub(crate) fn api_endpoint(base_url: &str, path: &str) -> String {
     format!("{}{}", base_url.trim_end_matches('/'), path)
 }
 
 enum PersistedDataKeyBackend {
     PlatformKeyring,
     TestDirectory(PathBuf),
-}
-
-fn hkdf_expand_label(seed: &[u8; KEY_SIZE], label: &[u8]) -> PublicResult<[u8; KEY_SIZE]> {
-    let hkdf = Hkdf::<Sha256>::new(None, seed);
-    let mut output = [0u8; KEY_SIZE];
-    hkdf.expand(label, &mut output)
-        .map_err(|err| PublicError::crypto(format!("hkdf expansion failed: {err}")))?;
-    Ok(output)
-}
-
-fn getrandom_fill(bytes: &mut [u8]) -> PublicResult<()> {
-    let mut rng = OsRng;
-    rng.try_fill_bytes(bytes)
-        .map_err(|err| PublicError::crypto(format!("os random generation failed: {err}")))
-}
-
-fn build_agent_assertion(
-    agent_id: &Uuid,
-    signing_key: &SigningKey,
-    audience: &str,
-    purpose: &str,
-) -> PublicResult<String> {
-    let now = Utc::now().timestamp();
-    let header_json = serde_json::json!({
-        "alg": "EdDSA",
-        "typ": "JWT",
-    });
-    let claims_json = serde_json::json!({
-        "iss": agent_id,
-        "aud": audience,
-        "jti": Uuid::now_v7(),
-        "iat": now,
-        "exp": now + 60,
-        "purpose": purpose,
-    });
-    let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header_json).map_err(|err| {
-        PublicError::unexpected(format!("failed to serialize JWT header: {err}"))
-    })?);
-    let claims_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims_json).map_err(|err| {
-        PublicError::unexpected(format!("failed to serialize JWT claims: {err}"))
-    })?);
-    let signing_input = format!("{header_b64}.{claims_b64}");
-    let signature = signing_key.sign(signing_input.as_bytes()).to_bytes();
-    Ok(format!(
-        "{signing_input}.{}",
-        URL_SAFE_NO_PAD.encode(signature)
-    ))
 }
 
 impl PersistedDataKeyBackend {
@@ -1222,7 +1084,7 @@ fn test_persisted_data_key_path(dir: &Path, credentials: &Credentials) -> Public
     Ok(dir.join(file_name))
 }
 
-fn encode_bytes(bytes: &[u8]) -> String {
+pub(crate) fn encode_bytes(bytes: &[u8]) -> String {
     STANDARD_NO_PAD.encode(bytes)
 }
 
@@ -1236,7 +1098,7 @@ fn decode_bytes(value: &str) -> PublicResult<Vec<u8>> {
         .map_err(|err| PublicError::validation(format!("invalid base64: {err}")))
 }
 
-async fn send_auth_request(
+pub(crate) async fn send_auth_request(
     request: reqwest::RequestBuilder,
     context: &'static str,
 ) -> PublicResult<reqwest::Response> {
@@ -1257,7 +1119,7 @@ fn map_reqwest_error(err: reqwest::Error, context: &str) -> PublicError {
     }
 }
 
-async fn parse_json_response<T: for<'de> Deserialize<'de>>(
+pub(crate) async fn parse_json_response<T: for<'de> Deserialize<'de>>(
     response: reqwest::Response,
     context: &str,
 ) -> PublicResult<T> {
@@ -1522,89 +1384,6 @@ mod tests {
             load_agent_seed(&credentials).expect("reload agent seed"),
             None
         );
-    }
-
-    #[test]
-    fn agent_key_material_derives_recipient_public_key_from_private_key() {
-        let material = agent_key_material_from_seed([0x5A; KEY_SIZE]).expect("derive key material");
-        let recipient_private = X25519StaticSecret::from(material.recipient_private_key);
-        let expected_public_key = X25519PublicKey::from(&recipient_private).to_bytes();
-
-        assert_eq!(material.recipient_public_key, expected_public_key);
-    }
-
-    #[test]
-    fn build_agent_assertion_includes_unique_jti() {
-        let agent_id = Uuid::now_v7();
-        let material = agent_key_material_from_seed([0x5B; KEY_SIZE]).expect("derive key material");
-        let first = build_agent_assertion(
-            &agent_id,
-            &material.signing_key,
-            "https://api.example.test",
-            AGENT_ASSERTION_PURPOSE_TOKEN_MINT,
-        )
-        .expect("first assertion");
-        let second = build_agent_assertion(
-            &agent_id,
-            &material.signing_key,
-            "https://api.example.test",
-            AGENT_ASSERTION_PURPOSE_TOKEN_MINT,
-        )
-        .expect("second assertion");
-
-        let first_jti = assertion_jti(&first);
-        let second_jti = assertion_jti(&second);
-
-        assert_ne!(first_jti, second_jti);
-        Uuid::parse_str(&first_jti).expect("jti should be a UUID");
-        Uuid::parse_str(&second_jti).expect("jti should be a UUID");
-    }
-
-    #[test]
-    fn build_agent_assertion_binds_audience_and_purpose() {
-        let agent_id = Uuid::now_v7();
-        let material = agent_key_material_from_seed([0x5C; KEY_SIZE]).expect("derive key material");
-        let assertion = build_agent_token_mint_assertion(
-            &agent_id,
-            &material.signing_key,
-            "https://api.example.test",
-        )
-        .expect("assertion");
-
-        let claims = assertion_claims(&assertion);
-        assert_eq!(claims["aud"], "https://api.example.test");
-        assert_eq!(claims["purpose"], AGENT_ASSERTION_PURPOSE_TOKEN_MINT);
-    }
-
-    #[test]
-    fn build_agent_cancel_enrollment_assertion_binds_cancel_purpose() {
-        let agent_id = Uuid::now_v7();
-        let material = agent_key_material_from_seed([0x5D; KEY_SIZE]).expect("derive key material");
-        let assertion = build_agent_cancel_enrollment_assertion(
-            &agent_id,
-            &material.signing_key,
-            "https://api.example.test",
-        )
-        .expect("assertion");
-
-        let claims = assertion_claims(&assertion);
-        assert_eq!(claims["aud"], "https://api.example.test");
-        assert_eq!(claims["purpose"], AGENT_ASSERTION_PURPOSE_CANCEL_ENROLLMENT);
-    }
-
-    fn assertion_jti(assertion: &str) -> String {
-        assertion_claims(assertion)["jti"]
-            .as_str()
-            .expect("jti claim")
-            .to_string()
-    }
-
-    fn assertion_claims(assertion: &str) -> serde_json::Value {
-        let payload_segment = assertion.split('.').nth(1).expect("JWT payload segment");
-        let payload = URL_SAFE_NO_PAD
-            .decode(payload_segment)
-            .expect("decode JWT payload");
-        serde_json::from_slice(&payload).expect("deserialize JWT payload")
     }
 
     #[test]

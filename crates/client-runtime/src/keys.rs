@@ -73,7 +73,7 @@ impl RuntimeClient {
         let seed = load_agent_seed(credentials)?.ok_or_else(|| {
             PublicError::validation("agent seed missing from local secure storage")
         })?;
-        Ok(agent_key_material_from_seed(seed)?.recipient_private_key)
+        Ok(*agent_key_material_from_seed(seed)?.recipient_private_key())
     }
 }
 

@@ -66,9 +66,7 @@ impl RuntimeClient {
             PrincipalCredentials::Agent(mut credentials) => {
                 self.refresh_agent_credentials_if_needed(&mut credentials)
                     .await?;
-                credentials
-                    .access_token
-                    .ok_or_else(|| PublicError::validation("agent access token missing"))
+                credentials.active_access_token().map(ToOwned::to_owned)
             }
         }
     }
@@ -97,7 +95,7 @@ impl RuntimeClient {
         &self,
         credentials: &mut AgentCredentials,
     ) -> PublicResult<()> {
-        if !credentials.access_expires_within(60) {
+        if !credentials.needs_access_token_within(60)? {
             return Ok(());
         }
 

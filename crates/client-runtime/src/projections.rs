@@ -552,7 +552,7 @@ mod tests {
         let key_material =
             agent_key_material_from_seed([0x33; 32]).expect("derive agent key material");
         let grant = encrypt_agent_work_list_key(
-            &key_material.recipient_public_key,
+            key_material.recipient_public_key(),
             &work_list_id,
             &list_key,
         )
@@ -560,7 +560,7 @@ mod tests {
 
         let resolved = resolve_work_list_key_for_principal_source(
             &PrincipalWorkListKeySource::AgentRecipientPrivateKey(
-                key_material.recipient_private_key,
+                *key_material.recipient_private_key(),
             ),
             work_list_id,
             &grant.base64,
