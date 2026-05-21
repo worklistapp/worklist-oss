@@ -30,14 +30,18 @@ use worklist_client_core::{PublicError, PublicResult};
 pub use worklist_client_api::{AgentEnrollmentResponse, AgentTokenResponse};
 
 const OPAQUE_SERVER_ID: &[u8] = b"worklist.api";
+const AGENT_ASSERTION_PURPOSE_TOKEN_MINT: &str = "token_mint";
+#[cfg(test)]
+const AGENT_ASSERTION_PURPOSE_CANCEL_ENROLLMENT: &str = "cancel_enrollment";
 const DATA_KEY_KEYCHAIN_SERVICE: &str = "worklist.data-key";
 const AGENT_SEED_KEYCHAIN_SERVICE: &str = "worklist.agent-seed";
 const TEST_KEYCHAIN_DIR_ENV: &str = "WORKLIST_TEST_KEYCHAIN_DIR";
 const AGENT_SEED_FILE_ONLY_ENV: &str = "WORKLIST_AGENT_SEED_FILE_ONLY";
 const KEY_SIZE: usize = 32;
 const AUTH_HTTP_TIMEOUT: StdDuration = StdDuration::from_secs(30);
+const REDACTED_SECRET_FIELD: &str = "[redacted]";
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UnlockMode {
     SingleCommand,
@@ -53,9 +57,7 @@ impl UnlockMode {
     }
 }
 
-const REDACTED_SECRET_FIELD: &str = "[redacted]";
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AuthSession {
     pub user_id: Uuid,
     pub api_url: String,
@@ -377,7 +379,44 @@ pub fn agent_credentials_path() -> PublicResult<PathBuf> {
 }
 
 pub fn normalize_api_url(api_url: &str) -> String {
-    api_url.trim_end_matches('/').to_string()
+    // This public normalizer is intentionally best-effort for legacy callers
+    // that may pass partial local config. Assertion signing uses the fallible
+    // canonicalizer so invalid audiences fail locally before a request is sent.
+    canonicalize_api_url(api_url)
+        .unwrap_or_else(|_| api_url.trim().trim_end_matches('/').to_string())
+}
+
+fn canonicalize_api_url(api_url: &str) -> PublicResult<String> {
+    let mut url = reqwest::Url::parse(api_url.trim()).map_err(|err| {
+        PublicError::validation(format!("API URL must be an absolute HTTP(S) base URL: {err}"))
+    })?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err(PublicError::validation(
+            "API URL must be an absolute HTTP(S) base URL",
+        ));
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(PublicError::validation(
+            "API URL must not include query parameters or a fragment",
+        ));
+    }
+    if url.username() != "" || url.password().is_some() {
+        return Err(PublicError::validation("API URL must not include credentials"));
+    }
+    if matches!(
+        (url.scheme(), url.port()),
+        ("http", Some(80)) | ("https", Some(443))
+    ) {
+        url.set_port(None)
+            .map_err(|_| PublicError::validation("API URL default port could not be removed"))?;
+    }
+    if url.path() == "/" {
+        url.set_path("");
+    } else {
+        let path = url.path().trim_end_matches('/').to_string();
+        url.set_path(&path);
+    }
+    Ok(url.as_str().trim_end_matches('/').to_string())
 }
 
 pub fn load_credentials() -> PublicResult<Option<Credentials>> {
@@ -765,7 +804,11 @@ pub async fn mint_agent_access_token(
     let seed = load_agent_seed(credentials)?
         .ok_or_else(|| PublicError::validation("agent seed missing from local secure storage"))?;
     let key_material = agent_key_material_from_seed(seed)?;
-    let assertion = build_agent_assertion(&credentials.agent_id, &key_material.signing_key)?;
+    let assertion = build_agent_token_mint_assertion(
+        &credentials.agent_id,
+        &key_material.signing_key,
+        &canonicalize_api_url(&credentials.api_url)?,
+    )?;
     let response = send_auth_request(
         client
             .post(api_endpoint(&credentials.api_url, "/auth/agents/token"))
@@ -774,6 +817,33 @@ pub async fn mint_agent_access_token(
     )
     .await?;
     parse_json_response(response, "agent token response").await
+}
+
+pub fn build_agent_token_mint_assertion(
+    agent_id: &Uuid,
+    signing_key: &SigningKey,
+    audience: &str,
+) -> PublicResult<String> {
+    build_agent_assertion(
+        agent_id,
+        signing_key,
+        audience,
+        AGENT_ASSERTION_PURPOSE_TOKEN_MINT,
+    )
+}
+
+#[cfg(test)]
+fn build_agent_cancel_enrollment_assertion(
+    agent_id: &Uuid,
+    signing_key: &SigningKey,
+    audience: &str,
+) -> PublicResult<String> {
+    build_agent_assertion(
+        agent_id,
+        signing_key,
+        audience,
+        AGENT_ASSERTION_PURPOSE_CANCEL_ENROLLMENT,
+    )
 }
 
 pub fn auth_response_to_credentials(api_url: &str, response: AuthResponse) -> Credentials {
@@ -828,7 +898,12 @@ fn getrandom_fill(bytes: &mut [u8]) -> PublicResult<()> {
         .map_err(|err| PublicError::crypto(format!("os random generation failed: {err}")))
 }
 
-fn build_agent_assertion(agent_id: &Uuid, signing_key: &SigningKey) -> PublicResult<String> {
+fn build_agent_assertion(
+    agent_id: &Uuid,
+    signing_key: &SigningKey,
+    audience: &str,
+    purpose: &str,
+) -> PublicResult<String> {
     let now = Utc::now().timestamp();
     let header_json = serde_json::json!({
         "alg": "EdDSA",
@@ -836,10 +911,11 @@ fn build_agent_assertion(agent_id: &Uuid, signing_key: &SigningKey) -> PublicRes
     });
     let claims_json = serde_json::json!({
         "iss": agent_id,
-        "aud": "worklist.api",
+        "aud": audience,
         "jti": Uuid::now_v7(),
         "iat": now,
         "exp": now + 60,
+        "purpose": purpose,
     });
     let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header_json).map_err(|err| {
         PublicError::unexpected(format!("failed to serialize JWT header: {err}"))
@@ -1288,6 +1364,25 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    #[test]
+    fn normalize_api_url_canonicalizes_http_base_urls() {
+        let cases = [
+            (
+                " HTTPS://API.EXAMPLE.TEST:443/ ",
+                "https://api.example.test",
+            ),
+            ("http://LOCALHOST:80/api/", "http://localhost/api"),
+            (
+                "https://API.EXAMPLE.TEST:8443/root/",
+                "https://api.example.test:8443/root",
+            ),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(normalize_api_url(input), expected);
+        }
+    }
+
     fn test_credentials() -> Credentials {
         Credentials {
             api_url: "https://worklist.example.test".to_string(),
@@ -1442,10 +1537,20 @@ mod tests {
     fn build_agent_assertion_includes_unique_jti() {
         let agent_id = Uuid::now_v7();
         let material = agent_key_material_from_seed([0x5B; KEY_SIZE]).expect("derive key material");
-        let first =
-            build_agent_assertion(&agent_id, &material.signing_key).expect("first assertion");
-        let second =
-            build_agent_assertion(&agent_id, &material.signing_key).expect("second assertion");
+        let first = build_agent_assertion(
+            &agent_id,
+            &material.signing_key,
+            "https://api.example.test",
+            AGENT_ASSERTION_PURPOSE_TOKEN_MINT,
+        )
+        .expect("first assertion");
+        let second = build_agent_assertion(
+            &agent_id,
+            &material.signing_key,
+            "https://api.example.test",
+            AGENT_ASSERTION_PURPOSE_TOKEN_MINT,
+        )
+        .expect("second assertion");
 
         let first_jti = assertion_jti(&first);
         let second_jti = assertion_jti(&second);
@@ -1455,14 +1560,51 @@ mod tests {
         Uuid::parse_str(&second_jti).expect("jti should be a UUID");
     }
 
+    #[test]
+    fn build_agent_assertion_binds_audience_and_purpose() {
+        let agent_id = Uuid::now_v7();
+        let material = agent_key_material_from_seed([0x5C; KEY_SIZE]).expect("derive key material");
+        let assertion = build_agent_token_mint_assertion(
+            &agent_id,
+            &material.signing_key,
+            "https://api.example.test",
+        )
+        .expect("assertion");
+
+        let claims = assertion_claims(&assertion);
+        assert_eq!(claims["aud"], "https://api.example.test");
+        assert_eq!(claims["purpose"], AGENT_ASSERTION_PURPOSE_TOKEN_MINT);
+    }
+
+    #[test]
+    fn build_agent_cancel_enrollment_assertion_binds_cancel_purpose() {
+        let agent_id = Uuid::now_v7();
+        let material = agent_key_material_from_seed([0x5D; KEY_SIZE]).expect("derive key material");
+        let assertion = build_agent_cancel_enrollment_assertion(
+            &agent_id,
+            &material.signing_key,
+            "https://api.example.test",
+        )
+        .expect("assertion");
+
+        let claims = assertion_claims(&assertion);
+        assert_eq!(claims["aud"], "https://api.example.test");
+        assert_eq!(claims["purpose"], AGENT_ASSERTION_PURPOSE_CANCEL_ENROLLMENT);
+    }
+
     fn assertion_jti(assertion: &str) -> String {
+        assertion_claims(assertion)["jti"]
+            .as_str()
+            .expect("jti claim")
+            .to_string()
+    }
+
+    fn assertion_claims(assertion: &str) -> serde_json::Value {
         let payload_segment = assertion.split('.').nth(1).expect("JWT payload segment");
         let payload = URL_SAFE_NO_PAD
             .decode(payload_segment)
             .expect("decode JWT payload");
-        let claims: serde_json::Value =
-            serde_json::from_slice(&payload).expect("deserialize JWT payload");
-        claims["jti"].as_str().expect("jti claim").to_string()
+        serde_json::from_slice(&payload).expect("deserialize JWT payload")
     }
 
     #[test]
