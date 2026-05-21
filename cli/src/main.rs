@@ -32,6 +32,24 @@ use worklist_client_runtime::{
     clear_session, lock, serve, session_key, unlock_status,
 };
 
+macro_rules! print {
+    () => {
+        $crate::write_stdout(format_args!(""))?
+    };
+    ($($arg:tt)*) => {
+        $crate::write_stdout(format_args!($($arg)*))?
+    };
+}
+
+macro_rules! println {
+    () => {
+        $crate::write_stdout_line(format_args!(""))?
+    };
+    ($($arg:tt)*) => {
+        $crate::write_stdout_line(format_args!($($arg)*))?
+    };
+}
+
 mod output;
 
 use output::{
@@ -108,24 +126,6 @@ impl CliError {
             message: self.to_string(),
         }
     }
-}
-
-macro_rules! print {
-    () => {
-        write_stdout(format_args!(""))?
-    };
-    ($($arg:tt)*) => {
-        write_stdout(format_args!($($arg)*))?
-    };
-}
-
-macro_rules! println {
-    () => {
-        write_stdout_line(format_args!(""))?
-    };
-    ($($arg:tt)*) => {
-        write_stdout_line(format_args!($($arg)*))?
-    };
 }
 
 fn write_stdout(args: fmt::Arguments<'_>) -> CliResult<()> {
@@ -1240,18 +1240,16 @@ async fn cmd_agent_register(
     let key_material = generate_agent_key_material()?;
     let client = reqwest::Client::new();
     let enrollment = register_agent(&client, api_url, &key_material, proposed_handle).await?;
-    let credentials = AgentCredentials {
-        api_url: current_api_url,
-        agent_id: enrollment.agent_id,
-        owner_user_id: enrollment.owner_user_id,
-        handle: enrollment
+    let credentials = AgentCredentials::registered(
+        current_api_url,
+        enrollment.agent_id,
+        enrollment.owner_user_id,
+        enrollment
             .handle
             .clone()
             .or_else(|| enrollment.proposed_handle.clone()),
-        display_name: enrollment.display_name.clone(),
-        access_token: None,
-        access_expires_at: None,
-    };
+        enrollment.display_name.clone(),
+    );
     save_agent_credentials(&credentials)?;
     if let Err(err) = save_agent_seed(&credentials, key_material.seed()) {
         let _ = clear_agent_credentials();
@@ -1263,7 +1261,7 @@ async fn cmd_agent_register(
         agent_id: enrollment.agent_id,
         enrollment_code: enrollment.enrollment_code.clone(),
         fingerprint: enrollment.fingerprint,
-        api_url: credentials.api_url,
+        api_url: credentials.api_url().to_string(),
         credentials_path: agent_credentials_path()?.display().to_string(),
     };
 
@@ -1290,7 +1288,7 @@ fn ensure_agent_registration_slot_available(current_api_url: &str) -> CliResult<
     };
 
     let message =
-        agent_registration_conflict_message(&existing_credentials.api_url, current_api_url);
+        agent_registration_conflict_message(existing_credentials.api_url(), current_api_url);
     Err(PublicError::validation(message).into())
 }
 
@@ -1472,7 +1470,7 @@ fn load_auth_status(
         .is_some_and(|credentials| credentials.api_url == current_api_url);
     let agent_matches_current_api = agent_credentials
         .as_ref()
-        .is_some_and(|credentials| credentials.api_url == current_api_url);
+        .is_some_and(|credentials| credentials.api_url() == current_api_url);
 
     match (principal_selection, user_credentials, agent_credentials) {
         (PrincipalSelection::Auto, Some(credentials), Some(_))
@@ -1495,7 +1493,8 @@ fn load_auth_status(
 
             Err(PublicError::validation(format!(
                 "no user or agent credentials are saved for {current_api_url}; saved user credentials target {}, saved agent credentials target {}",
-                user.api_url, agent.api_url
+                user.api_url,
+                agent.api_url()
             ))
             .into())
         }
@@ -1567,33 +1566,24 @@ fn logged_in_agent_auth_status(
     current_api_url: &str,
 ) -> CliResult<AuthStatusResult> {
     let session_state = agent_session_state(&credentials);
-    let api_url_mismatch = api_url_mismatch(&credentials.api_url, current_api_url);
+    let api_url_mismatch = api_url_mismatch(credentials.api_url(), current_api_url);
     let access_token_expires_at = credentials
-        .access_expires_at
+        .access_expires_at()
         .map(|value| value.to_rfc3339());
     let access_token_expires_display = credentials
-        .access_expires_at
+        .access_expires_at()
         .map(|value| value.format("%Y-%m-%d %H:%M:%S UTC").to_string());
-    let AgentCredentials {
-        api_url,
-        agent_id,
-        owner_user_id,
-        handle,
-        display_name,
-        access_token: _,
-        access_expires_at: _,
-    } = credentials;
 
     Ok(AuthStatusResult::LoggedIn(Box::new(LoggedInStatusResult {
         logged_in: true,
         principal_type: "agent",
-        api_url,
+        api_url: credentials.api_url().to_string(),
         email: None,
         user_id: None,
-        agent_id: Some(agent_id),
-        owner_user_id,
-        handle,
-        display_name,
+        agent_id: Some(credentials.agent_id()),
+        owner_user_id: credentials.owner_user_id(),
+        handle: credentials.handle().map(ToOwned::to_owned),
+        display_name: credentials.display_name().map(ToOwned::to_owned),
         access_token_expires_at,
         refresh_token_expires_at: None,
         access_token_expires_display,
@@ -1782,9 +1772,9 @@ fn session_state(credentials: &Credentials) -> &'static str {
 }
 
 fn agent_session_state(credentials: &AgentCredentials) -> &'static str {
-    match credentials.access_expires_at {
+    match credentials.access_expires_at() {
         Some(_) if credentials.access_expires_within(0) => "access_expired",
-        Some(_) if credentials.access_token.is_some() => "active",
+        Some(_) if credentials.access_token().is_some() => "active",
         _ => "registered",
     }
 }

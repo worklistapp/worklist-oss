@@ -107,9 +107,11 @@ impl RuntimeClient {
                 response.expires_in
             ))
         })?;
-        credentials.access_token = Some(response.access_token);
-        credentials.access_expires_at = Some(Utc::now() + chrono::Duration::seconds(expires_in));
-        credentials.owner_user_id = Some(response.owner_user_id);
+        credentials.set_active_access_token(
+            response.owner_user_id,
+            response.access_token,
+            Utc::now() + chrono::Duration::seconds(expires_in),
+        );
         save_agent_credentials(credentials)
     }
 }

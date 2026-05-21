@@ -2078,7 +2078,7 @@ async fn cli_status_reports_agent_only_session() {
     assert_eq!(status_json["loggedIn"], true);
     assert_eq!(status_json["principalType"], "agent");
     assert_eq!(status_json["apiUrl"], server.base_url);
-    assert_eq!(status_json["agentId"], json!(agent_credentials.agent_id));
+    assert_eq!(status_json["agentId"], json!(agent_credentials.agent_id()));
     assert_eq!(status_json["ownerUserId"], json!(fixture.owner_user_id));
     assert_eq!(status_json["handle"], "fixture-agent");
     assert_eq!(status_json["displayName"], "Fixture Agent");
@@ -3710,15 +3710,15 @@ fn seed_agent_credentials(
     fixture: &TestFixture,
     api_url: &str,
 ) -> AgentCredentials {
-    let credentials = AgentCredentials {
-        api_url: api_url.to_string(),
-        agent_id: Uuid::now_v7(),
-        owner_user_id: Some(fixture.owner_user_id),
-        handle: Some("fixture-agent".to_string()),
-        display_name: Some("Fixture Agent".to_string()),
-        access_token: Some(fixture.agent_access_token.clone()),
-        access_expires_at: Some(Utc::now() + Duration::hours(1)),
-    };
+    let credentials = AgentCredentials::active(
+        api_url.to_string(),
+        Uuid::now_v7(),
+        fixture.owner_user_id,
+        Some("fixture-agent".to_string()),
+        Some("Fixture Agent".to_string()),
+        fixture.agent_access_token.clone(),
+        Utc::now() + Duration::hours(1),
+    );
 
     let config_dir = home.join(".worklist");
     std::fs::create_dir_all(&config_dir).expect("create config dir");
@@ -3747,8 +3747,8 @@ fn agent_seed_file_path(
 ) -> std::path::PathBuf {
     let entry_name = format!(
         "{}::{}",
-        normalize_api_url(&credentials.api_url),
-        credentials.agent_id
+        normalize_api_url(credentials.api_url()),
+        credentials.agent_id()
     );
     let file_name = format!(
         "agent-seed-{}.bin",
