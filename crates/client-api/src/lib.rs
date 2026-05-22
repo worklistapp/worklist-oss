@@ -8,28 +8,15 @@ use uuid::Uuid;
 
 use worklist_client_core::{PublicError, PublicResult};
 
-pub type SealedBlob = String;
-
 const API_HTTP_TIMEOUT: StdDuration = StdDuration::from_secs(30);
+
+pub type SealedBlob = String;
 
 #[derive(Clone)]
 pub struct PublicApiClient {
     client: reqwest::Client,
     base_url: String,
     bearer_token: Option<String>,
-}
-
-impl fmt::Debug for PublicApiClient {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("PublicApiClient")
-            .field("client", &self.client)
-            .field("base_url", &self.base_url)
-            .field(
-                "bearer_token",
-                &self.bearer_token.as_ref().map(|_| "[redacted]"),
-            )
-            .finish()
-    }
 }
 
 impl PublicApiClient {
@@ -385,13 +372,26 @@ impl PublicApiClient {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl fmt::Debug for PublicApiClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PublicApiClient")
+            .field("client", &self.client)
+            .field("base_url", &self.base_url)
+            .field(
+                "bearer_token",
+                &self.bearer_token.as_ref().map(|_| "[redacted]"),
+            )
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PublicTaskRef {
     pub id: Uuid,
     pub work_list_id: Uuid,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentEnrollmentResponse {
     pub agent_id: Uuid,
@@ -409,7 +409,7 @@ pub struct AgentEnrollmentResponse {
     pub fingerprint: String,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentTokenResponse {
     pub access_token: String,
@@ -431,13 +431,13 @@ impl fmt::Debug for AgentTokenResponse {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LookupAgentEnrollmentRequest {
     pub code: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CurrentUserResponse {
     pub id: Uuid,
@@ -452,7 +452,7 @@ pub struct CurrentUserResponse {
     pub last_accessed_work_list_id: Option<Uuid>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkListResponse {
     pub id: Uuid,
@@ -468,7 +468,7 @@ pub struct WorkListResponse {
     pub membership: MembershipResponse,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkListDetailResponse {
     #[serde(flatten)]
@@ -476,7 +476,7 @@ pub struct WorkListDetailResponse {
     pub members: Vec<MembershipResponse>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SectionSnapshotPayload {
     pub id: Uuid,
@@ -485,7 +485,7 @@ pub struct SectionSnapshotPayload {
     pub auto_archive_after_days: Option<i32>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MembershipResponse {
     pub id: Uuid,
@@ -504,14 +504,14 @@ pub struct MembershipResponse {
     pub payload_binding_key: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApproveAgentGrantRequest {
     pub work_list_id: Uuid,
     pub key_ciphertext: String,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApproveAgentEnrollmentRequest {
     pub code: String,
@@ -535,14 +535,14 @@ impl fmt::Debug for ApproveAgentEnrollmentRequest {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentGrantResponse {
     pub work_list_id: Uuid,
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentSummaryResponse {
     pub agent_id: Uuid,
@@ -560,7 +560,7 @@ pub struct AgentSummaryResponse {
     pub grants: Vec<AgentGrantResponse>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskResponse {
     pub id: Uuid,
@@ -587,7 +587,7 @@ pub struct TaskResponse {
     pub delegations: Vec<DelegationResponse>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskDetailResponse {
     #[serde(flatten)]
@@ -595,7 +595,7 @@ pub struct TaskDetailResponse {
     pub comments: Vec<CommentResponse>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DelegationResponse {
     pub id: Uuid,
@@ -608,7 +608,7 @@ pub struct DelegationResponse {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CommentResponse {
     pub id: Uuid,
@@ -622,7 +622,7 @@ pub struct CommentResponse {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskListResponse {
     pub tasks: Vec<TaskResponse>,
@@ -630,14 +630,14 @@ pub struct TaskListResponse {
     pub archived_counts: Vec<ArchivedTaskCountResponse>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ArchivedTaskCountResponse {
     pub section_id: Option<Uuid>,
     pub count: i64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MyTasksResponse {
     pub tasks: Vec<MyTaskResponse>,
@@ -646,7 +646,7 @@ pub struct MyTasksResponse {
     pub offset: i64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MyTaskResponse {
     pub id: Uuid,
@@ -668,7 +668,7 @@ pub struct MyTaskResponse {
     pub delegations: Vec<DelegationResponse>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DashboardStatsResponse {
     pub tasks_overdue: i64,
@@ -677,7 +677,7 @@ pub struct DashboardStatsResponse {
     pub completed: i64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadAttachmentResponse {
     pub download_url: String,
@@ -742,7 +742,7 @@ pub struct ArchiveTaskRequest {}
 #[serde(rename_all = "camelCase")]
 pub struct UnarchiveTaskRequest {}
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuditPatchFieldRequest {
     pub field: String,
@@ -757,7 +757,7 @@ pub struct AuditPatchFieldRequest {
     pub after_ciphertext_digest: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuditPatchRequest {
     #[serde(default)]
@@ -787,7 +787,7 @@ impl AuditPatchFieldRequest {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeleteTaskRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -816,7 +816,7 @@ pub struct UpdateCommentRequest {
     pub body_ciphertext_proof: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeleteCommentRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -852,10 +852,7 @@ async fn handle_response<T: for<'de> Deserialize<'de>>(
             PublicError::unexpected(format!("failed to parse response from {path}: {err}"))
         })
     } else {
-        let error_text = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "unknown error".to_string());
+        let error_text = error_response_text(response, path, status).await;
         Err(map_api_error(status.as_u16(), &error_text, path))
     }
 }
@@ -865,12 +862,19 @@ async fn handle_empty_response(response: reqwest::Response, path: &str) -> Publi
     if status.is_success() {
         Ok(())
     } else {
-        let error_text = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "unknown error".to_string());
+        let error_text = error_response_text(response, path, status).await;
         Err(map_api_error(status.as_u16(), &error_text, path))
     }
+}
+
+async fn error_response_text(
+    response: reqwest::Response,
+    path: &str,
+    status: reqwest::StatusCode,
+) -> String {
+    response.text().await.unwrap_or_else(|err| {
+        format!("failed to read API error response from {path} (status {status}): {err}")
+    })
 }
 
 fn normalize_base_url(value: String) -> String {

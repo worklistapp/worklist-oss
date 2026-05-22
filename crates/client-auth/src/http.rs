@@ -1,5 +1,4 @@
-use std::fmt;
-use std::time::Duration as StdDuration;
+use std::{fmt, time::Duration as StdDuration};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
@@ -242,33 +241,65 @@ pub async fn logout(
     Ok((!status.is_success()).then(|| format!("server logout returned status {status}")))
 }
 
-pub fn auth_response_to_credentials(api_url: &str, response: AuthResponse) -> Credentials {
+pub fn auth_response_to_credentials(
+    api_url: &str,
+    response: AuthResponse,
+) -> PublicResult<Credentials> {
     let now = Utc::now();
-    Credentials {
+    let access_expires_at = expires_at_from(now, response.expires_in, "access token")?;
+    let refresh_expires_at = expires_at_from(now, response.refresh_expires_in, "refresh token")?;
+
+    Ok(Credentials {
         api_url: normalize_api_url(api_url),
         access_token: response.access_token,
         refresh_token: response.refresh_token,
-        access_expires_at: expires_at_from(now, response.expires_in),
-        refresh_expires_at: expires_at_from(now, response.refresh_expires_in),
+        access_expires_at,
+        refresh_expires_at,
         user_id: response.user.id,
         email: response.user.email,
         data_key_ciphertext: response.data_key_ciphertext,
-    }
+    })
 }
 
 pub fn update_credentials_with_refresh(
     credentials: &mut Credentials,
     refresh_response: RefreshResponse,
-) {
+) -> PublicResult<()> {
     let now = Utc::now();
+    let access_expires_at = expires_at_from(now, refresh_response.expires_in, "access token")?;
+    let refresh_expires_at =
+        expires_at_from(now, refresh_response.refresh_expires_in, "refresh token")?;
+
     credentials.access_token = refresh_response.access_token;
     credentials.refresh_token = refresh_response.refresh_token;
-    credentials.access_expires_at = expires_at_from(now, refresh_response.expires_in);
-    credentials.refresh_expires_at = expires_at_from(now, refresh_response.refresh_expires_in);
+    credentials.access_expires_at = access_expires_at;
+    credentials.refresh_expires_at = refresh_expires_at;
+    Ok(())
 }
 
-fn expires_at_from(now: DateTime<Utc>, expires_in_seconds: u64) -> DateTime<Utc> {
-    now + chrono::Duration::seconds(expires_in_seconds as i64)
+fn expires_at_from(
+    now: DateTime<Utc>,
+    expires_in_seconds: u64,
+    token_name: &'static str,
+) -> PublicResult<DateTime<Utc>> {
+    // TTLs come from server responses, so keep conversion fallible before
+    // updating any stored credential fields. The second check covers chrono's
+    // narrower TimeDelta range after the u64-to-i64 conversion succeeds.
+    let seconds = i64::try_from(expires_in_seconds).map_err(|err| {
+        PublicError::unexpected(format!(
+            "{token_name} ttl seconds overflow for expires_in={expires_in_seconds}: {err}"
+        ))
+    })?;
+    let ttl = chrono::Duration::try_seconds(seconds).ok_or_else(|| {
+        PublicError::unexpected(format!(
+            "{token_name} ttl duration overflow for expires_in={expires_in_seconds}"
+        ))
+    })?;
+    now.checked_add_signed(ttl).ok_or_else(|| {
+        PublicError::unexpected(format!(
+            "{token_name} expiry overflow for expires_in={expires_in_seconds}"
+        ))
+    })
 }
 
 pub(crate) fn api_endpoint(base_url: &str, path: &str) -> String {
@@ -316,10 +347,7 @@ pub(crate) async fn parse_json_response<T: for<'de> Deserialize<'de>>(
 ) -> PublicResult<T> {
     let status = response.status();
     if !status.is_success() {
-        let error_text = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "unknown error".to_string());
+        let error_text = error_response_text(response, context, status).await;
         return Err(map_api_error(status.as_u16(), &error_text));
     }
 
@@ -327,6 +355,16 @@ pub(crate) async fn parse_json_response<T: for<'de> Deserialize<'de>>(
         .json()
         .await
         .map_err(|err| PublicError::unexpected(format!("failed to parse {context}: {err}")))
+}
+
+async fn error_response_text(
+    response: reqwest::Response,
+    context: &str,
+    status: reqwest::StatusCode,
+) -> String {
+    response.text().await.unwrap_or_else(|err| {
+        format!("failed to read {context} error response (status {status}): {err}")
+    })
 }
 
 fn map_api_error(status: u16, body: &str) -> PublicError {
@@ -346,5 +384,148 @@ fn map_api_error(status: u16, body: &str) -> PublicError {
         403 => PublicError::validation("access denied"),
         404 => PublicError::validation("resource not found"),
         _ => PublicError::unexpected(format!("API error ({status}): {body}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn auth_response(expires_in: u64, refresh_expires_in: u64) -> AuthResponse {
+        AuthResponse {
+            access_token: "access-token".to_string(),
+            refresh_token: "refresh-token".to_string(),
+            expires_in,
+            refresh_expires_in,
+            token_type: "Bearer".to_string(),
+            user: UserResponse {
+                id: Uuid::now_v7(),
+                email: "user@example.com".to_string(),
+                name: "User".to_string(),
+                timezone: "UTC".to_string(),
+                avatar_color: "blue".to_string(),
+                theme_preference: "system".to_string(),
+                email_verified: true,
+            },
+            data_key_ciphertext: "data-key".to_string(),
+        }
+    }
+
+    #[test]
+    fn auth_response_to_credentials_rejects_ttl_overflow() {
+        let error =
+            auth_response_to_credentials("https://worklist.example", auth_response(u64::MAX, 3600))
+                .expect_err("overflowing access ttl should fail");
+
+        assert!(matches!(
+            error,
+            PublicError::Unexpected(message)
+                if message.contains("access token ttl seconds overflow")
+        ));
+    }
+
+    #[test]
+    fn auth_response_to_credentials_rejects_refresh_ttl_overflow() {
+        let error =
+            auth_response_to_credentials("https://worklist.example", auth_response(900, u64::MAX))
+                .expect_err("overflowing refresh ttl should fail");
+
+        assert!(matches!(
+            error,
+            PublicError::Unexpected(message)
+                if message.contains("refresh token ttl seconds overflow")
+        ));
+    }
+
+    #[test]
+    fn update_credentials_with_refresh_updates_tokens_and_expiries() {
+        let mut credentials =
+            auth_response_to_credentials("https://worklist.example", auth_response(900, 3600))
+                .expect("initial credentials");
+        let original_access_expires_at = credentials.access_expires_at;
+        let original_refresh_expires_at = credentials.refresh_expires_at;
+
+        update_credentials_with_refresh(
+            &mut credentials,
+            RefreshResponse {
+                access_token: "new-access-token".to_string(),
+                refresh_token: "new-refresh-token".to_string(),
+                expires_in: 1800,
+                refresh_expires_in: 7200,
+                token_type: "Bearer".to_string(),
+            },
+        )
+        .expect("refresh update should succeed");
+
+        assert_eq!(credentials.access_token, "new-access-token");
+        assert_eq!(credentials.refresh_token, "new-refresh-token");
+        assert!(credentials.access_expires_at > original_access_expires_at);
+        assert!(credentials.refresh_expires_at > original_refresh_expires_at);
+    }
+
+    #[test]
+    fn update_credentials_with_refresh_is_atomic_when_ttl_overflows() {
+        let mut credentials =
+            auth_response_to_credentials("https://worklist.example", auth_response(900, 3600))
+                .expect("initial credentials");
+        let original_access_token = credentials.access_token.clone();
+        let original_refresh_token = credentials.refresh_token.clone();
+        let original_access_expires_at = credentials.access_expires_at;
+        let original_refresh_expires_at = credentials.refresh_expires_at;
+
+        let error = update_credentials_with_refresh(
+            &mut credentials,
+            RefreshResponse {
+                access_token: "new-access-token".to_string(),
+                refresh_token: "new-refresh-token".to_string(),
+                expires_in: 900,
+                refresh_expires_in: u64::MAX,
+                token_type: "Bearer".to_string(),
+            },
+        )
+        .expect_err("overflowing refresh ttl should fail");
+
+        assert!(matches!(
+            error,
+            PublicError::Unexpected(message)
+                if message.contains("refresh token ttl seconds overflow")
+        ));
+        assert_eq!(credentials.access_token, original_access_token);
+        assert_eq!(credentials.refresh_token, original_refresh_token);
+        assert_eq!(credentials.access_expires_at, original_access_expires_at);
+        assert_eq!(credentials.refresh_expires_at, original_refresh_expires_at);
+    }
+
+    #[test]
+    fn update_credentials_with_refresh_is_atomic_when_access_ttl_overflows() {
+        let mut credentials =
+            auth_response_to_credentials("https://worklist.example", auth_response(900, 3600))
+                .expect("initial credentials");
+        let original_access_token = credentials.access_token.clone();
+        let original_refresh_token = credentials.refresh_token.clone();
+        let original_access_expires_at = credentials.access_expires_at;
+        let original_refresh_expires_at = credentials.refresh_expires_at;
+
+        let error = update_credentials_with_refresh(
+            &mut credentials,
+            RefreshResponse {
+                access_token: "new-access-token".to_string(),
+                refresh_token: "new-refresh-token".to_string(),
+                expires_in: u64::MAX,
+                refresh_expires_in: 3600,
+                token_type: "Bearer".to_string(),
+            },
+        )
+        .expect_err("overflowing access ttl should fail");
+
+        assert!(matches!(
+            error,
+            PublicError::Unexpected(message)
+                if message.contains("access token ttl seconds overflow")
+        ));
+        assert_eq!(credentials.access_token, original_access_token);
+        assert_eq!(credentials.refresh_token, original_refresh_token);
+        assert_eq!(credentials.access_expires_at, original_access_expires_at);
+        assert_eq!(credentials.refresh_expires_at, original_refresh_expires_at);
     }
 }

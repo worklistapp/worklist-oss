@@ -1,4 +1,4 @@
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use worklist_client_api::{CurrentUserResponse, DashboardStatsResponse, PublicApiClient};
 use worklist_client_auth::{
     AgentCredentials, Credentials, PrincipalCredentials, load_credentials_for_url,
@@ -90,7 +90,7 @@ impl RuntimeClient {
         let client = auth_http_client()?;
         let refresh_response =
             refresh_access_token(&client, &self.api_url, &credentials.refresh_token).await?;
-        update_credentials_with_refresh(credentials, refresh_response);
+        update_credentials_with_refresh(credentials, refresh_response)?;
         save_credentials(credentials)
     }
 
@@ -104,17 +104,50 @@ impl RuntimeClient {
 
         let client = auth_http_client()?;
         let response = mint_agent_access_token(&client, credentials).await?;
-        let expires_in = i64::try_from(response.expires_in).map_err(|err| {
-            PublicError::unexpected(format!(
-                "agent access ttl overflow for expires_in={}: {err}",
-                response.expires_in
-            ))
-        })?;
+        let access_expires_at = agent_access_expires_at_from(Utc::now(), response.expires_in)?;
         credentials.set_active_access_token(
             response.owner_user_id,
             response.access_token,
-            Utc::now() + chrono::Duration::seconds(expires_in),
+            access_expires_at,
         );
         save_agent_credentials(credentials)
+    }
+}
+
+fn agent_access_expires_at_from(
+    now: DateTime<Utc>,
+    expires_in_seconds: u64,
+) -> PublicResult<DateTime<Utc>> {
+    let seconds = i64::try_from(expires_in_seconds).map_err(|err| {
+        PublicError::unexpected(format!(
+            "agent access token ttl seconds overflow for expires_in={expires_in_seconds}: {err}"
+        ))
+    })?;
+    let ttl = chrono::Duration::try_seconds(seconds).ok_or_else(|| {
+        PublicError::unexpected(format!(
+            "agent access token ttl duration overflow for expires_in={expires_in_seconds}"
+        ))
+    })?;
+    now.checked_add_signed(ttl).ok_or_else(|| {
+        PublicError::unexpected(format!(
+            "agent access token expiry overflow for expires_in={expires_in_seconds}"
+        ))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_access_expires_at_from_rejects_ttl_overflow() {
+        let error = agent_access_expires_at_from(Utc::now(), u64::MAX)
+            .expect_err("overflowing agent access ttl should fail");
+
+        assert!(matches!(
+            error,
+            PublicError::Unexpected(message)
+                if message.contains("agent access token ttl seconds overflow")
+        ));
     }
 }

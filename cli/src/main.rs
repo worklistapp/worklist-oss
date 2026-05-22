@@ -52,24 +52,6 @@ enum CliError {
     },
 }
 
-impl std::error::Error for CliError {}
-
-impl fmt::Display for CliError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(err) = self.public_error() {
-            err.fmt(f)
-        } else {
-            write!(f, "broken pipe")
-        }
-    }
-}
-
-impl From<PublicError> for CliError {
-    fn from(value: PublicError) -> Self {
-        Self::Public(value)
-    }
-}
-
 impl CliError {
     fn public_error(&self) -> Option<&PublicError> {
         match self {
@@ -107,6 +89,24 @@ impl CliError {
             code: self.code(),
             message: self.to_string(),
         }
+    }
+}
+
+impl std::error::Error for CliError {}
+
+impl fmt::Display for CliError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(err) = self.public_error() {
+            err.fmt(f)
+        } else {
+            write!(f, "broken pipe")
+        }
+    }
+}
+
+impl From<PublicError> for CliError {
+    fn from(value: PublicError) -> Self {
+        Self::Public(value)
     }
 }
 
@@ -182,7 +182,7 @@ fn print_pretty_json_stderr<T: Serialize + ?Sized>(value: &T, context: &str) -> 
     write_stderr_line(format_args!("{output}"))
 }
 
-#[derive(Parser, Debug)]
+#[derive(Debug, Parser)]
 #[command(
     name = "worklist",
     version,
@@ -210,13 +210,24 @@ struct Cli {
     command: Option<Command>,
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OutputFormat {
     Table,
     Json,
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+impl OutputFormat {
+    #[must_use]
+    fn from_raw_args(args: &[OsString]) -> Self {
+        if args.iter().any(|arg| arg == OsStr::new("--json")) {
+            Self::Json
+        } else {
+            Self::Table
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum PrincipalArg {
     User,
     Agent,
@@ -227,17 +238,6 @@ impl From<PrincipalArg> for PrincipalSelection {
         match value {
             PrincipalArg::User => PrincipalSelection::User,
             PrincipalArg::Agent => PrincipalSelection::Agent,
-        }
-    }
-}
-
-impl OutputFormat {
-    #[must_use]
-    fn from_raw_args(args: &[OsString]) -> Self {
-        if args.iter().any(|arg| arg == OsStr::new("--json")) {
-            Self::Json
-        } else {
-            Self::Table
         }
     }
 }
@@ -378,7 +378,7 @@ enum AuthStatusResult {
     LoggedOut(LoggedOutStatusResult),
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Debug, Subcommand)]
 enum Command {
     Info,
     Auth {
@@ -417,7 +417,7 @@ enum Command {
     },
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Debug, Subcommand)]
 enum AgentCommand {
     Register {
         #[arg(long)]
@@ -443,7 +443,7 @@ enum AgentCommand {
     },
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Debug, Subcommand)]
 enum ListsCommand {
     Get {
         work_list_id: Uuid,
@@ -454,7 +454,7 @@ enum ListsCommand {
     },
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Debug, Subcommand)]
 enum TasksCommand {
     List {
         #[arg(long)]
@@ -490,13 +490,13 @@ enum TasksCommand {
     },
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Debug, Subcommand)]
 enum TaskAttachmentsCommand {
     Read(TaskAttachmentReadArgsCli),
     Download(TaskAttachmentDownloadArgsCli),
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Debug, Subcommand)]
 enum CommentsCommand {
     List {
         #[arg(long)]
@@ -667,7 +667,7 @@ struct TaskAttachmentDownloadArgsCli {
     password_stdin: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum JsonInputSource<'a> {
     File(&'a Path),
     Stdin,
@@ -682,7 +682,7 @@ impl<'a> JsonInputSource<'a> {
     }
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Debug, Subcommand)]
 enum AuthCommand {
     Login {
         #[arg(long)]
@@ -705,7 +705,7 @@ enum AuthCommand {
     Status,
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Debug, Subcommand)]
 enum KeychainCommand {
     Store {
         #[arg(long)]
@@ -985,7 +985,7 @@ async fn cmd_login(
     }
     let client = reqwest::Client::new();
     let auth_response = login(&client, api_url, &email, &password).await?;
-    let credentials = auth_response_to_credentials(api_url, auth_response);
+    let credentials = auth_response_to_credentials(api_url, auth_response)?;
     save_credentials(&credentials)?;
 
     let result = build_login_result(
@@ -1243,8 +1243,16 @@ async fn cmd_agent_register(
     );
     save_agent_credentials(&credentials)?;
     if let Err(err) = save_agent_seed(&credentials, key_material.seed()) {
-        let _ = clear_agent_credentials();
-        return Err(err.into());
+        return match clear_agent_credentials() {
+            Ok(()) => Err(err.into()),
+            Err(cleanup_err) => {
+                let warning = warning_result(
+                    "agent_registration_cleanup_failed",
+                    format!("failed to remove partial agent credentials: {cleanup_err}"),
+                );
+                Err(CliError::with_warnings(err, &[warning]))
+            }
+        };
     }
 
     let result = AgentRegisterResult {
