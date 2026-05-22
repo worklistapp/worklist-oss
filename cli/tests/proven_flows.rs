@@ -25,19 +25,23 @@ use worklist_client_auth::{
     AgentCredentials, Credentials, agent_key_material_from_seed, normalize_api_url,
 };
 use worklist_client_crypto::{
-    ATTACHMENT_BLOB_CONTEXT, ATTACHMENT_BLOB_CONTEXT_LABEL, ATTACHMENT_BLOB_REF_VERSION,
-    ATTACHMENT_REF_CONTEXT, AttachmentBlobRef, CommentPayloadBody, FlexibleValue, SealedPayload,
-    StrongBoxKeyRing, SymmetricKey, TaskPayloadBody, USER_DATA_KEY_CONTEXT,
-    WORK_LIST_MEMBERSHIP_CONTEXT, WORK_LIST_PAYLOAD_CONTEXT, build_comment_payload_envelope,
-    build_task_payload_envelope, compute_payload_proof, decrypt_comment_payload,
-    decrypt_task_payload, decrypt_task_title_for_id, derive_payload_binding_key,
-    encrypt_agent_work_list_key, encrypt_comment_payload, encrypt_task_payload,
-    flexible_value_to_json, json_value_to_flexible, plaintext_rich_text, seal_task_title,
-    seal_work_list_title, serialize_to_cbor,
+    AttachmentBlobRef, CommentPayloadBody, FlexibleValue, SealedPayload, StrongBoxKeyRing,
+    SymmetricKey, TaskPayloadBody, build_comment_payload_envelope, build_task_payload_envelope,
+    compute_payload_proof, decrypt_comment_payload, decrypt_task_payload,
+    decrypt_task_title_for_id, derive_payload_binding_key, encrypt_agent_work_list_key,
+    encrypt_comment_payload, encrypt_task_payload, flexible_value_to_json, json_value_to_flexible,
+    plaintext_rich_text, seal_task_title, seal_work_list_title, serialize_to_cbor,
 };
 
 const AUTHORIZED_USER_TOKEN_LABEL: &str = "user";
 const AUTHORIZED_AGENT_TOKEN_LABEL: &str = "agent";
+const USER_DATA_KEY_CONTEXT: &[u8] = b"worklist.user.data_key";
+const WORK_LIST_PAYLOAD_CONTEXT: &[u8] = b"worklist.work_list.v1";
+const WORK_LIST_MEMBERSHIP_CONTEXT: &[u8] = b"worklist.membership";
+const ATTACHMENT_BLOB_CONTEXT: &[u8] = b"worklist.attachment.blob.v1";
+const ATTACHMENT_REF_CONTEXT: &[u8] = b"worklist.attachment.ref.v1";
+const ATTACHMENT_BLOB_CONTEXT_LABEL: &str = "worklist.attachment.blob.v1";
+const ATTACHMENT_BLOB_REF_VERSION: u8 = 1;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_proven_flows_round_trip_through_mock_api() {

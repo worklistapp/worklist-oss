@@ -5,7 +5,17 @@ use std::time::Duration as StdDuration;
 use worklist_client_auth::{Credentials, PrincipalSelection, normalize_api_url};
 use worklist_client_core::{PublicError, PublicResult};
 
-pub use models::*;
+pub use delete_inputs::{
+    DeleteAuditPatchFieldInput, DeleteAuditPatchInput, DeleteCommentInput, DeleteTaskInput,
+};
+pub use models::{
+    AgentAttachment, AgentComment, AgentDelegation, AgentMembership, AgentTaskDetail,
+    AgentTaskSummary, AgentWorkListDetail, AgentWorkListSummary, ArchiveTaskArgs, CommentInput,
+    CreateCommentArgs, CreateTaskArgs, DeleteCommentArgs, DeleteTaskArgs, DownloadedAttachment,
+    MoveTaskArgs, MoveTaskInput, ReadError, ReadableAttachment, ReadableAttachmentContentFormat,
+    ReadableAttachmentSourceKind, TaskCreateInput, TaskUpdateInput, UnarchiveTaskArgs,
+    UpdateCommentArgs, UpdateTaskArgs,
+};
 pub use unlock_daemon::{
     SessionKey, UnlockStatus, clear_session, fetch_data_key, lock, serve, session_key, socket_path,
     unlock, unlock_status,
@@ -15,6 +25,7 @@ mod agent_grants;
 mod attachments;
 mod auth;
 mod comments;
+mod delete_inputs;
 mod keys;
 mod models;
 mod projections;

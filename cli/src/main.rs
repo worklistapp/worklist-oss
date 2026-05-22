@@ -10,9 +10,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::json;
 use uuid::Uuid;
-use worklist_client_api::{
-    AgentSummaryResponse, ApproveAgentEnrollmentRequest, DeleteCommentRequest, DeleteTaskRequest,
-};
+use worklist_client_api::{AgentSummaryResponse, ApproveAgentEnrollmentRequest};
 use worklist_client_auth::{
     AgentCredentials, Credentials, PersistedDataKeyStatus, PrincipalCredentials,
     PrincipalSelection, UnlockMode, agent_credentials_path, auth_response_to_credentials,
@@ -26,9 +24,9 @@ use worklist_client_core::{PublicError, PublicResult};
 use worklist_client_crypto::CryptoCapability;
 use worklist_client_runtime::{
     ArchiveTaskArgs, CommentInput, CreateCommentArgs, CreateTaskArgs, DeleteCommentArgs,
-    DeleteTaskArgs, MoveTaskArgs, MoveTaskInput, RuntimeClient, SessionKey, TaskCreateInput,
-    TaskUpdateInput, UnarchiveTaskArgs, UnlockStatus, UpdateCommentArgs, UpdateTaskArgs,
-    clear_session, lock, serve, session_key, unlock_status,
+    DeleteCommentInput, DeleteTaskArgs, DeleteTaskInput, MoveTaskArgs, MoveTaskInput,
+    RuntimeClient, SessionKey, TaskCreateInput, TaskUpdateInput, UnarchiveTaskArgs, UnlockStatus,
+    UpdateCommentArgs, UpdateTaskArgs, clear_session, lock, serve, session_key, unlock_status,
 };
 
 use self::output::{
@@ -2106,7 +2104,7 @@ async fn cmd_tasks_delete(
     args: TaskDeleteArgsCli,
 ) -> CliResult<()> {
     let input =
-        resolve_delete_input::<DeleteTaskRequest>(args.input_file.as_deref(), args.input_stdin)?;
+        resolve_delete_input::<DeleteTaskInput>(args.input_file.as_deref(), args.input_stdin)?;
     runtime
         .delete_task(DeleteTaskArgs {
             work_list_id: args.work_list_id,
@@ -2218,7 +2216,7 @@ async fn cmd_comments_delete(
     args: CommentDeleteArgsCli,
 ) -> CliResult<()> {
     let input =
-        resolve_delete_input::<DeleteCommentRequest>(args.input_file.as_deref(), args.input_stdin)?;
+        resolve_delete_input::<DeleteCommentInput>(args.input_file.as_deref(), args.input_stdin)?;
     runtime
         .delete_comment(DeleteCommentArgs {
             work_list_id: args.work_list_id,

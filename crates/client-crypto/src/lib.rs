@@ -42,16 +42,17 @@ pub use text_fields::{
     seal_work_list_title, seal_work_list_title_for_id,
 };
 
-pub const USER_DATA_KEY_CONTEXT: &[u8] = b"worklist.user.data_key";
-pub const WORK_LIST_PAYLOAD_CONTEXT: &[u8] = b"worklist.work_list.v1";
-pub const WORK_LIST_MEMBERSHIP_CONTEXT: &[u8] = b"worklist.membership";
-pub const TASK_PAYLOAD_CONTEXT: &[u8] = b"worklist.task.v1";
-pub const COMMENT_PAYLOAD_CONTEXT: &[u8] = b"worklist.comment.v1";
-pub const ATTACHMENT_BLOB_CONTEXT: &[u8] = b"worklist.attachment.blob.v1";
-pub const ATTACHMENT_REF_CONTEXT: &[u8] = b"worklist.attachment.ref.v1";
-pub const ATTACHMENT_BLOB_CONTEXT_LABEL: &str = "worklist.attachment.blob.v1";
-pub const ATTACHMENT_BLOB_REF_VERSION: u8 = 1;
-pub const DATA_KEY_SALT_BYTES: usize = 32;
+pub(crate) const USER_DATA_KEY_CONTEXT: &[u8] = b"worklist.user.data_key";
+pub(crate) const WORK_LIST_PAYLOAD_CONTEXT: &[u8] = b"worklist.work_list.v1";
+pub(crate) const WORK_LIST_MEMBERSHIP_CONTEXT: &[u8] = b"worklist.membership";
+pub(crate) const TASK_PAYLOAD_CONTEXT: &[u8] = b"worklist.task.v1";
+pub(crate) const COMMENT_PAYLOAD_CONTEXT: &[u8] = b"worklist.comment.v1";
+#[cfg(test)]
+pub(crate) const ATTACHMENT_BLOB_CONTEXT: &[u8] = b"worklist.attachment.blob.v1";
+pub(crate) const ATTACHMENT_REF_CONTEXT: &[u8] = b"worklist.attachment.ref.v1";
+pub(crate) const ATTACHMENT_BLOB_CONTEXT_LABEL: &str = "worklist.attachment.blob.v1";
+pub(crate) const ATTACHMENT_BLOB_REF_VERSION: u8 = 1;
+pub(crate) const DATA_KEY_SALT_BYTES: usize = 32;
 pub const KEY_SIZE: usize = 32;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

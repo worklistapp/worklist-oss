@@ -133,13 +133,9 @@ impl RuntimeClient {
 
     pub async fn delete_comment(&self, args: DeleteCommentArgs) -> PublicResult<()> {
         let mut client = self.authenticated_api_client().await?;
+        let request = args.input.into_api_request();
         client
-            .delete_comment(
-                args.work_list_id,
-                args.task_id,
-                args.comment_id,
-                &args.input,
-            )
+            .delete_comment(args.work_list_id, args.task_id, args.comment_id, &request)
             .await
     }
 

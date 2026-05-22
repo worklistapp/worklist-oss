@@ -2,8 +2,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
-use worklist_client_api::{DeleteCommentRequest, DeleteTaskRequest, SectionSnapshotPayload};
+use worklist_client_api::SectionSnapshotPayload;
 use worklist_client_crypto::{ChecklistItemPayload, TaskPayloadRichText};
+
+use crate::{DeleteCommentInput, DeleteTaskInput};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -242,7 +244,7 @@ pub struct UnarchiveTaskArgs {
 pub struct DeleteTaskArgs {
     pub work_list_id: Uuid,
     pub task_id: Uuid,
-    pub input: DeleteTaskRequest,
+    pub input: DeleteTaskInput,
 }
 
 #[derive(Debug)]
@@ -267,5 +269,5 @@ pub struct DeleteCommentArgs {
     pub work_list_id: Uuid,
     pub task_id: Uuid,
     pub comment_id: Uuid,
-    pub input: DeleteCommentRequest,
+    pub input: DeleteCommentInput,
 }

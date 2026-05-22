@@ -341,8 +341,9 @@ impl RuntimeClient {
 
     pub async fn delete_task(&self, args: DeleteTaskArgs) -> PublicResult<()> {
         let mut client = self.authenticated_api_client().await?;
+        let request = args.input.into_api_request();
         client
-            .delete_task(args.work_list_id, args.task_id, &args.input)
+            .delete_task(args.work_list_id, args.task_id, &request)
             .await
     }
 
