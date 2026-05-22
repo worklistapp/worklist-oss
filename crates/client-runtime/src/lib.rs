@@ -9,12 +9,12 @@ pub use delete_inputs::{
     DeleteAuditPatchFieldInput, DeleteAuditPatchInput, DeleteCommentInput, DeleteTaskInput,
 };
 pub use models::{
-    AgentAttachment, AgentComment, AgentDelegation, AgentMembership, AgentTaskDetail,
-    AgentTaskSummary, AgentWorkListDetail, AgentWorkListSummary, ArchiveTaskArgs, CommentInput,
-    CreateCommentArgs, CreateTaskArgs, DeleteCommentArgs, DeleteTaskArgs, DownloadedAttachment,
-    MoveTaskArgs, MoveTaskInput, ReadError, ReadableAttachment, ReadableAttachmentContentFormat,
-    ReadableAttachmentSourceKind, TaskCreateInput, TaskUpdateInput, UnarchiveTaskArgs,
-    UpdateCommentArgs, UpdateTaskArgs,
+    AcceptTaskAssignmentArgs, AgentAttachment, AgentComment, AgentDelegation, AgentMembership,
+    AgentTaskDetail, AgentTaskSummary, AgentWorkListDetail, AgentWorkListSummary, ArchiveTaskArgs,
+    CommentInput, CreateCommentArgs, CreateTaskArgs, DeleteCommentArgs, DeleteTaskArgs,
+    DownloadedAttachment, MoveTaskArgs, MoveTaskInput, ReadError, ReadableAttachment,
+    ReadableAttachmentContentFormat, ReadableAttachmentSourceKind, TaskCreateInput,
+    TaskUpdateInput, UnarchiveTaskArgs, UpdateCommentArgs, UpdateTaskArgs,
 };
 pub use unlock_daemon::{
     SessionKey, UnlockStatus, clear_session, fetch_data_key, lock, serve, session_key, socket_path,

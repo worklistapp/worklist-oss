@@ -7,14 +7,16 @@ use worklist_client_core::{PublicError, PublicResult};
 use crate::{
     AgentEnrollmentResponse, AgentSummaryResponse, ApproveAgentEnrollmentRequest,
     ArchiveTaskRequest, CommentResponse, CreateCommentRequest, CreateTaskRequest,
-    CurrentUserResponse, DashboardStatsResponse, DeleteCommentRequest, DeleteTaskRequest,
-    DownloadAttachmentResponse, LookupAgentEnrollmentRequest, MoveTaskRequest, MyTasksResponse,
-    TaskDetailResponse, TaskListResponse, TaskResponse, UnarchiveTaskRequest, UpdateCommentRequest,
-    UpdateTaskRequest, WorkListDetailResponse, WorkListResponse,
+    CurrentUserResponse, DashboardStatsResponse, DelegationResponse, DeleteCommentRequest,
+    DeleteTaskRequest, DownloadAttachmentResponse, LookupAgentEnrollmentRequest, MoveTaskRequest,
+    MyTaskResponse, MyTasksResponse, TaskDetailResponse, TaskListResponse, TaskResponse,
+    UnarchiveTaskRequest, UpdateCommentRequest, UpdateDelegationRequest, UpdateTaskRequest,
+    WorkListDetailResponse, WorkListResponse,
     errors::{handle_empty_response, handle_response, map_reqwest_error},
 };
 
 const API_HTTP_TIMEOUT: StdDuration = StdDuration::from_secs(30);
+const MY_TASKS_PAGE_LIMIT: i64 = 100;
 
 #[derive(Clone)]
 pub struct PublicApiClient {
@@ -101,12 +103,24 @@ impl PublicApiClient {
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> PublicResult<MyTasksResponse> {
+        self.get_my_tasks_filtered(limit, offset, false).await
+    }
+
+    pub async fn get_my_tasks_filtered(
+        &mut self,
+        limit: Option<i64>,
+        offset: Option<i64>,
+        include_completed: bool,
+    ) -> PublicResult<MyTasksResponse> {
         let mut params = Vec::new();
         if let Some(limit) = limit {
             params.push(format!("limit={limit}"));
         }
         if let Some(offset) = offset {
             params.push(format!("offset={offset}"));
+        }
+        if include_completed {
+            params.push("includeCompleted=true".to_string());
         }
 
         let path = if params.is_empty() {
@@ -116,6 +130,35 @@ impl PublicApiClient {
         };
 
         self.get(&path).await
+    }
+
+    pub async fn get_all_my_tasks(
+        &mut self,
+        include_completed: bool,
+    ) -> PublicResult<Vec<MyTaskResponse>> {
+        let mut tasks = Vec::new();
+        let mut offset = 0;
+
+        // /me/tasks currently exposes offset pagination. CLI listing is a
+        // best-effort snapshot if assignments change while pages are loading.
+        loop {
+            let page = self
+                .get_my_tasks_filtered(Some(MY_TASKS_PAGE_LIMIT), Some(offset), include_completed)
+                .await?;
+            let page_count = page.tasks.len();
+            let total = usize::try_from(page.total).map_err(|err| {
+                PublicError::unexpected(format!("invalid /me/tasks total {}: {err}", page.total))
+            })?;
+            tasks.extend(page.tasks);
+
+            if page_count == 0 || page_count < MY_TASKS_PAGE_LIMIT as usize || tasks.len() >= total
+            {
+                break;
+            }
+            offset += page_count as i64;
+        }
+
+        Ok(tasks)
     }
 
     pub async fn get_dashboard_stats(&mut self) -> PublicResult<DashboardStatsResponse> {
@@ -187,6 +230,20 @@ impl PublicApiClient {
     ) -> PublicResult<TaskResponse> {
         self.patch(
             &format!("/work-lists/{work_list_id}/tasks/{task_id}"),
+            payload,
+        )
+        .await
+    }
+
+    pub async fn update_delegation(
+        &mut self,
+        work_list_id: Uuid,
+        task_id: Uuid,
+        delegation_id: Uuid,
+        payload: &UpdateDelegationRequest,
+    ) -> PublicResult<DelegationResponse> {
+        self.patch(
+            &format!("/work-lists/{work_list_id}/tasks/{task_id}/delegations/{delegation_id}"),
             payload,
         )
         .await

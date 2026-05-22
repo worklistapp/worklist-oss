@@ -23,8 +23,10 @@ pub use comments::{
 pub use errors::ApiErrorResponse;
 pub use tasks::{
     ArchiveTaskRequest, ArchivedTaskCountResponse, CreateTaskRequest, DelegationResponse,
-    DeleteTaskRequest, MoveTaskRequest, MyTaskResponse, MyTasksResponse, PublicTaskRef,
-    TaskDetailResponse, TaskListResponse, TaskResponse, UnarchiveTaskRequest, UpdateTaskRequest,
+    DelegationRole, DelegationStatus, DelegationTarget, DelegationTargetType, DeleteTaskRequest,
+    MoveTaskRequest, MyTaskResponse, MyTasksResponse, PublicTaskRef, TaskDetailResponse,
+    TaskListResponse, TaskResponse, UnarchiveTaskRequest, UpdateDelegationRequest,
+    UpdateTaskRequest,
 };
 pub use users::{CurrentUserResponse, DashboardStatsResponse};
 pub use work_lists::{

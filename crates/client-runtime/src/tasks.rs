@@ -1,8 +1,10 @@
 use uuid::Uuid;
 use worklist_client_api::{
-    ArchiveTaskRequest, CreateTaskRequest, MoveTaskRequest, MyTaskResponse, PublicApiClient,
-    TaskResponse, UnarchiveTaskRequest, UpdateTaskRequest,
+    ArchiveTaskRequest, CreateTaskRequest, DelegationRole, DelegationStatus, DelegationTarget,
+    MoveTaskRequest, MyTaskResponse, PublicApiClient, TaskResponse, UnarchiveTaskRequest,
+    UpdateDelegationRequest, UpdateTaskRequest,
 };
+use worklist_client_auth::PrincipalCredentials;
 use worklist_client_core::{PublicError, PublicResult};
 use worklist_client_crypto::{
     SymmetricKey, TaskPayloadBody, build_task_payload_envelope, compute_payload_proof,
@@ -16,8 +18,9 @@ use crate::attachments::{
     download_and_decrypt_attachment, find_task_attachment, unsupported_attachment_read_error,
 };
 use crate::models::{
-    AgentTaskDetail, AgentTaskSummary, ArchiveTaskArgs, CreateTaskArgs, DeleteTaskArgs,
-    DownloadedAttachment, MoveTaskArgs, ReadableAttachment, UnarchiveTaskArgs, UpdateTaskArgs,
+    AcceptTaskAssignmentArgs, AgentTaskDetail, AgentTaskSummary, ArchiveTaskArgs, CreateTaskArgs,
+    DeleteTaskArgs, DownloadedAttachment, MoveTaskArgs, ReadableAttachment, UnarchiveTaskArgs,
+    UpdateTaskArgs,
 };
 use crate::projections::{
     TaskProjectionInput, TaskProjectionMetadata, WorkListContext, decode_work_list_title_fallback,
@@ -53,11 +56,9 @@ impl RuntimeClient {
 
         let work_lists = client.list_work_lists().await?;
         let contexts = self.build_work_list_contexts(&work_lists, Some(&key_source));
-        let response = client.get_my_tasks(Some(100), None).await?;
-        Ok(response
-            .tasks
+        let tasks = client.get_all_my_tasks(include_completed).await?;
+        Ok(tasks
             .into_iter()
-            .filter(|task| include_completed || !task.is_completed)
             .map(|task| {
                 let context = contexts.get(&task.work_list_id);
                 self.project_my_task_summary(task, context)
@@ -80,6 +81,81 @@ impl RuntimeClient {
             .await?;
         let detail = client.get_task(work_list_id, task_id).await?;
 
+        let task = self.project_task_summary(detail.task, Some(&context));
+        let comments = detail
+            .comments
+            .into_iter()
+            .map(|comment| self.project_comment(comment, context.list_key.as_ref()))
+            .collect();
+        Ok(AgentTaskDetail { task, comments })
+    }
+
+    pub async fn accept_task_assignment(
+        &self,
+        args: AcceptTaskAssignmentArgs,
+    ) -> PublicResult<AgentTaskDetail> {
+        let agent_id = match self.require_principal_credentials()? {
+            PrincipalCredentials::Agent(credentials) => credentials.agent_id(),
+            _ => {
+                return Err(PublicError::validation(
+                    "agent credentials required to accept a task assignment",
+                ));
+            }
+        };
+
+        let (mut client, context) = self
+            .load_work_list_context(
+                args.work_list_id,
+                args.password_stdin,
+                "Password required to decrypt accepted task data.",
+            )
+            .await?;
+        let detail = client.get_task(args.work_list_id, args.task_id).await?;
+        let delegation = detail
+            .task
+            .delegations
+            .iter()
+            .find(|delegation| {
+                matches!(delegation.target, DelegationTarget::Agent { agent_id: target_agent_id } if target_agent_id == agent_id)
+                    && delegation.role == DelegationRole::Assignee
+            })
+            .ok_or_else(|| {
+                PublicError::validation("no assignee delegation exists for this agent")
+            })?;
+
+        let already_accepted = delegation.status == DelegationStatus::Accepted;
+        if !already_accepted {
+            client
+                .update_delegation(
+                    args.work_list_id,
+                    args.task_id,
+                    delegation.id,
+                    &UpdateDelegationRequest {
+                        status: Some(DelegationStatus::Accepted),
+                    },
+                )
+                .await?;
+        }
+
+        let detail = if already_accepted {
+            detail
+        } else {
+            client
+                .get_task(args.work_list_id, args.task_id)
+                .await
+                .map_err(|err| {
+                    let message = format!(
+                        "accepted task assignment but failed to reload task {}: {err}",
+                        args.task_id
+                    );
+                    match err {
+                        PublicError::Validation(_) => PublicError::validation(message),
+                        PublicError::Crypto(_) => PublicError::crypto(message),
+                        PublicError::Unexpected(_) => PublicError::unexpected(message),
+                        _ => PublicError::unexpected(message),
+                    }
+                })?
+        };
         let task = self.project_task_summary(detail.task, Some(&context));
         let comments = detail
             .comments

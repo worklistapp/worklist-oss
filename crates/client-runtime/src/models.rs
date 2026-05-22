@@ -2,7 +2,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
-use worklist_client_api::SectionSnapshotPayload;
+use worklist_client_api::{
+    DelegationRole, DelegationStatus, DelegationTarget, SectionSnapshotPayload,
+};
 use worklist_client_crypto::{ChecklistItemPayload, TaskPayloadRichText};
 
 use crate::{DeleteCommentInput, DeleteTaskInput};
@@ -59,9 +61,10 @@ pub struct AgentWorkListDetail {
 pub struct AgentDelegation {
     pub id: Uuid,
     pub task_id: Uuid,
-    pub membership_id: Uuid,
-    pub role: String,
-    pub status: String,
+    #[serde(flatten)]
+    pub target: DelegationTarget,
+    pub role: DelegationRole,
+    pub status: DelegationStatus,
     pub note_present: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -215,6 +218,13 @@ pub struct UpdateTaskArgs {
     pub work_list_id: Uuid,
     pub task_id: Uuid,
     pub input: TaskUpdateInput,
+    pub password_stdin: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct AcceptTaskAssignmentArgs {
+    pub work_list_id: Uuid,
+    pub task_id: Uuid,
     pub password_stdin: bool,
 }
 

@@ -314,7 +314,7 @@ fn project_delegation(delegation: DelegationResponse) -> AgentDelegation {
     AgentDelegation {
         id: delegation.id,
         task_id: delegation.task_id,
-        membership_id: delegation.membership_id,
+        target: delegation.target,
         role: delegation.role,
         status: delegation.status,
         note_present: delegation.note_ciphertext.is_some(),

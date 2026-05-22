@@ -20,10 +20,11 @@ use worklist_client_auth::{
 use worklist_client_core::{PublicError, PublicResult};
 use worklist_client_crypto::CryptoCapability;
 use worklist_client_runtime::{
-    ArchiveTaskArgs, CommentInput, CreateCommentArgs, CreateTaskArgs, DeleteCommentArgs,
-    DeleteCommentInput, DeleteTaskArgs, DeleteTaskInput, MoveTaskArgs, MoveTaskInput,
-    RuntimeClient, SessionKey, TaskCreateInput, TaskUpdateInput, UnarchiveTaskArgs, UnlockStatus,
-    UpdateCommentArgs, UpdateTaskArgs, clear_session, lock, serve, session_key, unlock_status,
+    AcceptTaskAssignmentArgs, ArchiveTaskArgs, CommentInput, CreateCommentArgs, CreateTaskArgs,
+    DeleteCommentArgs, DeleteCommentInput, DeleteTaskArgs, DeleteTaskInput, MoveTaskArgs,
+    MoveTaskInput, RuntimeClient, SessionKey, TaskCreateInput, TaskUpdateInput, UnarchiveTaskArgs,
+    UnlockStatus, UpdateCommentArgs, UpdateTaskArgs, clear_session, lock, serve, session_key,
+    unlock_status,
 };
 
 use self::output::{
@@ -429,6 +430,14 @@ enum TasksCommand {
         #[arg(long, hide = true)]
         raw: bool,
     },
+    Assigned {
+        #[arg(long)]
+        include_completed: bool,
+        #[arg(long)]
+        password_stdin: bool,
+        #[arg(long, hide = true)]
+        raw: bool,
+    },
     Get {
         #[arg(long)]
         work_list_id: Uuid,
@@ -441,6 +450,7 @@ enum TasksCommand {
     },
     Create(TaskCreateArgsCli),
     Update(TaskUpdateArgsCli),
+    Accept(TaskAcceptArgsCli),
     Move(TaskMoveArgsCli),
     Archive(TaskArchiveArgsCli),
     Unarchive(TaskUnarchiveArgsCli),
@@ -502,6 +512,16 @@ struct TaskUpdateArgsCli {
     input_file: Option<PathBuf>,
     #[arg(long)]
     input_stdin: bool,
+    #[arg(long)]
+    password_stdin: bool,
+}
+
+#[derive(Args, Debug)]
+struct TaskAcceptArgsCli {
+    #[arg(long)]
+    work_list_id: Uuid,
+    #[arg(long)]
+    task_id: Uuid,
     #[arg(long)]
     password_stdin: bool,
 }
@@ -1643,16 +1663,7 @@ async fn cmd_tasks(
             if raw {
                 let mut client = runtime.authenticated_api_client().await?;
                 if all || work_list_id.is_none() {
-                    let response = client.get_my_tasks(Some(100), None).await?;
-                    let tasks: Vec<_> = if include_completed {
-                        response.tasks
-                    } else {
-                        response
-                            .tasks
-                            .into_iter()
-                            .filter(|task| !task.is_completed)
-                            .collect()
-                    };
+                    let tasks = client.get_all_my_tasks(include_completed).await?;
                     if tasks.is_empty() {
                         println_stdout(format_args!("No tasks found."))?;
                         return Ok(());
@@ -1694,6 +1705,32 @@ async fn cmd_tasks(
             print_tasks(&tasks, format)?;
             Ok(())
         }
+        TasksCommand::Assigned {
+            include_completed,
+            password_stdin,
+            raw,
+        } => {
+            if raw {
+                let mut client = runtime.authenticated_api_client().await?;
+                let tasks = client.get_all_my_tasks(include_completed).await?;
+                if tasks.is_empty() {
+                    println_stdout(format_args!("No assigned tasks found."))?;
+                    return Ok(());
+                }
+                print_raw_my_tasks(&tasks, format)?;
+                return Ok(());
+            }
+
+            let tasks = runtime
+                .list_tasks(None, include_completed, true, password_stdin)
+                .await?;
+            if tasks.is_empty() {
+                println_stdout(format_args!("No assigned tasks found."))?;
+                return Ok(());
+            }
+            print_tasks(&tasks, format)?;
+            Ok(())
+        }
         TasksCommand::Get {
             work_list_id,
             task_id,
@@ -1715,6 +1752,7 @@ async fn cmd_tasks(
         }
         TasksCommand::Create(args) => cmd_tasks_create(runtime, args).await,
         TasksCommand::Update(args) => cmd_tasks_update(runtime, args).await,
+        TasksCommand::Accept(args) => cmd_tasks_accept(runtime, args).await,
         TasksCommand::Move(args) => cmd_tasks_move(runtime, args).await,
         TasksCommand::Archive(args) => cmd_tasks_archive(runtime, args).await,
         TasksCommand::Unarchive(args) => cmd_tasks_unarchive(runtime, args).await,
@@ -1784,6 +1822,17 @@ async fn cmd_tasks_update(runtime: &RuntimeClient, args: TaskUpdateArgsCli) -> C
         })
         .await?;
     print_pretty_json(&updated, "serializing updated task should succeed")
+}
+
+async fn cmd_tasks_accept(runtime: &RuntimeClient, args: TaskAcceptArgsCli) -> CliResult<()> {
+    let accepted = runtime
+        .accept_task_assignment(AcceptTaskAssignmentArgs {
+            work_list_id: args.work_list_id,
+            task_id: args.task_id,
+            password_stdin: args.password_stdin,
+        })
+        .await?;
+    print_pretty_json(&accepted, "serializing accepted task should succeed")
 }
 
 async fn cmd_tasks_move(runtime: &RuntimeClient, args: TaskMoveArgsCli) -> CliResult<()> {

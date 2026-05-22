@@ -66,6 +66,7 @@ WORKLIST_API_URL=https://your-worklist.example cargo run -p worklist -- me
 
 - The CLI defaults to table/text output for humans; pass `--json` for machine-readable output.
 - Read commands return decrypted agent-facing models by default; raw wire DTOs are only available through hidden debug flags.
+- Agent `/me/tasks`, `tasks assigned`, and all-work-list task listings are assignment-gated: work-list grants authorize access, but a task appears in these views only after an explicit assignee delegation to that agent. Upgrades from grant-wide task listing behavior should assign or backfill agent delegations intentionally.
 - Encrypted read and write commands are non-interactive by default. Use `auth unlock --password-stdin` for a temporary in-memory session, or `auth keychain store --password-stdin` to persist a local bootstrap secret in the platform keychain.
 - `tasks get` includes typed attachment metadata and lists attachment IDs in table output.
 - `tasks attachments read` prints readable attachments to stdout, including plain text passthrough and DOCX rendered as Markdown; with `--json` it emits the rendered content plus attachment metadata.
