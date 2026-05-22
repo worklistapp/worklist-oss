@@ -63,6 +63,9 @@ impl RuntimeClient {
                     self.load_agent_recipient_private_key(&credentials)?,
                 ))
             }
+            _ => Err(PublicError::validation(
+                "unsupported principal credentials type",
+            )),
         }
     }
 

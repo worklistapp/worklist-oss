@@ -5,6 +5,7 @@ use thiserror::Error;
 pub type PublicResult<T> = Result<T, PublicError>;
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum PublicError {
     #[error("{0}")]
     Validation(String),

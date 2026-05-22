@@ -151,6 +151,7 @@ pub struct DownloadedAttachment {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ReadableAttachmentContentFormat {
     Text,
     Markdown,
@@ -158,6 +159,7 @@ pub enum ReadableAttachmentContentFormat {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ReadableAttachmentSourceKind {
     PlainText,
     DocxRendered,

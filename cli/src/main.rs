@@ -84,6 +84,7 @@ impl CliError {
             Some(PublicError::Validation(_)) => "validation",
             Some(PublicError::Crypto(_)) => "crypto",
             Some(PublicError::Unexpected(_)) => "unexpected",
+            Some(_) => "unexpected",
         }
     }
 
@@ -1106,6 +1107,9 @@ async fn cmd_logout(
 
             record_logout_cleanup_result(clear_agent_credentials(), &mut cleanup_error);
         }
+        _ => {
+            return Err(PublicError::validation("unsupported principal credentials type").into());
+        }
     }
 
     if let Some(err) = cleanup_error {
@@ -1502,6 +1506,7 @@ fn load_auth_status(
         (PrincipalSelection::Auto, None, None)
         | (PrincipalSelection::User, None, _)
         | (PrincipalSelection::Agent, _, None) => logged_out_auth_status(),
+        _ => Err(PublicError::validation("unsupported principal selection").into()),
     }
 }
 
@@ -1634,6 +1639,10 @@ fn persisted_bootstrap_status(status: PersistedDataKeyStatus) -> PersistedBootst
         PersistedDataKeyStatus::Unavailable(message) => PersistedBootstrapStatus {
             status: "unavailable",
             message: Some(message),
+        },
+        _ => PersistedBootstrapStatus {
+            status: "unavailable",
+            message: Some("unsupported persisted data key status".to_string()),
         },
     }
 }

@@ -56,6 +56,7 @@ pub const KEY_SIZE: usize = 32;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum CryptoCapability {
     DataKeyUnwrap,
     WorkListKeyDecrypt,

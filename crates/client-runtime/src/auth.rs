@@ -68,6 +68,9 @@ impl RuntimeClient {
                     .await?;
                 credentials.active_access_token().map(ToOwned::to_owned)
             }
+            _ => Err(PublicError::validation(
+                "unsupported principal credentials type",
+            )),
         }
     }
 

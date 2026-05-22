@@ -10,6 +10,7 @@ pub(crate) const REDACTED_SECRET_FIELD: &str = "[redacted]";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum UnlockMode {
     SingleCommand,
     Daemon,
@@ -243,6 +244,7 @@ pub enum AgentCredentialState<'a> {
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "principal_type", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum PrincipalCredentials {
     User(Credentials),
     Agent(AgentCredentials),
@@ -268,6 +270,7 @@ impl PrincipalCredentials {
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum PrincipalSelection {
     #[default]
     Auto,
@@ -286,6 +289,7 @@ impl PrincipalSelection {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum PersistedDataKeyStatus {
     Available,
     Missing,
