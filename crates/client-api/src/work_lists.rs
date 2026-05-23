@@ -10,9 +10,13 @@ pub struct WorkListResponse {
     pub id: Uuid,
     pub owner_user_id: Uuid,
     pub workspace_id: Uuid,
-    pub title_ciphertext: SealedBlob,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redacted: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title_ciphertext: Option<SealedBlob>,
     pub description_ciphertext: Option<SealedBlob>,
-    pub payload_ciphertext: SealedBlob,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_ciphertext: Option<SealedBlob>,
     pub timezone: String,
     pub section_snapshots: Vec<SectionSnapshotPayload>,
     pub created_at: DateTime<Utc>,

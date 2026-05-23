@@ -50,6 +50,11 @@ mod tests {
         ffi::OsString,
         sync::{Mutex, OnceLock},
     };
+    #[cfg(unix)]
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+    };
     use tempfile::TempDir;
     use uuid::Uuid;
     use worklist_client_core::PublicError;
@@ -93,6 +98,34 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[cfg(unix)]
+    fn single_file_with_prefix(dir: &Path, prefix: &str) -> PathBuf {
+        let mut matches = fs::read_dir(dir)
+            .expect("read dir")
+            .map(|entry| entry.expect("dir entry").path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(prefix))
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(matches.len(), 1, "expected one file with prefix {prefix}");
+        matches.pop().expect("matching file")
+    }
+
+    #[cfg(unix)]
+    fn assert_file_mode(path: &Path, expected: u32) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = fs::metadata(path)
+            .expect("file metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, expected, "unexpected mode for {}", path.display());
     }
 
     #[test]
@@ -216,6 +249,12 @@ mod tests {
         let _keychain_dir = EnvVarGuard::set_path(TEST_KEYCHAIN_DIR_ENV, temp.path());
 
         save_persisted_data_key(&credentials, b"secret").expect("store key");
+        #[cfg(unix)]
+        assert_file_mode(
+            &single_file_with_prefix(temp.path(), "persisted-data-key-"),
+            0o600,
+        );
+
         let loaded = load_persisted_data_key(&credentials).expect("load key");
 
         assert_eq!(loaded.as_deref(), Some(b"secret".as_slice()));
@@ -244,6 +283,12 @@ mod tests {
         let _file_backend = EnvVarGuard::set_value(AGENT_SEED_FILE_ONLY_ENV, "1");
 
         save_agent_seed(&credentials, &[0x5A; KEY_SIZE]).expect("store agent seed");
+        #[cfg(unix)]
+        assert_file_mode(
+            &single_file_with_prefix(&config_dir().expect("config dir"), "agent-seed-"),
+            0o600,
+        );
+
         let loaded = load_agent_seed(&credentials).expect("load agent seed");
 
         assert_eq!(loaded, Some([0x5A; KEY_SIZE]));
@@ -328,6 +373,14 @@ mod tests {
 
         save_credentials(&user_credentials).expect("save user credentials");
         save_agent_credentials(&agent_credentials).expect("save agent credentials");
+        #[cfg(unix)]
+        {
+            assert_file_mode(&credentials_path().expect("credentials path"), 0o600);
+            assert_file_mode(
+                &agent_credentials_path().expect("agent credentials path"),
+                0o600,
+            );
+        }
 
         clear_credentials().expect("clear user credentials");
 

@@ -91,7 +91,7 @@ impl RuntimeClient {
         let refresh_response =
             refresh_access_token(&client, &self.api_url, &credentials.refresh_token).await?;
         update_credentials_with_refresh(credentials, refresh_response)?;
-        save_credentials(credentials)
+        save_credentials_blocking(credentials.clone()).await
     }
 
     pub(crate) async fn refresh_agent_credentials_if_needed(
@@ -110,8 +110,20 @@ impl RuntimeClient {
             response.access_token,
             access_expires_at,
         );
-        save_agent_credentials(credentials)
+        save_agent_credentials_blocking(credentials.clone()).await
     }
+}
+
+async fn save_credentials_blocking(credentials: Credentials) -> PublicResult<()> {
+    tokio::task::spawn_blocking(move || save_credentials(&credentials))
+        .await
+        .map_err(|err| PublicError::unexpected(format!("failed to join credential save: {err}")))?
+}
+
+async fn save_agent_credentials_blocking(credentials: AgentCredentials) -> PublicResult<()> {
+    tokio::task::spawn_blocking(move || save_agent_credentials(&credentials))
+        .await
+        .map_err(|err| PublicError::unexpected(format!("failed to join agent credential save: {err}")))?
 }
 
 fn agent_access_expires_at_from(

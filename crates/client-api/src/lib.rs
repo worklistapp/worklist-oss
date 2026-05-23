@@ -11,7 +11,8 @@ mod users;
 mod work_lists;
 
 pub use agents::{
-    AgentEnrollmentResponse, AgentGrantResponse, AgentSummaryResponse, AgentTokenResponse,
+    AgentAssignmentScope, AgentBoardScope, AgentEnrollmentResponse, AgentGrantPermissions,
+    AgentGrantResponse, AgentSummaryResponse, AgentTaskReadScope, AgentTokenResponse,
     ApproveAgentEnrollmentRequest, ApproveAgentGrantRequest, LookupAgentEnrollmentRequest,
 };
 pub use attachments::DownloadAttachmentResponse;

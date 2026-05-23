@@ -88,16 +88,28 @@ impl RuntimeClient {
             }
         };
 
-        let fallback_title =
-            decode_work_list_title_fallback(&work_list.title_ciphertext, &list_key, work_list.id);
-        let (title, read_error) =
-            match decode_work_list_payload_value(&list_key, &work_list.payload_ciphertext) {
-                Ok(payload) => (extract_work_list_title(&payload).or(fallback_title), None),
-                Err(err) => (
-                    fallback_title,
-                    Some(make_read_error("work_list_payload", err)),
-                ),
+        let fallback_title = work_list
+            .title_ciphertext
+            .as_deref()
+            .and_then(|ciphertext| {
+                decode_work_list_title_fallback(ciphertext, &list_key, work_list.id)
+            });
+        let Some(payload_ciphertext) = work_list.payload_ciphertext.as_deref() else {
+            return WorkListContext {
+                work_list_title: fallback_title,
+                list_key: Some(list_key),
+                read_error: None,
             };
+        };
+
+        let (title, read_error) = match decode_work_list_payload_value(&list_key, payload_ciphertext)
+        {
+            Ok(payload) => (extract_work_list_title(&payload).or(fallback_title), None),
+            Err(err) => (
+                fallback_title,
+                Some(make_read_error("work_list_payload", err)),
+            ),
+        };
         WorkListContext {
             work_list_title: title,
             list_key: Some(list_key),
@@ -150,8 +162,12 @@ impl RuntimeClient {
             }
         };
 
-        let fallback_title =
-            decode_work_list_title_fallback(&work_list.title_ciphertext, &list_key, work_list.id);
+        let fallback_title = work_list
+            .title_ciphertext
+            .as_deref()
+            .and_then(|ciphertext| {
+                decode_work_list_title_fallback(ciphertext, &list_key, work_list.id)
+            });
         let fallback_description =
             work_list
                 .description_ciphertext
@@ -159,7 +175,18 @@ impl RuntimeClient {
                 .and_then(|ciphertext| {
                     decode_work_list_description_fallback(ciphertext, &list_key, work_list.id)
                 });
-        match decode_work_list_payload_value(&list_key, &work_list.payload_ciphertext) {
+        let Some(payload_ciphertext) = work_list.payload_ciphertext.as_deref() else {
+            return build_work_list_summary(
+                work_list,
+                membership,
+                fallback_title,
+                fallback_description,
+                None,
+                None,
+            );
+        };
+
+        match decode_work_list_payload_value(&list_key, payload_ciphertext) {
             Ok(payload) => {
                 let title = extract_work_list_title(&payload).or(fallback_title);
                 let description = extract_work_list_description(&payload).or(fallback_description);

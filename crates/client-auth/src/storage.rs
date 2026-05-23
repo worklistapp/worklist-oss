@@ -1,6 +1,11 @@
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::{
+    fs::OpenOptions,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -144,30 +149,119 @@ where
     T: Serialize,
 {
     ensure_config_dir()?;
-
-    let file = File::create(path)
-        .map_err(|err| PublicError::unexpected(format!("failed to create {label} file: {err}")))?;
-    set_config_file_permissions(path, label)?;
-
-    let writer = BufWriter::new(file);
-    serde_json::to_writer_pretty(writer, value)
-        .map_err(|err| PublicError::unexpected(format!("failed to write {label} file: {err}")))
+    let contents = serde_json::to_vec_pretty(value)
+        .map_err(|err| PublicError::unexpected(format!("failed to write {label} file: {err}")))?;
+    write_secret_file_atomic(path, &contents, label)
 }
 
 #[cfg(unix)]
-fn set_config_file_permissions(path: &Path, label: &str) -> PublicResult<()> {
-    use std::os::unix::fs::PermissionsExt;
+fn create_secret_file(path: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
 
-    let permissions = fs::Permissions::from_mode(0o600);
-    fs::set_permissions(path, permissions).map_err(|err| {
-        PublicError::unexpected(format!("failed to set {label} file permissions: {err}"))
-    })
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(unix)]
+fn write_secret_file_atomic(path: &Path, contents: &[u8], label: &str) -> PublicResult<()> {
+    let parent = path.parent().ok_or_else(|| {
+        PublicError::unexpected(format!("{label} file path has no parent directory"))
+    })?;
+    let temp_path = temporary_secret_path(path);
+    let mut file = create_secret_file(&temp_path).map_err(|err| {
+        PublicError::unexpected(format!(
+            "failed to create temporary {label} file {}: {err}",
+            temp_path.display()
+        ))
+    })?;
+
+    let write_result = (|| -> PublicResult<()> {
+        use std::io::Write;
+
+        file.write_all(contents).map_err(|err| {
+            PublicError::unexpected(format!(
+                "failed to write temporary {label} file {}: {err}",
+                temp_path.display()
+            ))
+        })?;
+        file.flush().map_err(|err| {
+            PublicError::unexpected(format!(
+                "failed to flush temporary {label} file {}: {err}",
+                temp_path.display()
+            ))
+        })?;
+        file.sync_all().map_err(|err| {
+            PublicError::unexpected(format!(
+                "failed to sync temporary {label} file {}: {err}",
+                temp_path.display()
+            ))
+        })?;
+        drop(file);
+        fs::rename(&temp_path, path).map_err(|err| {
+            PublicError::unexpected(format!(
+                "failed to replace {label} file {}: {err}",
+                path.display()
+            ))
+        })?;
+        sync_directory(parent, label)?;
+        Ok(())
+    })();
+
+    if let Err(original_error) = write_result {
+        match fs::remove_file(&temp_path) {
+            Ok(()) => {}
+            Err(cleanup_error) if cleanup_error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(cleanup_error) => {
+                return Err(PublicError::unexpected(format!(
+                    "{original_error}; additionally failed to remove temporary {label} file {}: {cleanup_error}",
+                    temp_path.display()
+                )));
+            }
+        }
+        return Err(original_error);
+    }
+
+    Ok(())
 }
 
 #[cfg(not(unix))]
-fn set_config_file_permissions(_path: &Path, _label: &str) -> PublicResult<()> {
-    Ok(())
+fn write_secret_file_atomic(path: &Path, contents: &[u8], label: &str) -> PublicResult<()> {
+    fs::write(path, contents).map_err(|err| {
+        PublicError::unexpected(format!(
+            "failed to write {label} file {}: {err}",
+            path.display()
+        ))
+    })
 }
+
+#[cfg(unix)]
+fn temporary_secret_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("secret");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    path.with_file_name(format!(".{file_name}.{}.{}.tmp", std::process::id(), nonce))
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path, label: &str) -> PublicResult<()> {
+    File::open(path)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|err| {
+            PublicError::unexpected(format!(
+                "failed to sync {label} parent directory {}: {err}",
+                path.display()
+            ))
+        })
+}
+
 
 fn ensure_config_dir() -> PublicResult<PathBuf> {
     let dir = config_dir()?;
@@ -377,14 +471,7 @@ fn save_agent_seed_to_file(
 ) -> PublicResult<()> {
     ensure_config_dir()?;
     let path = agent_seed_file_path(credentials)?;
-    fs::write(&path, seed).map_err(|err| {
-        PublicError::unexpected(format!(
-            "failed to write the local agent seed file {}: {err}",
-            path.display()
-        ))
-    })?;
-    set_secret_file_permissions(&path)?;
-    Ok(())
+    write_secret_file_atomic(&path, seed, "local agent seed")
 }
 
 fn clear_agent_seed_file(credentials: &AgentCredentials) -> PublicResult<()> {
@@ -452,14 +539,7 @@ fn save_test_persisted_data_key(
     set_config_dir_permissions(dir)?;
 
     let path = test_persisted_data_key_path(dir, credentials)?;
-    fs::write(&path, data_key).map_err(|err| {
-        PublicError::unexpected(format!(
-            "failed to write the persisted test keychain secret {}: {err}",
-            path.display()
-        ))
-    })?;
-    set_secret_file_permissions(&path)?;
-    Ok(())
+    write_secret_file_atomic(&path, data_key, "persisted test keychain secret")
 }
 
 fn clear_test_persisted_data_key(dir: &Path, credentials: &Credentials) -> PublicResult<()> {
@@ -483,20 +563,4 @@ fn test_persisted_data_key_path(dir: &Path, credentials: &Credentials) -> Public
         URL_SAFE_NO_PAD.encode(Sha256::digest(entry_name.as_bytes()))
     );
     Ok(dir.join(file_name))
-}
-
-fn set_secret_file_permissions(path: &Path) -> PublicResult<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|err| {
-        PublicError::unexpected(format!(
-            "failed to set secret file permissions on {}: {err}",
-            path.display()
-        ))
-    })
-}
-
-#[cfg(not(unix))]
-fn set_secret_file_permissions(_path: &Path) -> PublicResult<()> {
-    Ok(())
 }

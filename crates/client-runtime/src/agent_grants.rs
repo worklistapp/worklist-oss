@@ -1,5 +1,7 @@
 use base64::Engine as _;
-use worklist_client_api::{AgentEnrollmentResponse, ApproveAgentGrantRequest, PublicApiClient};
+use worklist_client_api::{
+    AgentEnrollmentResponse, AgentGrantPermissions, ApproveAgentGrantRequest, PublicApiClient,
+};
 use worklist_client_core::{PublicError, PublicResult};
 use worklist_client_crypto::encrypt_agent_work_list_key;
 
@@ -42,6 +44,9 @@ impl RuntimeClient {
             grants.push(ApproveAgentGrantRequest {
                 work_list_id: work_list.id,
                 key_ciphertext: ciphertext.base64,
+                // OSS runtime approvals default to least-privilege task work.
+                // Broader board access is selected only by the hosted UI flow.
+                permissions: AgentGrantPermissions::assigned_task_worker(),
             });
         }
         Ok(grants)
