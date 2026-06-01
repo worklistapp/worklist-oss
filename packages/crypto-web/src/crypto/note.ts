@@ -3,12 +3,20 @@ import { encode as cborEncode, decode as cborDecode } from 'cbor-x'
 import { SEALED_PAYLOAD_VERSION } from './constants'
 import { encodeBase64 } from './base64'
 import { getStrongBoxBridge } from './strong-box'
-import { parseSealedPayload, serializeSealedPayload, type SealedPayload } from './sealed-payload'
+import {
+  parseSealedPayload,
+  serializeSealedPayload,
+  serializeSealedPayloadBase64,
+  type SealedPayload,
+} from './sealed-payload'
 import { validatePayloadBytes, computeSchemaHash } from './payload-validation'
+import { randomBytes } from './random'
 import type { SealedBlobPayload, ValidatedSealedBlobPayload } from './types'
 
 const encoder = new TextEncoder()
 const NOTE_PAYLOAD_CONTEXT = encoder.encode('worklist.note.v1')
+const NOTE_KEY_CONTEXT = encoder.encode('worklist.note.key.v1')
+const NOTE_KEY_BYTES = 32
 
 type TextMarkType = 'bold' | 'italic' | 'strike' | 'code' | 'link' | 'mention'
 
@@ -102,6 +110,39 @@ export async function decryptNotePayload(params: {
     throw new Error('Invalid note payload envelope')
   }
   return envelope
+}
+
+export async function decryptNoteKey(params: {
+  noteKeyCiphertext: string
+  dataKey: Uint8Array
+}): Promise<Uint8Array> {
+  const sealed = parseSealedPayload(params.noteKeyCiphertext)
+  const bridge = await getStrongBoxBridge()
+  return bridge.decrypt({
+    key: params.dataKey,
+    context: NOTE_KEY_CONTEXT,
+    ciphertext: sealed.ciphertext,
+  })
+}
+
+export async function encryptNoteKey(params: {
+  noteKey: Uint8Array
+  dataKey: Uint8Array
+}): Promise<string> {
+  const bridge = await getStrongBoxBridge()
+  const ciphertext = await bridge.encrypt({
+    key: params.dataKey,
+    context: NOTE_KEY_CONTEXT,
+    plaintext: toUint8Array(params.noteKey),
+  })
+  return serializeSealedPayloadBase64({
+    version: SEALED_PAYLOAD_VERSION,
+    ciphertext,
+  })
+}
+
+export function generateNoteKey(): Uint8Array {
+  return randomBytes(NOTE_KEY_BYTES)
 }
 
 function toSealedBlob(payload: SealedPayload): SealedBlobPayload {

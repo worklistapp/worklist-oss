@@ -2,7 +2,7 @@
 
 Auditable browser encryption implementation for Worklist.
 
-This package contains the browser-side cryptographic primitives used by the production frontend: password-export-key based data-key wrapping, sealed payload encryption, payload validation, HPKE invite envelopes, OPAQUE browser helpers, and the StrongBox WASM worker bridge.
+This package contains the browser-side cryptographic primitives used by the production frontend: password-export-key based data-key wrapping, sealed payload encryption, payload validation, private note-key wrapping, audit payload sealing, HPKE invite and agent-grant helpers, OPAQUE browser helpers, and the StrongBox WASM worker bridge plus health check.
 
 ## Commands
 

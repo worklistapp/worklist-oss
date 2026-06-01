@@ -13,6 +13,12 @@ const BASEPOINT = (() => {
   bytes[0] = 9
   return bytes
 })()
+const UNSUPPORTED_DOM_EXCEPTION_NAMES = new Set([
+  'NotSupportedError',
+  'SyntaxError',
+  'OperationError',
+  'InvalidAccessError',
+])
 
 class X25519WebCryptoError extends Error {
   unsupported: boolean
@@ -198,15 +204,17 @@ function createX25519Error(label: string, cause: unknown): X25519WebCryptoError 
 
 function isUnsupportedDomException(error: unknown): boolean {
   if (typeof DOMException !== 'undefined' && error instanceof DOMException) {
-    return (
-      error.name === 'NotSupportedError' ||
-      error.name === 'SyntaxError' ||
-      error.name === 'OperationError' ||
-      error.name === 'InvalidAccessError'
-    )
+    return UNSUPPORTED_DOM_EXCEPTION_NAMES.has(error.name)
+  }
+  if (error instanceof Error && error.name === 'SyntaxError') {
+    return true
   }
   const message = error instanceof Error ? error.message : ''
-  return /not supported/i.test(message) || /invalid or illegal string/i.test(message)
+  return (
+    /not supported/i.test(message) ||
+    /unsupported key usage/i.test(message) ||
+    /invalid or illegal string/i.test(message)
+  )
 }
 
 export function __resetX25519ImplementationForTesting() {
