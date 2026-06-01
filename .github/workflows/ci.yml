@@ -16,6 +16,8 @@ jobs:
 
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
@@ -25,3 +27,30 @@ jobs:
 
       - name: Test workspace
         run: cargo test --workspace
+
+  web-crypto:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck crypto-web
+        run: bun run crypto-web:typecheck
+
+      - name: Test crypto-web
+        run: bun run crypto-web:test
+
+      - name: Verify StrongBox WASM
+        run: bun run crypto-web:verify-wasm

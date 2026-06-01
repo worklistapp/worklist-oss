@@ -1,0 +1,13 @@
+# Browser Crypto Audit Scope
+
+The public browser crypto package includes:
+
+- key derivation helpers for password export keys and data-key wrapping;
+- OPAQUE browser start/finish helpers;
+- sealed payload serialization, parsing, validation, and StrongBox encryption;
+- task, comment, note, attachment, and work-list payload helpers;
+- HPKE invite envelope sealing/opening and invite-key derivation;
+- X25519 fallback code used when native browser support is unavailable;
+- StrongBox WASM worker client and worker bridge.
+
+The private frontend still owns API transport, React state, query invalidation, UI text, and session stores. Those adapters may hold key material, but cryptographic transformations should be imported from this package.

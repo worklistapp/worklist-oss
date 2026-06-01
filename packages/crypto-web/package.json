@@ -1,0 +1,38 @@
+{
+  "name": "@worklist/crypto-web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "GPL-3.0-only",
+  "description": "Auditable browser encryption implementation for Worklist.",
+  "exports": {
+    "./crypto/*": {
+      "types": "./src/crypto/*.ts",
+      "default": "./src/crypto/*.ts"
+    },
+    "./workers/*": {
+      "types": "./src/workers/*.ts",
+      "default": "./src/workers/*.ts"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "README.md",
+    "SECURITY.md",
+    "docs",
+    "scripts",
+    "src"
+  ],
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "build:wasm": "bun scripts/build-wasm.ts",
+    "verify:wasm": "bun scripts/verify-wasm.ts",
+    "generate:manifest": "bun scripts/generate-manifest.ts"
+  },
+  "dependencies": {
+    "@serenity-kit/opaque": "^1.1.0",
+    "argon2-browser": "^1.18.0",
+    "cbor-x": "^1.6.0"
+  }
+}

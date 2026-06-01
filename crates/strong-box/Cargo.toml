@@ -1,0 +1,39 @@
+[package]
+name = "strong-box"
+description = "Strong, ergonomic encryption for non-cryptographers"
+version = "0.0.0-git"
+authors = ["Matt Palmer <matt@hezmatt.org>"]
+license = "GPL-3.0-only"
+homepage = "https://github.com/mpalmer/strong-box"
+repository = "https://github.com/mpalmer/strong-box"
+edition = "2024"
+# Remember: changing this is a breaking change (and requires updating CI configs, too)
+rust-version = "1.85"
+
+include = [
+	"/LICENCE",
+	"/src/*.rs",
+]
+
+[dependencies]
+ciborium = "0.2"
+ciborium-io = { version = "0.2", features = ["std"] }
+ciborium-ll = { version = "0.2", features = ["std"] }
+chacha20poly1305 = "0.10"
+constant_time_eq = "0.4"
+hkdf = "0.12"
+parking_lot = { version = "0.12", features = ["arc_lock"] }
+secrecy = "0.10"
+sha2 = "0.10"
+thiserror = "2.0"
+thiserror-ext = "0.3"
+tracing = "0.1"
+typenum = "1.0"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rand = "0.9"
+x25519-dalek = { version = "2.0", features = ["static_secrets", "getrandom"] }
+
+[dev-dependencies]
+tracing-subscriber = "0.3"
+tracing-tree = "0.4"
