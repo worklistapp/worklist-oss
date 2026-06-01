@@ -1,11 +1,17 @@
 /// <reference path="../types/argon2-browser.d.ts" />
 
-import argon2 from 'argon2-browser'
+import * as argon2Import from 'argon2-browser'
 import wasmUrl from 'argon2-browser/dist/argon2.wasm?url'
 
 import { DEFAULT_ARGON2_PARAMS, KEY_SIZE_BYTES, MIN_SALT_BYTES, type Argon2Params } from './constants'
 
+type Argon2Module = typeof import('argon2-browser').default
+type Argon2ImportShape = Partial<Argon2Module> & {
+  default?: Argon2Module
+}
+
 type Argon2Global = typeof globalThis & {
+  argon2?: Argon2Module
   argon2WasmPath?: string
   loadArgon2WasmBinary?: () => Promise<Uint8Array>
   process?: typeof process
@@ -64,7 +70,19 @@ if (isServerRuntime) {
   }
 }
 
-const { hash, ArgonType } = argon2
+function resolveArgon2Module(): Argon2Module {
+  const imported = argon2Import as Argon2ImportShape
+  const module =
+    imported.default ??
+    (imported.hash && imported.ArgonType ? imported : undefined) ??
+    globalWithArgon2.argon2
+  if (!module?.hash || !module.ArgonType) {
+    throw new Error('argon2-browser did not expose a usable module')
+  }
+  return module as Argon2Module
+}
+
+const { hash, ArgonType } = resolveArgon2Module()
 
 export async function deriveKeyFromPassword(
   password: string,
