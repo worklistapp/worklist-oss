@@ -6,7 +6,7 @@ This package contains the browser-side cryptographic primitives used by the prod
 
 ## Commands
 
-Install Bun dependencies first. `bun run test` launches Vitest through Node 24 so the browser-crypto test runtime matches CI.
+Install Bun dependencies first. `bun run test` launches Vitest through Node 26 so the browser-crypto test runtime matches CI. The script fails fast if `node` on `PATH` is not Node 26.
 
 ```bash
 bun run typecheck

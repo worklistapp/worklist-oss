@@ -25,7 +25,8 @@
   ],
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",
-    "test": "node \"$(cd ../.. && bun pm bin)/vitest\" run",
+    "test": "bun run ensure:node26 && node \"$(cd ../.. && bun pm bin)/vitest\" run",
+    "ensure:node26": "node -e \"const major = Number(process.versions.node.split('.')[0]); if (major !== 26) { console.error('Vitest must run under Node 26; found ' + process.version + '. Select Node 26 and retry.'); process.exit(1); }\"",
     "build:wasm": "bun scripts/build-wasm.ts",
     "verify:wasm": "bun scripts/verify-wasm.ts",
     "generate:manifest": "bun scripts/generate-manifest.ts"
