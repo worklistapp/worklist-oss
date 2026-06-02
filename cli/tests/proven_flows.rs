@@ -13,6 +13,12 @@ use axum::{
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
 use chrono::{DateTime, Duration, Utc};
+use opaque_ke::{
+    ClientRegistration, ClientRegistrationFinishParameters, ClientRegistrationStartResult,
+    CredentialFinalization, CredentialRequest, Identifiers, RegistrationRequest,
+    RegistrationUpload, ServerLogin, ServerLoginParameters, ServerRegistration, ServerSetup,
+};
+use rand_core::OsRng;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -20,17 +26,21 @@ use strong_box::StrongBox;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use uuid::Uuid;
-use worklist_client_api::{AuditPatchFieldRequest, AuditPatchRequest};
+use worklist_client_api::{
+    ApproveAgentEnrollmentRequest, AuditPatchFieldRequest, AuditPatchRequest,
+};
 use worklist_client_auth::{
-    AgentCredentials, Credentials, agent_key_material_from_seed, normalize_api_url,
+    AgentCredentials, ClientCipherSuite, Credentials, agent_key_material_from_seed,
+    normalize_api_url,
 };
 use worklist_client_crypto::{
     AttachmentBlobRef, CommentPayloadBody, FlexibleValue, SealedPayload, StrongBoxKeyRing,
     SymmetricKey, TaskPayloadBody, build_comment_payload_envelope, build_task_payload_envelope,
     compute_payload_proof, decrypt_comment_payload, decrypt_task_payload,
-    decrypt_task_title_for_id, derive_payload_binding_key, encrypt_agent_work_list_key,
-    encrypt_comment_payload, encrypt_task_payload, flexible_value_to_json, json_value_to_flexible,
-    plaintext_rich_text, seal_task_title, seal_work_list_title, serialize_to_cbor,
+    decrypt_task_title_for_id, derive_data_key_wrapping_key_from_opaque_export_key,
+    derive_payload_binding_key, encrypt_agent_work_list_key, encrypt_comment_payload,
+    encrypt_task_payload, flexible_value_to_json, json_value_to_flexible, plaintext_rich_text,
+    seal_task_title, seal_work_list_title, serialize_to_cbor,
 };
 
 const AUTHORIZED_USER_TOKEN_LABEL: &str = "user";
@@ -42,6 +52,8 @@ const ATTACHMENT_BLOB_CONTEXT: &[u8] = b"worklist.attachment.blob.v1";
 const ATTACHMENT_REF_CONTEXT: &[u8] = b"worklist.attachment.ref.v1";
 const ATTACHMENT_BLOB_CONTEXT_LABEL: &str = "worklist.attachment.blob.v1";
 const ATTACHMENT_BLOB_REF_VERSION: u8 = 1;
+const OPAQUE_SERVER_ID: &[u8] = b"worklist.api";
+const FIXTURE_EMAIL: &str = "fixture@example.test";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_proven_flows_round_trip_through_mock_api() {
@@ -459,7 +471,7 @@ async fn cli_proven_flows_round_trip_through_mock_api() {
 async fn cli_task_reads_parse_current_api_shapes() {
     let fixture = TestFixture::new();
     let state = Arc::new(Mutex::new(TestState::new(fixture.clone())));
-    let server = spawn_server(state).await;
+    let server = spawn_server(state.clone()).await;
     let home = TempDir::new().expect("temp home");
     seed_credentials(home.path(), &fixture, &server.base_url);
 
@@ -1489,6 +1501,148 @@ async fn cli_unlock_daemon_enables_later_decrypt_without_password_flag() {
         lock_output.status.success(),
         "lock failed: {}",
         lock_output.stderr
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_unlock_daemon_supports_opaque_export_key_data_key_payloads() {
+    let mut fixture = TestFixture::new();
+    fixture.use_opaque_export_key_data_key_ciphertext();
+    let state = Arc::new(Mutex::new(TestState::new(fixture.clone())));
+    let server = spawn_server(state.clone()).await;
+    let home = TempDir::new().expect("temp home");
+    seed_credentials(home.path(), &fixture, &server.base_url);
+
+    let unlock_output = run_cli(
+        home.path(),
+        &server.base_url,
+        &["auth", "unlock", "--ttl-seconds", "300", "--password-stdin"],
+        Some(&fixture.password),
+    );
+    assert!(
+        unlock_output.status.success(),
+        "v2 unlock failed: {}",
+        unlock_output.stderr
+    );
+    let saved_credentials = std::fs::read_to_string(user_credentials_file(home.path()))
+        .expect("read saved credentials after v2 unlock");
+    assert!(!saved_credentials.contains("opaque_export_key"));
+    assert!(!saved_credentials.contains("opaqueExportKey"));
+
+    let task_output = run_cli(
+        home.path(),
+        &server.base_url,
+        &[
+            "--json",
+            "tasks",
+            "get",
+            "--work-list-id",
+            &fixture.work_list_id.to_string(),
+            "--task-id",
+            &fixture.task_id.to_string(),
+        ],
+        None,
+    );
+    assert!(
+        task_output.status.success(),
+        "task get after v2 unlock failed: {}",
+        task_output.stderr
+    );
+    let task_json: Value = parse_stdout_json(&task_output.stdout);
+    assert_eq!(task_json["title"], "Existing task");
+
+    let state = state.lock().expect("state lock");
+    assert_eq!(state.opaque_login_start_count, 1);
+    assert_eq!(state.opaque_login_finish_count, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_unlock_daemon_rejects_wrong_password_for_opaque_export_key_payloads() {
+    let mut fixture = TestFixture::new();
+    fixture.use_opaque_export_key_data_key_ciphertext();
+    let state = Arc::new(Mutex::new(TestState::new(fixture.clone())));
+    let server = spawn_server(state.clone()).await;
+    let home = TempDir::new().expect("temp home");
+    seed_credentials(home.path(), &fixture, &server.base_url);
+
+    let unlock_output = run_cli(
+        home.path(),
+        &server.base_url,
+        &["auth", "unlock", "--ttl-seconds", "300", "--password-stdin"],
+        Some("wrong password"),
+    );
+
+    assert!(
+        !unlock_output.status.success(),
+        "v2 unlock unexpectedly succeeded"
+    );
+    assert!(unlock_output.stderr.contains("OPAQUE login finish failed"));
+
+    let task_output = run_cli(
+        home.path(),
+        &server.base_url,
+        &[
+            "--json",
+            "tasks",
+            "get",
+            "--work-list-id",
+            &fixture.work_list_id.to_string(),
+            "--task-id",
+            &fixture.task_id.to_string(),
+        ],
+        None,
+    );
+    assert!(!task_output.status.success());
+
+    let state = state.lock().expect("state lock");
+    assert_eq!(state.opaque_login_start_count, 1);
+    assert_eq!(state.opaque_login_finish_count, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_agent_approve_uses_reauthenticated_credentials_for_opaque_export_key_payloads() {
+    let mut fixture = TestFixture::new();
+    fixture.use_opaque_export_key_data_key_ciphertext();
+    let state = Arc::new(Mutex::new(TestState::new(fixture.clone())));
+    let server = spawn_server(state.clone()).await;
+    let home = TempDir::new().expect("temp home");
+    seed_credentials(home.path(), &fixture, &server.base_url);
+    let code_file = home.path().join("agent-code.txt");
+    std::fs::write(&code_file, "fixture-agent-code").expect("write code file");
+
+    let approve_output = run_cli(
+        home.path(),
+        &server.base_url,
+        &[
+            "--json",
+            "agent",
+            "approve",
+            "--code-file",
+            code_file.to_str().expect("utf8 path"),
+            "--handle",
+            "approved-agent",
+            "--display-name",
+            "Approved Agent",
+            "--password-stdin",
+        ],
+        Some(&fixture.password),
+    );
+
+    assert!(
+        approve_output.status.success(),
+        "agent approve failed: {}",
+        approve_output.stderr
+    );
+    let approved_json: Value = parse_stdout_json(&approve_output.stdout);
+    assert_eq!(approved_json[0]["handle"], "approved-agent");
+
+    let state = state.lock().expect("state lock");
+    assert_eq!(state.opaque_login_start_count, 1);
+    assert_eq!(state.opaque_login_finish_count, 1);
+    assert_eq!(state.agent_approve_count, 1);
+    assert_eq!(
+        state.last_authorization_token.as_deref(),
+        Some(AUTHORIZED_USER_TOKEN_LABEL)
     );
 }
 
@@ -2578,6 +2732,8 @@ struct TestFixture {
     list_key: SymmetricKey,
     binding_key: SymmetricKey,
     data_key_ciphertext: String,
+    opaque_server_setup: Option<Vec<u8>>,
+    opaque_password_file: Option<Vec<u8>>,
     work_list_key_ciphertext: String,
     agent_work_list_key_ciphertext: String,
     work_list_payload_ciphertext: String,
@@ -2600,6 +2756,9 @@ struct TestState {
     last_authorization_token: Option<String>,
     logout_status: StatusCode,
     refresh_request_count: usize,
+    opaque_login_start_count: usize,
+    opaque_login_finish_count: usize,
+    opaque_login_server_state: Option<Vec<u8>>,
     created_task_body: Option<TaskPayloadBody>,
     updated_task_body: Option<TaskPayloadBody>,
     moved_task_body: Option<MoveTaskRequestBody>,
@@ -2619,6 +2778,7 @@ struct TestState {
     invalid_comment_attachment_metadata: bool,
     attachment_size_mismatch: bool,
     attachment_download_requests: usize,
+    agent_approve_count: usize,
     base_url: Option<String>,
 }
 
@@ -2631,6 +2791,9 @@ impl TestState {
             last_authorization_token: None,
             logout_status: StatusCode::OK,
             refresh_request_count: 0,
+            opaque_login_start_count: 0,
+            opaque_login_finish_count: 0,
+            opaque_login_server_state: None,
             fixture,
             created_task_body: None,
             updated_task_body: None,
@@ -2651,6 +2814,7 @@ impl TestState {
             invalid_comment_attachment_metadata: false,
             attachment_size_mismatch: false,
             attachment_download_requests: 0,
+            agent_approve_count: 0,
             base_url: None,
         }
     }
@@ -2799,6 +2963,8 @@ impl TestFixture {
             list_key,
             binding_key,
             data_key_ciphertext,
+            opaque_server_setup: None,
+            opaque_password_file: None,
             work_list_key_ciphertext,
             agent_work_list_key_ciphertext,
             work_list_payload_ciphertext,
@@ -2812,6 +2978,16 @@ impl TestFixture {
             binary_attachment,
             hostile_attachment,
         }
+    }
+
+    fn use_opaque_export_key_data_key_ciphertext(&mut self) {
+        let (opaque_server_setup, opaque_password_file, opaque_export_key) =
+            opaque_fixture_for_password(&self.password);
+        let data_key = SymmetricKey::new([0x11; 32]);
+        self.data_key_ciphertext = encode_opaque_data_key_ciphertext(&opaque_export_key, &data_key)
+            .expect("opaque data key ciphertext");
+        self.opaque_server_setup = Some(opaque_server_setup);
+        self.opaque_password_file = Some(opaque_password_file);
     }
 }
 
@@ -2868,6 +3044,25 @@ struct RefreshRequestBody {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OpaqueLoginStartRequestBody {
+    email: String,
+    client_login_state: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OpaqueLoginFinishRequestBody {
+    session_token: String,
+    client_finish_message: String,
+}
+
+#[derive(Deserialize)]
+struct AgentEnrollmentLookupRequestBody {
+    code: String,
+}
+
+#[derive(Deserialize)]
 struct IncludeArchivedQuery {
     #[serde(rename = "includeArchived")]
     include_archived: Option<bool>,
@@ -2875,8 +3070,15 @@ struct IncludeArchivedQuery {
 
 async fn spawn_server(state: Arc<Mutex<TestState>>) -> TestServer {
     let app = Router::new()
+        .route("/auth/opaque/login/start", post(opaque_login_start))
+        .route("/auth/opaque/login/finish", post(opaque_login_finish))
         .route("/auth/refresh", post(refresh_session))
         .route("/auth/logout", post(logout_session))
+        .route("/agents/enrollments/lookup", post(lookup_agent_enrollment))
+        .route(
+            "/agents/enrollments/approve",
+            post(approve_agent_enrollment),
+        )
         .route("/work-lists", get(list_work_lists))
         .route("/work-lists/{id}", get(get_work_list))
         .route("/work-lists/{id}/tasks", get(list_tasks).post(create_task))
@@ -2927,6 +3129,121 @@ async fn spawn_server(state: Arc<Mutex<TestState>>) -> TestServer {
     }
 }
 
+async fn opaque_login_start(
+    State(state): State<Arc<Mutex<TestState>>>,
+    Json(payload): Json<OpaqueLoginStartRequestBody>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let mut state = state.lock().expect("state lock");
+    assert_eq!(payload.email.trim().to_lowercase(), FIXTURE_EMAIL);
+    let setup_bytes = state
+        .fixture
+        .opaque_server_setup
+        .as_ref()
+        .expect("opaque server setup");
+    let password_file = state
+        .fixture
+        .opaque_password_file
+        .as_ref()
+        .expect("opaque password file");
+    let setup =
+        ServerSetup::<ClientCipherSuite>::deserialize(setup_bytes).expect("deserialize setup");
+    let password_file = ServerRegistration::<ClientCipherSuite>::deserialize(password_file)
+        .expect("deserialize password file");
+    let client_message = decode_b64(&payload.client_login_state);
+    let credential_request = CredentialRequest::<ClientCipherSuite>::deserialize(&client_message)
+        .expect("deserialize credential request");
+    let identifiers = Identifiers {
+        client: Some(FIXTURE_EMAIL.as_bytes()),
+        server: Some(OPAQUE_SERVER_ID),
+    };
+    let params = ServerLoginParameters {
+        context: None,
+        identifiers,
+    };
+    let mut rng = OsRng;
+    let login = ServerLogin::start(
+        &mut rng,
+        &setup,
+        Some(password_file),
+        credential_request,
+        FIXTURE_EMAIL.as_bytes(),
+        params,
+    )
+    .expect("start opaque login");
+    state.opaque_login_start_count += 1;
+    state.opaque_login_server_state = Some(login.state.serialize().to_vec());
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "serverLoginState": STANDARD_NO_PAD.encode(login.message.serialize()),
+            "sessionToken": "fixture-opaque-session",
+            "expiresIn": 120
+        })),
+    )
+}
+
+async fn opaque_login_finish(
+    State(state): State<Arc<Mutex<TestState>>>,
+    Json(payload): Json<OpaqueLoginFinishRequestBody>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    assert_eq!(payload.session_token, "fixture-opaque-session");
+    let mut state = state.lock().expect("state lock");
+    let Some(server_state) = state.opaque_login_server_state.take() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "opaque_session_missing",
+                "message": "login session expired"
+            })),
+        );
+    };
+    let client_finish = decode_b64(&payload.client_finish_message);
+    let finish = CredentialFinalization::<ClientCipherSuite>::deserialize(&client_finish)
+        .expect("deserialize opaque finish");
+    let server_login =
+        ServerLogin::<ClientCipherSuite>::deserialize(&server_state).expect("server login state");
+    let identifiers = Identifiers {
+        client: Some(FIXTURE_EMAIL.as_bytes()),
+        server: Some(OPAQUE_SERVER_ID),
+    };
+    let params = ServerLoginParameters {
+        context: None,
+        identifiers,
+    };
+    server_login
+        .finish(finish, params)
+        .expect("finish opaque login");
+
+    state.opaque_login_finish_count += 1;
+    state.current_access_token = format!("opaque-access-token-{}", state.opaque_login_finish_count);
+    state.current_refresh_token =
+        format!("opaque-refresh-token-{}", state.opaque_login_finish_count);
+    let access_token = state.current_access_token.clone();
+    let refresh_token = state.current_refresh_token.clone();
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "accessToken": access_token,
+            "refreshToken": refresh_token,
+            "expiresIn": 3600,
+            "refreshExpiresIn": 3600,
+            "tokenType": "Bearer",
+            "user": {
+                "id": state.fixture.owner_user_id,
+                "email": FIXTURE_EMAIL,
+                "name": "Fixture User",
+                "timezone": "UTC",
+                "avatarColor": "blue",
+                "themePreference": "system",
+                "emailVerified": true
+            },
+            "dataKeyCiphertext": state.fixture.data_key_ciphertext
+        })),
+    )
+}
+
 async fn refresh_session(
     State(state): State<Arc<Mutex<TestState>>>,
     Json(payload): Json<RefreshRequestBody>,
@@ -2964,6 +3281,74 @@ async fn logout_session(
         state.logout_status,
         Json(json!({
             "loggedOut": state.logout_status.is_success()
+        })),
+    )
+}
+
+async fn lookup_agent_enrollment(
+    State(state): State<Arc<Mutex<TestState>>>,
+    Json(payload): Json<AgentEnrollmentLookupRequestBody>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    assert_eq!(payload.code, "fixture-agent-code");
+    let state = state.lock().expect("state lock");
+    let agent_material = agent_key_material_from_seed([0x77; 32]).expect("agent material");
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "agentId": Uuid::now_v7(),
+            "ownerUserId": state.fixture.owner_user_id,
+            "status": "pending",
+            "approved": false,
+            "authPublicKey": STANDARD_NO_PAD.encode(agent_material.auth_public_key()),
+            "recipientPublicKey": STANDARD_NO_PAD.encode(agent_material.recipient_public_key()),
+            "enrollmentCode": "fixture-agent-code",
+            "enrollmentExpiresAt": Utc::now() + Duration::minutes(5),
+            "handle": null,
+            "proposedHandle": "fixture-agent",
+            "displayName": null,
+            "scopeMode": "inherit_owner",
+            "fingerprint": "fixture-fingerprint"
+        })),
+    )
+}
+
+async fn approve_agent_enrollment(
+    State(state): State<Arc<Mutex<TestState>>>,
+    headers: HeaderMap,
+    Json(payload): Json<ApproveAgentEnrollmentRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    authorize(&state, &headers);
+    assert_eq!(payload.code, "fixture-agent-code");
+    assert_eq!(payload.fingerprint, "fixture-fingerprint");
+    assert_eq!(payload.grants.len(), 1);
+    assert_eq!(
+        payload.grants[0].work_list_id,
+        state.lock().expect("state lock").fixture.work_list_id
+    );
+    assert!(
+        !payload.grants[0].key_ciphertext.trim().is_empty(),
+        "approval should include encrypted grant material"
+    );
+
+    let mut state = state.lock().expect("state lock");
+    state.agent_approve_count += 1;
+    (
+        StatusCode::OK,
+        Json(json!({
+            "agentId": Uuid::now_v7(),
+            "ownerUserId": state.fixture.owner_user_id,
+            "status": "active",
+            "approved": true,
+            "handle": payload.handle,
+            "proposedHandle": "fixture-agent",
+            "displayName": payload.display_name,
+            "scopeMode": payload.scope_mode,
+            "fingerprint": payload.fingerprint,
+            "activatedAt": Utc::now(),
+            "revokedAt": null,
+            "lastSeenAt": null,
+            "grants": []
         })),
     )
 }
@@ -3787,7 +4172,7 @@ fn seed_credentials_with_expiry(
         access_expires_at,
         refresh_expires_at,
         user_id: fixture.owner_user_id,
-        email: "fixture@example.test".to_string(),
+        email: FIXTURE_EMAIL.to_string(),
         data_key_ciphertext: fixture.data_key_ciphertext.clone(),
     };
 
@@ -3831,6 +4216,38 @@ fn decode_b64(value: &str) -> Vec<u8> {
         .expect("decode base64")
 }
 
+fn opaque_fixture_for_password(password: &str) -> (Vec<u8>, Vec<u8>, String) {
+    let mut rng = OsRng;
+    let setup = ServerSetup::<ClientCipherSuite>::new(&mut rng);
+    let ClientRegistrationStartResult { message, state } =
+        ClientRegistration::<ClientCipherSuite>::start(&mut rng, password.as_bytes())
+            .expect("start opaque registration");
+    let request = RegistrationRequest::<ClientCipherSuite>::deserialize(&message.serialize())
+        .expect("deserialize registration request");
+    let server_registration =
+        ServerRegistration::<ClientCipherSuite>::start(&setup, request, FIXTURE_EMAIL.as_bytes())
+            .expect("start server registration");
+    let identifiers = Identifiers {
+        client: Some(FIXTURE_EMAIL.as_bytes()),
+        server: Some(OPAQUE_SERVER_ID),
+    };
+    let finish_params = ClientRegistrationFinishParameters::new(identifiers, None);
+    let finish = state
+        .finish(
+            &mut rng,
+            password.as_bytes(),
+            server_registration.message,
+            finish_params,
+        )
+        .expect("finish client registration");
+    let upload = RegistrationUpload::<ClientCipherSuite>::deserialize(&finish.message.serialize())
+        .expect("deserialize registration upload");
+    let password_file = ServerRegistration::finish(upload).serialize().to_vec();
+    let export_key = STANDARD_NO_PAD.encode(finish.export_key.as_slice());
+
+    (setup.serialize().to_vec(), password_file, export_key)
+}
+
 fn encode_data_key_ciphertext(
     password: &str,
     salt: &[u8; 32],
@@ -3843,6 +4260,23 @@ fn encode_data_key_ciphertext(
         .encrypt(data_key.as_bytes(), USER_DATA_KEY_CONTEXT)
         .expect("seal data key");
     let payload = SealedPayload::new([salt.as_slice(), sealed.as_slice()].concat()).to_bytes()?;
+    Ok(STANDARD_NO_PAD.encode(payload))
+}
+
+fn encode_opaque_data_key_ciphertext(
+    opaque_export_key: &str,
+    data_key: &SymmetricKey,
+) -> worklist_client_core::PublicResult<String> {
+    let wrapping_key = derive_data_key_wrapping_key_from_opaque_export_key(opaque_export_key)?;
+    let strong_box = StrongBoxKeyRing::new(wrapping_key).strong_box();
+    let sealed = strong_box
+        .encrypt(data_key.as_bytes(), USER_DATA_KEY_CONTEXT)
+        .expect("seal data key");
+    let payload = SealedPayload {
+        version: 2,
+        ciphertext: sealed,
+    }
+    .to_bytes()?;
     Ok(STANDARD_NO_PAD.encode(payload))
 }
 

@@ -2,6 +2,10 @@
 
 Payloads are encoded with CBOR, validated against package-local limits, and sealed with StrongBox AEAD using explicit context labels. Work-list payload proofs use HMAC binding keys derived from the work-list key.
 
+Current user data-key payloads are sealed under `worklist.user.data_key` with a wrapping key derived from the OPAQUE `exportKey` using HKDF-SHA256 and the info label `worklist.opaque.export_key.data_key.v1`. They use sealed payload version `2` so the browser can distinguish current OPAQUE-export-key payloads from legacy payloads without sniffing random legacy salt bytes.
+
+Legacy user data-key payloads remain accept-on-read for existing accounts. They store a 32-byte random salt followed by the StrongBox ciphertext and derive the wrapping key from the password with Argon2id. Password change rewraps successfully decrypted legacy payloads into the current OPAQUE-export-key format.
+
 Private note keys are generated as 32 random bytes and wrapped with the user's data key under `worklist.note.key.v1`. Audit payloads are sealed under `audit-patch` and bind their ciphertext to the work-list payload proof mechanism.
 
 HPKE invite envelopes use:

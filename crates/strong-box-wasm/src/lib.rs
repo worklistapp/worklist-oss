@@ -14,11 +14,6 @@ use strong_box::{Key, StaticStrongBox, StrongBox};
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroize;
 
-// Use wee_alloc as the global allocator for smaller WASM binary size
-#[cfg(target_arch = "wasm32")]
-#[global_allocator]
-static ALLOC: wee_alloc::WeeAlloc = wee_alloc::WeeAlloc::INIT;
-
 #[cfg(all(test, miri))]
 mod result_tracker {
     use std::{

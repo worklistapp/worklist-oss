@@ -16,4 +16,9 @@ describe('base64 helpers', () => {
     const decoded = decodeBase64(encoded)
     expect(new TextDecoder().decode(decoded)).toBe('secret-token')
   })
+
+  it('accepts URL-safe strings', () => {
+    const decoded = decodeBase64('-_8')
+    expect(Array.from(decoded)).toEqual([251, 255])
+  })
 })

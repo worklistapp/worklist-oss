@@ -6,7 +6,9 @@ The workspace currently includes `oss/crates/strong-box` because the first spike
 
 ```bash
 cd oss
-cargo build -p strong-box-wasm --profile wasm-release --target wasm32-unknown-unknown
+../scripts/build-strong-box-wasm.sh
 ```
 
-The package script `bun run build:wasm` rebuilds the artifact and copies it to `src/crypto/wasm/strong_box_wasm_bg.wasm`. The script `bun run verify:wasm` rebuilds the artifact and compares SHA256 hashes against the checked-in browser artifact.
+The package script `bun run build:wasm` rebuilds the artifact with deterministic `CARGO_ENCODED_RUSTFLAGS` path remapping and copies it to `src/crypto/wasm/strong_box_wasm_bg.wasm`. The root `scripts/build-strong-box-wasm.sh` script applies the same remapping. The script `bun run verify:wasm` rebuilds the artifact and compares SHA256 hashes against the checked-in browser artifact.
+
+Exact byte-for-byte verification is enforced on Linux x64, matching the pinned Docker builder and GitHub Actions runner used by the OSS CI. Other hosts still rebuild the bridge and reject missing or implausibly small artifacts, but they may report a host-specific hash instead of failing the command.

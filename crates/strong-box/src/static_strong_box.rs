@@ -317,7 +317,9 @@ impl TryFrom<&[u8]> for Ciphertext {
 			.pull(&mut buf[..])
 			.map_err(|e| Error::ciphertext_decoding("nonce", e))?
 		{
-			// Is this necessary?  Probably better to be safe than sorry
+			if chunk.len() != nonce.len() {
+				return Err(Error::invalid_ciphertext("incorrect nonce length"));
+			}
 			nonce[..].copy_from_slice(chunk);
 		} else {
 			return Err(Error::invalid_ciphertext("short nonce"));
@@ -351,5 +353,30 @@ impl TryFrom<&[u8]> for Ciphertext {
 			nonce,
 			ciphertext,
 		})
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn ciphertext_decode_rejects_incorrect_nonce_length_without_panicking() {
+		use ciborium_ll::{Encoder, Header};
+
+		let mut bytes = Vec::new();
+		bytes.extend_from_slice(&CIPHERTEXT_MAGIC);
+		let mut enc = Encoder::from(&mut bytes);
+		enc.push(Header::Array(Some(3))).expect("array");
+		enc.bytes(&[0u8; 16], None).expect("key id");
+		enc.bytes(&[0u8; 13], None).expect("long nonce");
+		enc.bytes(&[], None).expect("ciphertext");
+
+		let error = Ciphertext::try_from(bytes.as_slice()).expect_err("invalid nonce length");
+
+		assert!(matches!(
+			error,
+			Error::InvalidCiphertext(message) if message == "incorrect nonce length"
+		));
 	}
 }

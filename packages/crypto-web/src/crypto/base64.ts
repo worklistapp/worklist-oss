@@ -1,5 +1,5 @@
 function normalizeBase64(input: string): string {
-  const sanitized = input.trim().replace(/\s+/g, '')
+  const sanitized = input.trim().replace(/\s+/g, '').replace(/-/g, '+').replace(/_/g, '/')
   if (sanitized.length === 0) {
     throw new Error('base64 input cannot be empty')
   }

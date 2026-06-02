@@ -1,5 +1,9 @@
+import { encode as cborEncode } from 'cbor-x'
+
 import { deriveKeyFromPassword } from './argon2'
+import { decodeBase64, encodeBase64 } from './base64'
 import { KEY_SIZE_BYTES } from './constants'
+import { hkdfExpand } from './hkdf'
 import { randomBytes } from './random'
 import {
   parseSealedPayload,
@@ -12,9 +16,30 @@ const encoder = new TextEncoder()
 
 const DATA_KEY_CONTEXT_LABEL = 'worklist.user.data_key'
 const DATA_KEY_CONTEXT = encoder.encode(DATA_KEY_CONTEXT_LABEL)
+const OPAQUE_EXPORT_KEY_INFO = 'worklist.opaque.export_key.data_key.v1'
+const LEGACY_PASSWORD_ARGON2_PAYLOAD_VERSION = 1
+const OPAQUE_EXPORT_KEY_PAYLOAD_VERSION = 2
 export const DATA_KEY_SALT_BYTES = 32
+export const OPAQUE_EXPORT_KEY_REQUIRED_CODE = 'OPAQUE_EXPORT_KEY_REQUIRED'
+
+export class OpaqueExportKeyRequiredError extends Error {
+  readonly code = OPAQUE_EXPORT_KEY_REQUIRED_CODE
+
+  constructor() {
+    super('OPAQUE export key is required to decrypt this data key payload')
+    this.name = 'OpaqueExportKeyRequiredError'
+  }
+}
+
+export function isOpaqueExportKeyRequiredError(error: unknown): error is OpaqueExportKeyRequiredError {
+  return (
+    error instanceof OpaqueExportKeyRequiredError ||
+    (error instanceof Error && 'code' in error && error.code === OPAQUE_EXPORT_KEY_REQUIRED_CODE)
+  )
+}
 
 type KeyDeriver = (password: string, salt: Uint8Array) => Promise<Uint8Array>
+type OpaqueExportKeyDeriver = (exportKey: string) => Promise<Uint8Array>
 
 type CreateCiphertextParams = {
   password: string
@@ -30,23 +55,48 @@ type CreateCiphertextParams = {
   deriveKey?: KeyDeriver
 }
 
+type CreateOpaqueCiphertextParams = {
+  opaqueExportKey: string
+  /**
+   * Provide an existing data key for deterministic tests; otherwise a random key is generated.
+   */
+  dataKey?: Uint8Array
+  strongBox?: StrongBoxBridge
+  deriveOpaqueExportKey?: OpaqueExportKeyDeriver
+}
+
 export type CreateCiphertextResult = {
   ciphertext: string
   dataKey: Uint8Array
-  salt: Uint8Array
+  salt?: Uint8Array
 }
 
 type DecryptCiphertextParams = {
-  password: string
+  /**
+   * Required for legacy Argon2-wrapped data-key ciphertexts.
+   */
+  password?: string
+  /**
+   * Required for current OPAQUE-export-key-wrapped data-key ciphertexts.
+   */
+  opaqueExportKey?: string
   ciphertext: string
   strongBox?: StrongBoxBridge
   deriveKey?: KeyDeriver
+  deriveOpaqueExportKey?: OpaqueExportKeyDeriver
 }
 
-export type DecryptCiphertextResult = {
-  dataKey: Uint8Array
-  salt: Uint8Array
-}
+export type DecryptCiphertextResult =
+  | {
+      dataKey: Uint8Array
+      salt: Uint8Array
+      format: 'legacy_password_argon2'
+    }
+  | {
+      dataKey: Uint8Array
+      salt?: undefined
+      format: 'opaque_export_key'
+    }
 
 export async function createDataKeyCiphertext(
   params: CreateCiphertextParams,
@@ -72,7 +122,7 @@ export async function createDataKeyCiphertext(
   })
 
   const payload: SealedPayload = {
-    version: 1,
+    version: LEGACY_PASSWORD_ARGON2_PAYLOAD_VERSION,
     ciphertext: concatBytes(saltCopy, sealed),
   }
 
@@ -83,11 +133,74 @@ export async function createDataKeyCiphertext(
   }
 }
 
+export async function createDataKeyCiphertextFromOpaqueExportKey(
+  params: CreateOpaqueCiphertextParams,
+): Promise<CreateCiphertextResult> {
+  const {
+    opaqueExportKey,
+    dataKey = randomBytes(KEY_SIZE_BYTES),
+    strongBox,
+    deriveOpaqueExportKey = deriveDataKeyWrappingKeyFromOpaqueExportKey,
+  } = params
+
+  const dataKeyCopy = copyBytes(dataKey)
+  const wrappingKey = await deriveOpaqueExportKey(opaqueExportKey)
+  const bridge = strongBox ?? (await getStrongBoxBridge())
+  const sealed = await bridge.encrypt({
+    key: wrappingKey,
+    context: DATA_KEY_CONTEXT,
+    plaintext: dataKeyCopy,
+  })
+
+  const payload: SealedPayload = {
+    version: OPAQUE_EXPORT_KEY_PAYLOAD_VERSION,
+    ciphertext: sealed,
+  }
+
+  return {
+    ciphertext: serializeDataKeySealedPayloadBase64(payload),
+    dataKey: dataKeyCopy,
+  }
+}
+
 export async function decryptDataKeyCiphertext(
   params: DecryptCiphertextParams,
 ): Promise<DecryptCiphertextResult> {
-  const { password, ciphertext, strongBox, deriveKey = deriveKeyFromPassword } = params
+  const {
+    password,
+    opaqueExportKey,
+    ciphertext,
+    strongBox,
+    deriveKey = deriveKeyFromPassword,
+    deriveOpaqueExportKey = deriveDataKeyWrappingKeyFromOpaqueExportKey,
+  } = params
   const payload = parseSealedPayload(ciphertext)
+  if (payload.version === OPAQUE_EXPORT_KEY_PAYLOAD_VERSION) {
+    if (!opaqueExportKey) {
+      throw new OpaqueExportKeyRequiredError()
+    }
+    const wrappingKey = await deriveOpaqueExportKey(opaqueExportKey)
+    const bridge = strongBox ?? (await getStrongBoxBridge())
+    const dataKey = await bridge.decrypt({
+      key: wrappingKey,
+      context: DATA_KEY_CONTEXT,
+      ciphertext: payload.ciphertext,
+    })
+
+    assertDataKeyLength(dataKey)
+    return {
+      dataKey: copyBytes(dataKey),
+      format: 'opaque_export_key',
+    }
+  }
+
+  if (payload.version !== LEGACY_PASSWORD_ARGON2_PAYLOAD_VERSION) {
+    throw new Error(`Unsupported data key payload version: ${payload.version}`)
+  }
+
+  if (!password) {
+    throw new Error('password is required to decrypt legacy data key payloads')
+  }
   if (payload.ciphertext.length <= DATA_KEY_SALT_BYTES) {
     throw new Error('data key payload is truncated')
   }
@@ -104,13 +217,12 @@ export async function decryptDataKeyCiphertext(
     ciphertext: sealed,
   })
 
-  if (dataKey.length !== KEY_SIZE_BYTES) {
-    throw new Error('data key must be 32 bytes')
-  }
+  assertDataKeyLength(dataKey)
 
   return {
     dataKey: copyBytes(dataKey),
     salt: copyBytes(salt),
+    format: 'legacy_password_argon2',
   }
 }
 
@@ -137,19 +249,35 @@ function assertSaltLength(salt: Uint8Array) {
   }
 }
 
+function serializeDataKeySealedPayloadBase64(payload: SealedPayload): string {
+  if (
+    payload.version !== LEGACY_PASSWORD_ARGON2_PAYLOAD_VERSION &&
+    payload.version !== OPAQUE_EXPORT_KEY_PAYLOAD_VERSION
+  ) {
+    throw new Error(`Unsupported data key payload version: ${payload.version}`)
+  }
+  if (!(payload.ciphertext instanceof Uint8Array) || payload.ciphertext.length === 0) {
+    throw new Error('Ciphertext must be a non-empty Uint8Array')
+  }
+  return encodeBase64(cborEncode(payload))
+}
+
 type RewrapDataKeyCiphertextParams = {
-  oldPassword: string
-  newPassword: string
+  oldPassword?: string
+  oldOpaqueExportKey?: string
+  newPassword?: string
+  newOpaqueExportKey?: string
   oldCiphertext: string
   strongBox?: StrongBoxBridge
   deriveKey?: KeyDeriver
+  deriveOpaqueExportKey?: OpaqueExportKeyDeriver
 }
 
 export type RewrapDataKeyCiphertextResult = {
   newCiphertext: string
   dataKey: Uint8Array
-  oldSalt: Uint8Array
-  newSalt: Uint8Array
+  oldSalt?: Uint8Array
+  newSalt?: Uint8Array
 }
 
 /**
@@ -160,28 +288,71 @@ export type RewrapDataKeyCiphertextResult = {
 export async function rewrapDataKeyCiphertext(
   params: RewrapDataKeyCiphertextParams,
 ): Promise<RewrapDataKeyCiphertextResult> {
-  const { oldPassword, newPassword, oldCiphertext, strongBox, deriveKey } = params
+  const {
+    oldPassword,
+    oldOpaqueExportKey,
+    newPassword,
+    newOpaqueExportKey,
+    oldCiphertext,
+    strongBox,
+    deriveKey,
+    deriveOpaqueExportKey,
+  } = params
 
-  // Unwrap with old password
+  // Unwrap with current material. Legacy payloads need the old password;
+  // current payloads need the OPAQUE export key.
   const { dataKey, salt: oldSalt } = await decryptDataKeyCiphertext({
     password: oldPassword,
+    opaqueExportKey: oldOpaqueExportKey,
     ciphertext: oldCiphertext,
     strongBox,
     deriveKey,
+    deriveOpaqueExportKey,
   })
 
-  // Rewrap with new password (generate new salt for security)
-  const { ciphertext: newCiphertext, salt: newSalt } = await createDataKeyCiphertext({
-    password: newPassword,
-    dataKey,
-    strongBox,
-    deriveKey,
-  })
+  const { ciphertext: newCiphertext, salt: newSalt } = newOpaqueExportKey
+    ? await createDataKeyCiphertextFromOpaqueExportKey({
+        opaqueExportKey: newOpaqueExportKey,
+        dataKey,
+        strongBox,
+        deriveOpaqueExportKey,
+      })
+    : await createDataKeyCiphertext({
+        password: requirePassword(newPassword, 'new password is required to rewrap legacy data key payloads'),
+        dataKey,
+        strongBox,
+        deriveKey,
+      })
 
   return {
     newCiphertext,
     dataKey: copyBytes(dataKey),
-    oldSalt: copyBytes(oldSalt),
+    oldSalt: oldSalt ? copyBytes(oldSalt) : undefined,
     newSalt,
   }
+}
+
+export async function deriveDataKeyWrappingKeyFromOpaqueExportKey(exportKey: string): Promise<Uint8Array> {
+  const exportKeyBytes = decodeBase64(exportKey)
+  if (exportKeyBytes.length === 0) {
+    throw new Error('OPAQUE export key cannot be empty')
+  }
+  return hkdfExpand({
+    parent: exportKeyBytes,
+    info: OPAQUE_EXPORT_KEY_INFO,
+    length: KEY_SIZE_BYTES,
+  })
+}
+
+function assertDataKeyLength(dataKey: Uint8Array) {
+  if (dataKey.length !== KEY_SIZE_BYTES) {
+    throw new Error('data key must be 32 bytes')
+  }
+}
+
+function requirePassword(password: string | undefined, message: string): string {
+  if (!password) {
+    throw new Error(message)
+  }
+  return password
 }

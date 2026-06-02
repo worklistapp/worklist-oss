@@ -2,7 +2,7 @@
 
 The public browser crypto package includes:
 
-- key derivation helpers for password export keys and data-key wrapping;
+- key derivation helpers for OPAQUE-export-key data-key wrapping and legacy Argon2 data-key unwrap compatibility;
 - OPAQUE browser start/finish helpers;
 - sealed payload serialization, parsing, validation, and StrongBox encryption;
 - task, comment, note, attachment, and work-list payload helpers;

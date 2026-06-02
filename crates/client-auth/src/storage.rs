@@ -262,7 +262,6 @@ fn sync_directory(path: &Path, label: &str) -> PublicResult<()> {
         })
 }
 
-
 fn ensure_config_dir() -> PublicResult<PathBuf> {
     let dir = config_dir()?;
     if !dir.exists() {

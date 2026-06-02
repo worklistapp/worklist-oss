@@ -35,10 +35,12 @@ impl RuntimeClient {
         all: bool,
         password_stdin: bool,
     ) -> PublicResult<Vec<AgentTaskSummary>> {
-        let key_source = self.load_principal_work_list_key_source(
-            password_stdin,
-            "Password required to decrypt task data.",
-        )?;
+        let key_source = self
+            .load_principal_work_list_key_source(
+                password_stdin,
+                "Password required to decrypt task data.",
+            )
+            .await?;
         let mut client = self.authenticated_api_client().await?;
 
         if !all && let Some(work_list_id) = work_list_id {
@@ -429,8 +431,9 @@ impl RuntimeClient {
         password_stdin: bool,
         prompt_message: &str,
     ) -> PublicResult<(PublicApiClient, WorkListContext)> {
-        let key_source =
-            self.load_principal_work_list_key_source(password_stdin, prompt_message)?;
+        let key_source = self
+            .load_principal_work_list_key_source(password_stdin, prompt_message)
+            .await?;
         let mut client = self.authenticated_api_client().await?;
         let work_list = client.get_work_list(work_list_id).await?;
         let context = self.context_from_work_list_detail(&work_list, Some(&key_source));

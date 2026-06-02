@@ -18,10 +18,12 @@ impl RuntimeClient {
         &self,
         password_stdin: bool,
     ) -> PublicResult<Vec<AgentWorkListSummary>> {
-        let key_source = self.load_principal_work_list_key_source(
-            password_stdin,
-            "Password required to decrypt work lists.",
-        )?;
+        let key_source = self
+            .load_principal_work_list_key_source(
+                password_stdin,
+                "Password required to decrypt work lists.",
+            )
+            .await?;
         let mut client = self.authenticated_api_client().await?;
         let lists = client.list_work_lists().await?;
         Ok(lists
@@ -35,10 +37,12 @@ impl RuntimeClient {
         work_list_id: Uuid,
         password_stdin: bool,
     ) -> PublicResult<AgentWorkListDetail> {
-        let key_source = self.load_principal_work_list_key_source(
-            password_stdin,
-            "Password required to decrypt work list data.",
-        )?;
+        let key_source = self
+            .load_principal_work_list_key_source(
+                password_stdin,
+                "Password required to decrypt work list data.",
+            )
+            .await?;
         let mut client = self.authenticated_api_client().await?;
         let detail = client.get_work_list(work_list_id).await?;
         Ok(self.project_work_list_detail(detail, Some(&key_source)))
@@ -102,14 +106,14 @@ impl RuntimeClient {
             };
         };
 
-        let (title, read_error) = match decode_work_list_payload_value(&list_key, payload_ciphertext)
-        {
-            Ok(payload) => (extract_work_list_title(&payload).or(fallback_title), None),
-            Err(err) => (
-                fallback_title,
-                Some(make_read_error("work_list_payload", err)),
-            ),
-        };
+        let (title, read_error) =
+            match decode_work_list_payload_value(&list_key, payload_ciphertext) {
+                Ok(payload) => (extract_work_list_title(&payload).or(fallback_title), None),
+                Err(err) => (
+                    fallback_title,
+                    Some(make_read_error("work_list_payload", err)),
+                ),
+            };
         WorkListContext {
             work_list_title: title,
             list_key: Some(list_key),

@@ -114,7 +114,7 @@ impl RuntimeClient {
     }
 }
 
-async fn save_credentials_blocking(credentials: Credentials) -> PublicResult<()> {
+pub(crate) async fn save_credentials_blocking(credentials: Credentials) -> PublicResult<()> {
     tokio::task::spawn_blocking(move || save_credentials(&credentials))
         .await
         .map_err(|err| PublicError::unexpected(format!("failed to join credential save: {err}")))?
@@ -123,7 +123,9 @@ async fn save_credentials_blocking(credentials: Credentials) -> PublicResult<()>
 async fn save_agent_credentials_blocking(credentials: AgentCredentials) -> PublicResult<()> {
     tokio::task::spawn_blocking(move || save_agent_credentials(&credentials))
         .await
-        .map_err(|err| PublicError::unexpected(format!("failed to join agent credential save: {err}")))?
+        .map_err(|err| {
+            PublicError::unexpected(format!("failed to join agent credential save: {err}"))
+        })?
 }
 
 fn agent_access_expires_at_from(

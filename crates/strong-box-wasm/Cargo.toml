@@ -20,4 +20,3 @@ zeroize = { version = "1.8", features = ["zeroize_derive"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom_02 = { package = "getrandom", version = "0.2", features = ["custom"] }
-wee_alloc = "0.4.5"

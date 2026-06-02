@@ -13,17 +13,20 @@ impl RuntimeClient {
         enrollment: &AgentEnrollmentResponse,
         password_stdin: bool,
     ) -> PublicResult<Vec<ApproveAgentGrantRequest>> {
-        let mut credentials = self.require_logged_in_credentials()?;
-        let data_key = self.load_data_key(
-            &credentials,
-            password_stdin,
-            "Password required to approve agent access.",
-        )?;
+        let credentials = self.require_logged_in_credentials()?;
+        let data_key = self
+            .load_data_key(
+                &credentials,
+                password_stdin,
+                "Password required to approve agent access.",
+            )
+            .await?;
         let recipient_public_key = base64::engine::general_purpose::STANDARD_NO_PAD
             .decode(enrollment.recipient_public_key.trim())
             .map_err(|err| {
                 PublicError::validation(format!("invalid recipient public key: {err}"))
             })?;
+        let mut credentials = self.require_logged_in_credentials()?;
         self.refresh_user_credentials_if_needed(&mut credentials)
             .await?;
         let mut client =

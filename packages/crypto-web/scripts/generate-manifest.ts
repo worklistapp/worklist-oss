@@ -19,6 +19,10 @@ function argValue(name: string): string | null {
   return process.argv[index + 1] ?? null
 }
 
+function hasFlag(name: string): boolean {
+  return process.argv.includes(name)
+}
+
 async function optionalSha256(filePath: string): Promise<string | null> {
   try {
     const bytes = await readFile(filePath)
@@ -31,15 +35,35 @@ async function optionalSha256(filePath: string): Promise<string | null> {
   }
 }
 
-function gitCommit(): string {
+function configuredCommit(): string | null {
+  const envNames = ['GIT_COMMIT_HASH', 'VITE_GIT_COMMIT_HASH', 'GITHUB_SHA']
+  for (const name of envNames) {
+    const value = process.env[name]?.trim()
+    if (value && value !== 'unknown') {
+      return value
+    }
+  }
+  return null
+}
+
+function gitCommit(): string | null {
   const result = spawnSync('git', ['rev-parse', 'HEAD'], {
     cwd: ossRoot,
     encoding: 'utf8',
   })
   if (result.status !== 0) {
-    return 'unknown'
+    return null
   }
-  return result.stdout.trim() || 'unknown'
+  return result.stdout.trim() || null
+}
+
+const commit = configuredCommit() ?? gitCommit() ?? 'unknown'
+const requireCommit =
+  hasFlag('--require-commit') || process.env.CRYPTO_MANIFEST_REQUIRE_GIT_COMMIT === '1'
+
+if (requireCommit && commit === 'unknown') {
+  console.error('crypto manifest requires a Git commit; set GIT_COMMIT_HASH or VITE_GIT_COMMIT_HASH')
+  process.exit(1)
 }
 
 const packageJson = JSON.parse(
@@ -49,12 +73,12 @@ const packageJson = JSON.parse(
 const manifest = {
   packageName: packageJson.name,
   packageVersion: packageJson.version,
-  gitCommit: gitCommit(),
+  gitCommit: commit,
   bunLockSha256: await optionalSha256(path.join(ossRoot, 'bun.lock')),
   cargoLockSha256: await optionalSha256(path.join(ossRoot, 'Cargo.lock')),
   wasmSha256: await sha256File(packageWasmPath),
   buildCommand:
-    'cargo build -p strong-box-wasm --profile wasm-release --target wasm32-unknown-unknown',
+    'bun run build:wasm (sets deterministic CARGO_ENCODED_RUSTFLAGS remap-path-prefix values; cargo build -p strong-box-wasm --profile wasm-release --locked --target wasm32-unknown-unknown)',
   license: packageJson.license,
 }
 

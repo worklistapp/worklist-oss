@@ -3,17 +3,19 @@ use std::io::{self, Read};
 use rpassword::prompt_password;
 use worklist_client_auth::{
     AgentCredentials, Credentials, PrincipalCredentials, agent_key_material_from_seed,
-    load_agent_seed, load_persisted_data_key,
+    auth_response_to_credentials, load_agent_seed, load_persisted_data_key, login,
 };
 use worklist_client_core::{PublicError, PublicResult};
-use worklist_client_crypto::{SymmetricKey, decrypt_user_data_key};
+use worklist_client_crypto::{
+    SymmetricKey, decrypt_user_data_key_with_login_secret, is_opaque_export_key_required_error,
+};
 
 use crate::projections::PrincipalWorkListKeySource;
 use crate::unlock_daemon::{SessionKey, fetch_data_key, unlock};
-use crate::{DEFAULT_AUTO_UNLOCK_TTL_SECONDS, RuntimeClient};
+use crate::{DEFAULT_AUTO_UNLOCK_TTL_SECONDS, RuntimeClient, auth_http_client};
 
 impl RuntimeClient {
-    pub(crate) fn load_data_key(
+    pub(crate) async fn load_data_key(
         &self,
         credentials: &Credentials,
         password_stdin: bool,
@@ -22,7 +24,9 @@ impl RuntimeClient {
         let session_key = self.current_session_key(credentials)?;
         if password_stdin {
             let password = read_required_password(password_stdin, Some(prompt_message))?;
-            return decrypt_user_data_key(&password, &credentials.data_key_ciphertext);
+            return self
+                .decrypt_user_data_key_with_password(credentials, &password)
+                .await;
         }
 
         if let Some(data_key) = fetch_data_key(&session_key)? {
@@ -49,14 +53,15 @@ impl RuntimeClient {
         Ok(Some(data_key))
     }
 
-    pub(crate) fn load_principal_work_list_key_source(
+    pub(crate) async fn load_principal_work_list_key_source(
         &self,
         password_stdin: bool,
         prompt_message: &str,
     ) -> PublicResult<PrincipalWorkListKeySource> {
         match self.require_principal_credentials()? {
             PrincipalCredentials::User(credentials) => Ok(PrincipalWorkListKeySource::UserDataKey(
-                self.load_data_key(&credentials, password_stdin, prompt_message)?,
+                self.load_data_key(&credentials, password_stdin, prompt_message)
+                    .await?,
             )),
             PrincipalCredentials::Agent(credentials) => {
                 Ok(PrincipalWorkListKeySource::AgentRecipientPrivateKey(
@@ -67,6 +72,46 @@ impl RuntimeClient {
                 "unsupported principal credentials type",
             )),
         }
+    }
+
+    pub(crate) async fn decrypt_user_data_key_with_password(
+        &self,
+        credentials: &Credentials,
+        password: &str,
+    ) -> PublicResult<SymmetricKey> {
+        match decrypt_user_data_key_with_login_secret(
+            password,
+            None,
+            &credentials.data_key_ciphertext,
+        ) {
+            Ok(data_key) => Ok(data_key),
+            Err(err) if is_opaque_export_key_required_error(&err) => {
+                self.decrypt_user_data_key_after_opaque_login(credentials, password)
+                    .await
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn decrypt_user_data_key_after_opaque_login(
+        &self,
+        credentials: &Credentials,
+        password: &str,
+    ) -> PublicResult<SymmetricKey> {
+        let client = auth_http_client()?;
+        let mut auth_response = login(&client, &self.api_url, &credentials.email, password).await?;
+        let opaque_export_key = auth_response.opaque_export_key.take().ok_or_else(|| {
+            PublicError::unexpected("OPAQUE login did not return a client export key")
+        })?;
+        let data_key_ciphertext = auth_response.data_key_ciphertext.clone();
+        let data_key = decrypt_user_data_key_with_login_secret(
+            password,
+            Some(&opaque_export_key),
+            &data_key_ciphertext,
+        )?;
+        let updated_credentials = auth_response_to_credentials(&self.api_url, auth_response)?;
+        crate::auth::save_credentials_blocking(updated_credentials).await?;
+        Ok(data_key)
     }
 
     fn load_agent_recipient_private_key(

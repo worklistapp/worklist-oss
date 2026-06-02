@@ -90,6 +90,8 @@ export type OpaquePasswordChangeFinishInput = {
 export type OpaquePasswordChangeFinishResult = {
   oldPasswordFinishMessage: string
   newPasswordFinishMessage: string
+  oldPasswordExportKey: string
+  newPasswordExportKey: string
 }
 
 export async function startOpaquePasswordChange(
@@ -143,5 +145,7 @@ export async function finishOpaquePasswordChange(
   return {
     oldPasswordFinishMessage: oldPasswordFinish.finishLoginRequest,
     newPasswordFinishMessage: newPasswordFinish.registrationRecord,
+    oldPasswordExportKey: oldPasswordFinish.exportKey,
+    newPasswordExportKey: newPasswordFinish.exportKey,
   }
 }

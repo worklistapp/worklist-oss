@@ -19,7 +19,9 @@ pub use http::{
     auth_response_to_credentials, login, logout, normalize_api_url, refresh_access_token,
     update_credentials_with_refresh,
 };
-pub use opaque::{ClientCipherSuite, ClientKsf, opaque_login_finish, opaque_login_start};
+pub use opaque::{
+    ClientCipherSuite, ClientKsf, OpaqueLoginFinish, opaque_login_finish, opaque_login_start,
+};
 pub use storage::{
     agent_credentials_path, clear_agent_credentials, clear_agent_seed, clear_credentials,
     clear_persisted_data_key, config_dir, credentials_path, load_agent_credentials,
@@ -210,6 +212,7 @@ mod tests {
                 email_verified: true,
             },
             data_key_ciphertext: "data-key-ciphertext".to_string(),
+            opaque_export_key: Some("opaque-export-key".to_string()),
         };
         let refresh_response = RefreshResponse {
             access_token: "refresh-access-secret".to_string(),
@@ -223,9 +226,13 @@ mod tests {
             session_token: "login-session-secret".to_string(),
             expires_in: 120,
         };
+        let opaque_login_finish = OpaqueLoginFinish {
+            finish_message: "finish-message-secret".to_string(),
+            export_key: "opaque-export-key".to_string(),
+        };
 
         let debug_output = format!(
-            "{credentials:?} {principal_credentials:?} {auth_response:?} {refresh_response:?} {login_start_response:?}"
+            "{credentials:?} {principal_credentials:?} {auth_response:?} {refresh_response:?} {login_start_response:?} {opaque_login_finish:?}"
         );
 
         assert!(debug_output.contains(REDACTED_SECRET_FIELD));
@@ -238,7 +245,9 @@ mod tests {
         assert!(!debug_output.contains("refresh-token-secret"));
         assert!(!debug_output.contains("server-state"));
         assert!(!debug_output.contains("login-session-secret"));
+        assert!(!debug_output.contains("finish-message-secret"));
         assert!(!debug_output.contains("data-key-ciphertext"));
+        assert!(!debug_output.contains("opaque-export-key"));
     }
 
     #[test]

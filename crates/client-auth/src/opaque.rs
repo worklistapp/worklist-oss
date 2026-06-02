@@ -1,3 +1,5 @@
+use std::fmt;
+
 use argon2::{Algorithm, Argon2, Params, Version};
 use generic_array::{ArrayLength, GenericArray};
 use opaque_ke::{
@@ -10,6 +12,7 @@ use sha2::Sha512;
 
 use worklist_client_core::{PublicError, PublicResult};
 
+use crate::credentials::REDACTED_SECRET_FIELD;
 use crate::http::{decode_bytes, encode_bytes};
 
 const OPAQUE_SERVER_ID: &[u8] = b"worklist.api";
@@ -59,12 +62,27 @@ pub fn opaque_login_start(
     Ok((state, encode_bytes(message.serialize().as_slice())))
 }
 
+#[derive(Clone)]
+pub struct OpaqueLoginFinish {
+    pub finish_message: String,
+    pub export_key: String,
+}
+
+impl fmt::Debug for OpaqueLoginFinish {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OpaqueLoginFinish")
+            .field("finish_message", &REDACTED_SECRET_FIELD)
+            .field("export_key", &REDACTED_SECRET_FIELD)
+            .finish()
+    }
+}
+
 pub fn opaque_login_finish(
     state: ClientLogin<ClientCipherSuite>,
     email: &str,
     password: &str,
     server_response_b64: &str,
-) -> PublicResult<String> {
+) -> PublicResult<OpaqueLoginFinish> {
     let mut rng = OsRng;
     let server_bytes = decode_bytes(server_response_b64)?;
     let credential_response = CredentialResponse::<ClientCipherSuite>::deserialize(&server_bytes)
@@ -83,5 +101,8 @@ pub fn opaque_login_finish(
         .finish(&mut rng, password.as_bytes(), credential_response, params)
         .map_err(|err| PublicError::crypto(format!("OPAQUE login finish failed: {err}")))?;
 
-    Ok(encode_bytes(finish_result.message.serialize().as_slice()))
+    Ok(OpaqueLoginFinish {
+        finish_message: encode_bytes(finish_result.message.serialize().as_slice()),
+        export_key: encode_bytes(finish_result.export_key.as_slice()),
+    })
 }

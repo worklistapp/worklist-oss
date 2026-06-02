@@ -41,6 +41,8 @@ pub struct AuthResponse {
     pub token_type: String,
     pub user: UserResponse,
     pub data_key_ciphertext: String,
+    #[serde(default)]
+    pub opaque_export_key: Option<String>,
 }
 
 impl fmt::Debug for AuthResponse {
@@ -53,6 +55,13 @@ impl fmt::Debug for AuthResponse {
             .field("token_type", &self.token_type)
             .field("user", &self.user)
             .field("data_key_ciphertext", &REDACTED_SECRET_FIELD)
+            .field(
+                "opaque_export_key",
+                &self
+                    .opaque_export_key
+                    .as_ref()
+                    .map(|_| REDACTED_SECRET_FIELD),
+            )
             .finish()
     }
 }
@@ -185,7 +194,7 @@ pub async fn login(
     let start_result: LoginStartResponse =
         parse_json_response(start_response, "login start response").await?;
 
-    let client_finish_message = opaque_login_finish(
+    let opaque_finish = opaque_login_finish(
         opaque_state,
         email,
         password,
@@ -195,13 +204,16 @@ pub async fn login(
     let finish_response = send_auth_request(
         client.post(login_finish_url).json(&LoginFinishRequest {
             session_token: start_result.session_token,
-            client_finish_message,
+            client_finish_message: opaque_finish.finish_message,
         }),
         "login finish",
     )
     .await?;
 
-    parse_json_response(finish_response, "auth response").await
+    let mut auth_response: AuthResponse =
+        parse_json_response(finish_response, "auth response").await?;
+    auth_response.opaque_export_key = Some(opaque_finish.export_key);
+    Ok(auth_response)
 }
 
 pub async fn refresh_access_token(
@@ -408,6 +420,7 @@ mod tests {
                 email_verified: true,
             },
             data_key_ciphertext: "data-key".to_string(),
+            opaque_export_key: Some("opaque-export-key".to_string()),
         }
     }
 
@@ -461,6 +474,18 @@ mod tests {
         assert_eq!(credentials.refresh_token, "new-refresh-token");
         assert!(credentials.access_expires_at > original_access_expires_at);
         assert!(credentials.refresh_expires_at > original_refresh_expires_at);
+    }
+
+    #[test]
+    fn auth_response_to_credentials_does_not_persist_opaque_export_key() {
+        let credentials =
+            auth_response_to_credentials("https://worklist.example", auth_response(900, 3600))
+                .expect("credentials");
+
+        let serialized = serde_json::to_string(&credentials).expect("serialize credentials");
+        assert!(!serialized.contains("opaque_export_key"));
+        assert!(!serialized.contains("opaqueExportKey"));
+        assert!(!serialized.contains("opaque-export-key"));
     }
 
     #[test]

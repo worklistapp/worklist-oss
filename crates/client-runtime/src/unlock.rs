@@ -3,32 +3,37 @@ use worklist_client_auth::{
     load_credentials, load_credentials_for_url, persisted_data_key_status, save_persisted_data_key,
 };
 use worklist_client_core::PublicResult;
-use worklist_client_crypto::decrypt_user_data_key;
 
 use crate::RuntimeClient;
 use crate::keys::read_required_password;
 use crate::unlock_daemon::{UnlockStatus, clear_session, session_key, unlock, unlock_status};
 
 impl RuntimeClient {
-    pub fn unlock_daemon(&self, ttl_seconds: u64, password_stdin: bool) -> PublicResult<()> {
+    pub async fn unlock_daemon(&self, ttl_seconds: u64, password_stdin: bool) -> PublicResult<()> {
         let credentials = self.require_logged_in_credentials()?;
         let password = read_required_password(
             password_stdin,
             Some("Password required to unlock the local daemon."),
         )?;
-        let data_key = decrypt_user_data_key(&password, &credentials.data_key_ciphertext)?;
-        let session_key = self.current_session_key(&credentials)?;
+        let data_key = self
+            .decrypt_user_data_key_with_password(&credentials, &password)
+            .await?;
+        let current_credentials = self.require_logged_in_credentials()?;
+        let session_key = self.current_session_key(&current_credentials)?;
         unlock(&session_key, &data_key, ttl_seconds)
     }
 
-    pub fn store_persisted_data_key(&self, password_stdin: bool) -> PublicResult<()> {
+    pub async fn store_persisted_data_key(&self, password_stdin: bool) -> PublicResult<()> {
         let credentials = self.require_logged_in_credentials()?;
         let password = read_required_password(
             password_stdin,
             Some("Password required to store a local bootstrap secret."),
         )?;
-        let data_key = decrypt_user_data_key(&password, &credentials.data_key_ciphertext)?;
-        save_persisted_data_key(&credentials, data_key.as_bytes())?;
+        let data_key = self
+            .decrypt_user_data_key_with_password(&credentials, &password)
+            .await?;
+        let current_credentials = self.require_logged_in_credentials()?;
+        save_persisted_data_key(&current_credentials, data_key.as_bytes())?;
         Ok(())
     }
 

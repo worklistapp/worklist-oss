@@ -8,7 +8,7 @@ mod payloads;
 mod text_fields;
 
 use base64::Engine as _;
-use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
+use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::Sha256;
@@ -27,7 +27,9 @@ pub use cbor::{
 pub(crate) use keys::symmetric_key_from_bytes;
 pub use keys::{
     KeyDerivationService, StrongBoxKeyRing, SymmetricKey, decrypt_user_data_key,
-    decrypt_work_list_key, derive_child_key, derive_payload_binding_key, derive_work_list_key,
+    decrypt_user_data_key_with_login_secret, decrypt_work_list_key, derive_child_key,
+    derive_data_key_wrapping_key_from_opaque_export_key, derive_payload_binding_key,
+    derive_work_list_key, is_opaque_export_key_required_error,
 };
 pub use payloads::{
     AttachmentBlobRef, ChecklistItemPayload, CommentPayloadBody, CommentPayloadEnvelope,
@@ -197,6 +199,8 @@ fn decode_base64(value: &str) -> PublicResult<Vec<u8>> {
     STANDARD_NO_PAD
         .decode(trimmed.as_bytes())
         .or_else(|_| STANDARD.decode(trimmed.as_bytes()))
+        .or_else(|_| URL_SAFE_NO_PAD.decode(trimmed.as_bytes()))
+        .or_else(|_| URL_SAFE.decode(trimmed.as_bytes()))
         .map_err(|err| PublicError::validation(format!("ciphertext must be base64: {err}")))
 }
 
