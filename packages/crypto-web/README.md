@@ -6,6 +6,8 @@ This package contains the browser-side cryptographic primitives used by the prod
 
 ## Commands
 
+Install Bun dependencies first. `bun run test` launches Vitest through Node 24 so the browser-crypto test runtime matches CI.
+
 ```bash
 bun run typecheck
 bun run test

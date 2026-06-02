@@ -4,6 +4,17 @@ import { buildWasm, builtWasmPath, packageWasmPath, sha256File } from './wasm-ut
 
 const MIN_STRONG_BOX_WASM_BYTES = 1024
 
+const isTruthyEnv = (value: string | undefined) => value === '1' || value?.toLowerCase() === 'true'
+const isLinuxX64 = process.platform === 'linux' && process.arch === 'x64'
+const isGitHubActions = isTruthyEnv(process.env.GITHUB_ACTIONS)
+const requireExactHash = isTruthyEnv(process.env.STRONG_BOX_WASM_VERIFY_EXACT) || isLinuxX64
+
+// GitHub Actions verification is intentionally limited to the canonical linux/x64 runner.
+if (isGitHubActions && !isLinuxX64) {
+  console.error('StrongBox WASM exact verification in CI requires a linux/x64 runner.')
+  process.exit(1)
+}
+
 await buildWasm()
 
 const builtPath = builtWasmPath()
@@ -11,8 +22,6 @@ await wasmSize(builtPath)
 await wasmSize(packageWasmPath)
 const builtHash = await sha256File(builtWasmPath())
 const packageHash = await sha256File(packageWasmPath)
-const requireExactHash =
-  process.env.STRONG_BOX_WASM_VERIFY_EXACT === '1' || (process.platform === 'linux' && process.arch === 'x64')
 
 if (builtHash !== packageHash) {
   if (!requireExactHash) {
