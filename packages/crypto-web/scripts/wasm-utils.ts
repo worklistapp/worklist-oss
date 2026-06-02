@@ -1,5 +1,6 @@
 import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
+import { existsSync } from 'node:fs'
 import { mkdir, readFile, rm, copyFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import path from 'node:path'
@@ -8,16 +9,37 @@ import { fileURLToPath } from 'node:url'
 const scriptDir = path.dirname(fileURLToPath(import.meta.url))
 export const packageDir = path.resolve(scriptDir, '..')
 export const ossRoot = path.resolve(packageDir, '../..')
-const repoRoot = path.resolve(ossRoot, '..')
+export const repoRoot = resolveRepositoryRoot(ossRoot)
+export const sourceRoot = ossRoot
 export const packageWasmPath = path.join(packageDir, 'src/crypto/wasm/strong_box_wasm_bg.wasm')
 const rustflagsSeparator = '\x1f'
+
+type PathExists = (filePath: string) => boolean
+type SysrootResolver = () => string | null
+
+export function resolveRepositoryRoot(root: string, pathExists: PathExists = existsSync): string {
+  const candidate = path.resolve(root, '..')
+  const isMonorepoOssDirectory = path.basename(root) === 'oss'
+  if (
+    isMonorepoOssDirectory &&
+    pathExists(path.join(candidate, 'Cargo.toml')) &&
+    pathExists(path.join(candidate, 'oss', 'Cargo.toml')) &&
+    pathExists(path.join(candidate, 'crates', 'strong-box-wasm', 'Cargo.toml')) &&
+    pathExists(path.join(candidate, 'oss', 'crates', 'strong-box-wasm', 'Cargo.toml'))
+  ) {
+    return candidate
+  }
+
+  return root
+}
 
 export function targetRoot(): string {
   const configured = process.env.CARGO_TARGET_DIR || process.env.CARGO_BUILD_TARGET_DIR
   if (!configured) {
-    return path.join(ossRoot, 'target')
+    return path.join(repoRoot, 'target')
   }
-  return path.isAbsolute(configured) ? configured : path.join(ossRoot, configured)
+  // Resolve relative overrides from repoRoot before passing an absolute path to Cargo.
+  return path.isAbsolute(configured) ? configured : path.join(repoRoot, configured)
 }
 
 export function builtWasmPath(): string {
@@ -39,23 +61,24 @@ function rustSysroot(): string | null {
   return result.stdout.trim() || null
 }
 
-export function deterministicWasmBuildEnv(): NodeJS.ProcessEnv {
+export function deterministicWasmBuildEnv(sysrootResolver: SysrootResolver = rustSysroot): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env }
   const cargoHome = env.CARGO_HOME
     ? path.resolve(env.CARGO_HOME)
     : path.join(homedir(), '.cargo')
   const remapFlags = [
-    `--remap-path-prefix=${repoRoot}=/workspace`,
+    `--remap-path-prefix=${sourceRoot}=/workspace`,
     `--remap-path-prefix=${targetRoot()}=/workspace/target`,
     `--remap-path-prefix=${cargoHome}=/cargo`,
   ]
 
-  const sysroot = rustSysroot()
+  const sysroot = sysrootResolver()
   if (sysroot) {
     remapFlags.push(`--remap-path-prefix=${sysroot}=/rust`)
   }
 
   delete env.RUSTFLAGS
+  env.CARGO_TARGET_DIR = targetRoot()
   env.CARGO_ENCODED_RUSTFLAGS = remapFlags.join(rustflagsSeparator)
   return env
 }
