@@ -4,6 +4,8 @@ import { afterEach, describe, expect, it } from 'vitest'
 
 // Vitest only includes src/**/* tests; this intentionally covers script utilities.
 import {
+  HOST_SPECIFIC_WASM_UPDATE_ENV,
+  canUpdateCommittedWasm,
   deterministicWasmBuildEnv,
   repoRoot,
   resolveRepositoryRoot,
@@ -80,6 +82,12 @@ describe('StrongBox WASM build utilities', () => {
     const standaloneOssRoot = path.join('/tmp', 'oss')
 
     expect(resolveRepositoryRoot(standaloneOssRoot, () => false)).toBe(standaloneOssRoot)
+  })
+
+  it('allows committed WASM updates only on linux/x64 unless explicitly overridden', () => {
+    expect(canUpdateCommittedWasm('linux', 'x64', {})).toBe(true)
+    expect(canUpdateCommittedWasm('darwin', 'arm64', {})).toBe(false)
+    expect(canUpdateCommittedWasm('darwin', 'arm64', { [HOST_SPECIFIC_WASM_UPDATE_ENV]: '1' })).toBe(true)
   })
 })
 

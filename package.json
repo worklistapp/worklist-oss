@@ -9,7 +9,8 @@
     "crypto-web:typecheck": "cd packages/crypto-web && bun run typecheck",
     "crypto-web:test": "cd packages/crypto-web && bun run test",
     "crypto-web:verify-wasm": "cd packages/crypto-web && bun run verify:wasm",
-    "test": "bun run crypto-web:typecheck && bun run crypto-web:test && bun run crypto-web:verify-wasm"
+    "test": "bun run crypto-web:typecheck && bun run crypto-web:test",
+    "test:canonical": "bun run test && bun run crypto-web:verify-wasm"
   },
   "devDependencies": {
     "@types/node": "^24.10.1",

@@ -1,5 +1,7 @@
 import wasmUrl from '../crypto/wasm/strong_box_wasm_bg.wasm?url'
 import { PlaintextCache } from '../crypto/strong-box-cache'
+import { computeStrongBoxDecryptCacheKey } from './strong-box-cache-key'
+import { verifyStrongBoxWasmBytes } from './strong-box-wasm-integrity'
 
 type StrongBoxWorkerContext = typeof globalThis & {
   postMessage(message: WorkerResponse, transfer?: Transferable[]): void
@@ -156,7 +158,7 @@ async function handleRequest(request: WorkerRequest) {
       const context = new Uint8Array(request.context)
       const payload = new Uint8Array(request.payload)
 
-      const cacheKey = await computeCacheKey(key, context, payload)
+      const cacheKey = await computeStrongBoxDecryptCacheKey(key, context, payload)
       const cachedValue = cache.get(cacheKey)
       if (cachedValue) {
         const buffer = cachedValue.buffer as ArrayBuffer
@@ -395,18 +397,8 @@ async function initWasm() {
     },
   }
 
-  let instance: WebAssembly.WebAssemblyInstantiatedSource
-  try {
-    if (!WebAssembly.instantiateStreaming) {
-      throw new Error('instantiateStreaming unavailable')
-    }
-    const response = await fetch(wasmUrl)
-    instance = await WebAssembly.instantiateStreaming(response, imports)
-  } catch {
-    const response = await fetch(wasmUrl)
-    const bytes = await response.arrayBuffer()
-    instance = await WebAssembly.instantiate(bytes, imports)
-  }
+  const bytes = await fetchVerifiedWasmBytes()
+  const instance = await WebAssembly.instantiate(bytes, imports)
 
   const exports = instance.instance.exports
   wasm = exports as unknown as StrongBoxExports
@@ -471,27 +463,15 @@ function readResult(resultPtr: number) {
   return { bytes, errorCode, errorMessage }
 }
 
-async function computeCacheKey(key: Uint8Array, context: Uint8Array, payload: Uint8Array) {
-  const buffer = new Uint8Array(key.length + context.length + payload.length)
-  buffer.set(key, 0)
-  buffer.set(context, key.length)
-  buffer.set(payload, key.length + context.length)
-
-  const subtle = crypto.subtle
-  if (subtle) {
-    try {
-      const digest = await subtle.digest('SHA-256', buffer)
-      return bytesToHex(new Uint8Array(digest))
-    } catch {
-      // Fall through to manual hex encoding
-    }
+async function fetchVerifiedWasmBytes(): Promise<ArrayBuffer> {
+  const response = await fetch(wasmUrl)
+  if (!response.ok) {
+    throw new Error(`Failed to load StrongBox WASM from ${wasmUrl}`)
   }
 
-  return bytesToHex(buffer)
-}
-
-function bytesToHex(bytes: Uint8Array) {
-  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
+  const bytes = await response.arrayBuffer()
+  await verifyStrongBoxWasmBytes(new Uint8Array(bytes))
+  return bytes
 }
 
 function serializeError(error: unknown): SerializedError {

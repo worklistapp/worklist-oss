@@ -1,6 +1,6 @@
 # Worklist OSS
 
-Open-source Rust workspace for the `worklist` CLI and shared client crates.
+Open-source workspace for the `worklist` CLI, shared client crates, and auditable browser crypto package.
 
 This repository contains the early public client surface for Worklist:
 
@@ -10,6 +10,7 @@ This repository contains the early public client surface for Worklist:
 - `worklist-client-api`: typed HTTP client for the Worklist API
 - `worklist-client-crypto`: client-side crypto helpers for sealed payloads and key derivation
 - `worklist-client-runtime`: unlock-aware runtime that projects raw API responses into agent-facing decrypted models
+- `@worklist/crypto-web`: browser-side encryption implementation, including key management, payload encryption, recovery compatibility, invite handling, OPAQUE helpers, and the StrongBox WASM bridge
 
 ## Status
 
@@ -17,7 +18,7 @@ This workspace is still in active development and is not yet positioned as a sta
 
 - crate boundaries are intentional, but APIs may still change
 - several APIs may still evolve as the agent workflow surface expands
-- the current release target is the CLI first, with supporting crates published alongside it
+- the current release target is the CLI first, with supporting crates and browser crypto package published alongside it
 
 ## Layout
 
@@ -28,6 +29,7 @@ crates/client-auth/     # auth, credentials, and session helpers
 crates/client-api/      # typed API client
 crates/client-crypto/   # client-side crypto and payload helpers
 crates/client-runtime/  # decrypted agent-facing runtime and read models
+packages/crypto-web/    # auditable browser crypto package and StrongBox WASM bridge
 .github/workflows/ci.yml
 ```
 
@@ -36,6 +38,7 @@ crates/client-runtime/  # decrypted agent-facing runtime and read models
 Requirements:
 
 - Rust stable toolchain
+- Node 26 and Bun for `packages/crypto-web`
 
 Common commands:
 
@@ -48,7 +51,14 @@ cargo run -p worklist -- auth keychain store --password-stdin
 cargo run -p worklist -- --json tasks get --work-list-id <list-id> --task-id <task-id>
 cargo run -p worklist -- --json tasks attachments read --work-list-id <list-id> --task-id <task-id> --attachment-id <attachment-id>
 cargo run -p worklist -- --json tasks attachments download --work-list-id <list-id> --task-id <task-id> --attachment-id <attachment-id>
+bun install --frozen-lockfile
+bun run crypto-web:typecheck
+bun run crypto-web:test
+bun run test
+bun run test:canonical
 ```
+
+`bun run test` runs local browser-crypto typecheck and the Vitest suite. `bun run test:canonical` adds exact byte-for-byte StrongBox WASM verification and is expected to pass on Linux x64. On a non-Linux-x64 local host, set `STRONG_BOX_WASM_ALLOW_HOST_SPECIFIC_HASH=1` only when diagnosing an expected host-specific rebuild; CI and release builds must run the exact check without that override.
 
 Once the crate is published, install the CLI with:
 
@@ -72,6 +82,7 @@ WORKLIST_API_URL=https://your-worklist.example cargo run -p worklist -- me
 - `tasks attachments read` prints readable attachments to stdout, including plain text passthrough and DOCX rendered as Markdown; with `--json` it emits the rendered content plus attachment metadata.
 - `tasks attachments download` decrypts binary attachments and saves them locally; if `--output` is omitted it writes `./<attachment-file-name>`.
 - The current workspace targets encrypted Worklist flows, so authenticated reads and writes still depend on credentials, local key unwrap, and workspace keys from a live Worklist deployment.
+- Browser crypto audit scope, protocol notes, dependency notes, and StrongBox WASM reproducible-build details live under [`packages/crypto-web/docs`](./packages/crypto-web/docs).
 - CI for this repository runs from `.github/workflows/ci.yml`.
 - Crates.io release steps are documented in [`RELEASE.md`](./RELEASE.md), with a helper script at [`scripts/publish-crates.sh`](./scripts/publish-crates.sh).
 

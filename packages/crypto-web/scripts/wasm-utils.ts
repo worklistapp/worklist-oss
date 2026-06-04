@@ -1,7 +1,7 @@
 import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { mkdir, readFile, rm, copyFile } from 'node:fs/promises'
+import { mkdir, readFile, rm, copyFile, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -12,10 +12,17 @@ export const ossRoot = path.resolve(packageDir, '../..')
 export const repoRoot = resolveRepositoryRoot(ossRoot)
 export const sourceRoot = ossRoot
 export const packageWasmPath = path.join(packageDir, 'src/crypto/wasm/strong_box_wasm_bg.wasm')
+export const packageWasmHashPath = path.join(packageDir, 'src/crypto/wasm/strong_box_wasm_hash.ts')
+export const HOST_SPECIFIC_WASM_UPDATE_ENV = 'STRONG_BOX_WASM_UPDATE_HOST_SPECIFIC'
 const rustflagsSeparator = '\x1f'
 
 type PathExists = (filePath: string) => boolean
 type SysrootResolver = () => string | null
+type PlatformEnv = Record<string, string | undefined>
+
+function isTruthyEnv(value: string | undefined): boolean {
+  return value === '1' || value?.toLowerCase() === 'true'
+}
 
 export function resolveRepositoryRoot(root: string, pathExists: PathExists = existsSync): string {
   const candidate = path.resolve(root, '..')
@@ -115,12 +122,51 @@ export async function buildWasm(): Promise<string> {
 }
 
 export async function copyBuiltWasm(): Promise<void> {
+  assertCanUpdateCommittedWasm()
   const output = await buildWasm()
   await mkdir(path.dirname(packageWasmPath), { recursive: true })
   await copyFile(output, packageWasmPath)
 }
 
+export function canUpdateCommittedWasm(
+  platform = process.platform,
+  arch = process.arch,
+  env: PlatformEnv = process.env,
+): boolean {
+  return (platform === 'linux' && arch === 'x64') || isTruthyEnv(env[HOST_SPECIFIC_WASM_UPDATE_ENV])
+}
+
+export function assertCanUpdateCommittedWasm(): void {
+  if (canUpdateCommittedWasm()) {
+    return
+  }
+
+  throw new Error(
+    `Refusing to update committed StrongBox WASM artifacts on ${process.platform}/${process.arch}. ` +
+      'Use a linux/x64 builder for release artifacts, or set ' +
+      `${HOST_SPECIFIC_WASM_UPDATE_ENV}=1 for an explicitly host-specific local rebuild.`,
+  )
+}
+
 export async function sha256File(filePath: string): Promise<string> {
   const bytes = await readFile(filePath)
   return createHash('sha256').update(bytes).digest('hex')
+}
+
+export async function writeCommittedWasmHash(hash?: string): Promise<void> {
+  const resolvedHash = hash ?? (await sha256File(packageWasmPath))
+  await writeFile(
+    packageWasmHashPath,
+    // Keep this byte-for-byte aligned with scripts/build-strong-box-wasm.sh.
+    `export const STRONG_BOX_WASM_SHA256 =\n  '${resolvedHash}' as const\n`,
+  )
+}
+
+export async function readCommittedWasmHash(): Promise<string> {
+  const source = await readFile(packageWasmHashPath, 'utf8')
+  const match = source.match(/STRONG_BOX_WASM_SHA256\s*=\s*\n?\s*['"]([a-f0-9]{64})['"]/u)
+  if (!match) {
+    throw new Error(`Unable to read StrongBox WASM SHA256 from ${packageWasmHashPath}`)
+  }
+  return match[1]
 }

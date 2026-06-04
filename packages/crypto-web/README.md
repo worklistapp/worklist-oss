@@ -16,7 +16,9 @@ bun run verify:wasm
 bun run generate:manifest
 ```
 
-Run these from `oss/packages/crypto-web`. From the OSS workspace root, `bun run test` runs the crypto-web typecheck, tests, and WASM verification.
+Run these from `oss/packages/crypto-web`. From the OSS workspace root, `bun run test` runs the crypto-web typecheck and Vitest suite; `bun run test:canonical` also runs exact StrongBox WASM verification and is expected to pass on Linux x64.
+
+The StrongBox WASM worker requires browser secure-context crypto APIs, including `crypto.getRandomValues` and `crypto.subtle`. Runtime WASM hash verification catches artifact corruption or deployment drift, but the build and CI reproducibility checks are the supply-chain trust boundary.
 
 ## Audit Scope
 
